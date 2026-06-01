@@ -1,0 +1,19 @@
+[workspace]
+members = [
+    "clients/shiitake-rs",
+    "shiitake-server",
+    "shiitake-server-api",
+    "shiitake-worker",
+    "shiitake-worker-api",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+repository = "https://github.com/TenzaiLabs/shiitake"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

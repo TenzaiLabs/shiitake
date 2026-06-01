@@ -1,0 +1,36 @@
+# Default e2e profile. Override with `-f` or `--set` to deploy different
+# server flavours (e.g. a tighter-memory pool to exercise OOM handling).
+authToken: e2e-secret-token
+captureRoot: /capture
+defaultWorkdir: /tmp
+
+server:
+  image: shiitake-server:e2e
+  port: 8080
+  dispatchPort: 8090
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+worker:
+  image: shiitake-test-worker:e2e
+  count: 8
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+# Optional in-cluster OpenTelemetry Collector. When enabled, the server exports
+# OTLP to it and re-exposes the metrics on a Prometheus endpoint the test run
+# scrapes. The short export interval makes metrics show up within a test run.
+otel:
+  enabled: false
+  image: otel/opentelemetry-collector-contrib:latest
+  metricExportIntervalMs: 2000

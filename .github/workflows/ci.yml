@@ -1,0 +1,55 @@
+name: 🏃‍♂️ CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: 🎨 Format
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v6
+      - name: 🌙 Install nightly rustfmt
+        run: rustup toolchain install nightly --profile minimal --component rustfmt
+      - name: 🎨 cargo fmt
+        run: cargo +nightly fmt --all --check
+
+  clippy:
+    name: 📎 Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v6
+      - name: 🧰 Toolchain
+        run: rustup show
+      - name: 💾 Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Keyed on rust-toolchain.toml so a toolchain bump starts from a clean
+          # cache; shared with the test job to compile dependencies once.
+          shared-key: rust-${{ hashFiles('rust-toolchain.toml') }}
+      - name: 📎 Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: 🧪 Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v6
+      - name: 🧰 Toolchain
+        run: rustup show
+      - name: 💾 Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-${{ hashFiles('rust-toolchain.toml') }}
+      - name: 🧪 Test
+        run: cargo test --workspace --locked

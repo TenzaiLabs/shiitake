@@ -1,0 +1,33 @@
+{{- if .Values.otel.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-otel
+  labels:
+    app: shiitake-otel
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: shiitake-otel
+  template:
+    metadata:
+      labels:
+        app: shiitake-otel
+    spec:
+      containers:
+        - name: collector
+          image: {{ .Values.otel.image }}
+          args:
+            - --config=/conf/config.yaml
+          ports:
+            - containerPort: 4318
+            - containerPort: 8889
+          volumeMounts:
+            - name: config
+              mountPath: /conf
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-otel
+{{- end }}

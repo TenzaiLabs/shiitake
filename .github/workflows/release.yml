@@ -1,0 +1,166 @@
+name: 🚀 Release
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  image:
+    name: 🐳 Server image (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v6
+      - name: 🔢 Stamp version from release tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          v="${TAG#v}"
+          sed -i "s/^version = \".*\"/version = \"$v\"/" Cargo.toml
+          awk -v v="$v" '/^name = "shiitake-/{print; getline; sub(/^version = .*/, "version = \"" v "\""); print; next} {print}' Cargo.lock > Cargo.lock.tmp
+          mv Cargo.lock.tmp Cargo.lock
+      - name: 🔤 Resolve image name
+        id: image
+        env:
+          REPO: ${{ github.repository }}
+        run: echo "image=${REGISTRY}/${REPO,,}-server" >> "$GITHUB_OUTPUT"
+      - name: 🧱 Set up Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: 🔑 Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: 🏷️ Image labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.image }}
+      - name: 🚀 Build & push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ steps.image.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+      - name: 🧮 Platform tag
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+      - name: 📤 Export digest
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
+      - name: ⬆️ Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    name: 🧩 Combine + push manifest
+    runs-on: ubuntu-24.04
+    needs: image
+    env:
+      IMAGE: ${{ needs.image.outputs.image }}
+    steps:
+      - name: 📥 Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+      - name: 🧱 Set up Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: 🔑 Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: 🏷️ Image tags
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+      - name: 🧩 Create manifest list
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${IMAGE}@sha256:%s " *)
+      - name: ✅ Inspect
+        run: docker buildx imagetools inspect "${IMAGE}:${{ steps.meta.outputs.version }}"
+
+  worker-binary:
+    name: 🏗️ Worker binary (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            triple: x86_64-unknown-linux-musl
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            triple: aarch64-unknown-linux-musl
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v6
+      - name: 🔢 Stamp version from release tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          v="${TAG#v}"
+          sed -i "s/^version = \".*\"/version = \"$v\"/" Cargo.toml
+          awk -v v="$v" '/^name = "shiitake-/{print; getline; sub(/^version = .*/, "version = \"" v "\""); print; next} {print}' Cargo.lock > Cargo.lock.tmp
+          mv Cargo.lock.tmp Cargo.lock
+      - name: 🎯 Add target
+        run: rustup target add ${{ matrix.triple }}
+      - name: 🧰 musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+      - name: 🛠️ Build worker
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: |
+          cargo build --release --locked --target "${{ matrix.triple }}" --bin shiitake-worker
+          bin="shiitake-worker-${{ matrix.triple }}"
+          cp "target/${{ matrix.triple }}/release/shiitake-worker" "$bin"
+          sha256sum "$bin" > "$bin.sha256"
+      - name: ⬆️ Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bin="shiitake-worker-${{ matrix.triple }}"
+          gh release upload "${{ github.event.release.tag_name }}" "$bin" "$bin.sha256" --clobber

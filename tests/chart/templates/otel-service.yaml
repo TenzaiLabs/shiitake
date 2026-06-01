@@ -1,0 +1,16 @@
+{{- if .Values.otel.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-otel
+spec:
+  selector:
+    app: shiitake-otel
+  ports:
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+    - name: prometheus
+      port: 8889
+      targetPort: 8889
+{{- end }}

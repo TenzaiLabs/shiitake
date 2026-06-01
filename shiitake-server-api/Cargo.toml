@@ -1,0 +1,9 @@
+[package]
+name = "shiitake-server-api"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+shiitake-worker-api = { path = "../shiitake-worker-api" }
+strum = { version = "0.28.0", features = ["derive"] }

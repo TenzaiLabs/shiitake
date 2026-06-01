@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1
+
+# A representative end-user worker image. Shiitake ships the worker as a
+# statically-linked binary that downstream users drop into their own toolchain
+# container as the entrypoint; this image stands in for that container in the
+# end-to-end suite, pairing the worker with bash + python3 to exercise real
+# command execution.
+#
+# Build context is the repository root: `docker build -f tests/Dockerfile.worker .`
+
+FROM rust:1-slim-bookworm AS builder
+ARG TARGETARCH
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends musl-tools \
+ && rm -rf /var/lib/apt/lists/*
+ENV CC_x86_64_unknown_linux_musl=musl-gcc \
+    CC_aarch64_unknown_linux_musl=musl-gcc
+WORKDIR /src
+COPY . .
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) triple=x86_64-unknown-linux-musl ;; \
+      arm64) triple=aarch64-unknown-linux-musl ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    rustup target add "$triple"; \
+    cargo build --release --locked --target "$triple" --bin shiitake-worker; \
+    install -D "target/${triple}/release/shiitake-worker" /out/shiitake-worker
+
+FROM python:3-alpine
+RUN apk add --no-cache bash
+COPY --from=builder /out/shiitake-worker /usr/local/bin/shiitake-worker
+ENTRYPOINT ["/usr/local/bin/shiitake-worker"]
