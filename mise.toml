@@ -1,0 +1,8 @@
+# Local + CI tooling — run `mise install` to provision.
+# The Rust toolchain is pinned separately in rust-toolchain.toml.
+[tools]
+k3d = "5.9.0"
+kubectl = "1.36.1"
+helm = "3.19.5"
+python = "3.14"
+uv = "0.11.7"

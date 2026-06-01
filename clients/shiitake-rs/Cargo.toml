@@ -1,0 +1,12 @@
+[package]
+name = "shiitake-rs"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+shiitake-server-api = { path = "../../shiitake-server-api" }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+thiserror = "2"

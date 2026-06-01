@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+
+# Python (clients/shiitake-py)
+**/.venv/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+clients/shiitake-py/uv.lock
