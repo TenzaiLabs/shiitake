@@ -90,6 +90,27 @@ def spawn(command, env=None, timeout=300.0, workdir=None, busy_deadline=90.0):
         raise AssertionError(f"POST /exec -> {status}: {payload}")
 
 
+def wait_for_idle(count, deadline=60.0):
+    """Block until at least `count` workers are idle (connected and free).
+
+    Workers are one-shot: each runs a single command and exits, then the
+    deployment restarts it and it reconnects fresh. So the pool drains as
+    earlier tests run and replenishes asynchronously. The concurrency check
+    dispatches several commands expecting them to overlap; if it starts before
+    the pool has refilled, some dispatches hit 429 (no idle worker) and retry
+    on a backoff that spreads them out past the commands' own runtime, so they
+    never overlap. Gate on idle capacity first to make the check deterministic."""
+    end = time.monotonic() + deadline
+    while True:
+        _, health = _request("GET", "/health", token=None)
+        idle = (health or {}).get("workers_idle", 0)
+        if idle >= count:
+            return idle
+        if time.monotonic() > end:
+            raise AssertionError(f"only {idle} idle workers after {deadline}s; need {count}")
+        time.sleep(0.5)
+
+
 def get_status(handle):
     status, payload = _request("GET", f"/exec/{handle}")
     assert status == 200, f"GET /exec/{handle} -> {status}: {payload}"
@@ -268,9 +289,22 @@ class Concurrency(unittest.TestCase):
         # Fewer than the pool size so every command should find an idle worker
         # without waiting; they overlap, so the server reports them inflight.
         n = max(2, min(POOL_SIZE - 1, 6))
+        # Earlier tests cycled one-shot workers out of the pool; wait for it to
+        # refill so all n commands dispatch back-to-back (no 429 backoff) and
+        # actually run concurrently.
+        wait_for_idle(n)
         handles = [spawn("sleep 2", env=PATH_ENV, timeout=30.0) for _ in range(n)]
-        _, health = _request("GET", "/health", token=None)
-        self.assertGreaterEqual(health["workers_inflight"], 2)
+        # Sample health across the run window — the peak inflight is the
+        # parallelism we're proving. (A single sample can land in the gap
+        # between dispatches or after the first command has already finished.)
+        peak = 0
+        for _ in range(15):
+            _, health = _request("GET", "/health", token=None)
+            peak = max(peak, health["workers_inflight"])
+            if peak >= n:
+                break
+            time.sleep(0.1)
+        self.assertGreaterEqual(peak, 2, msg=f"peak workers_inflight was {peak}, expected >= 2")
         for h in handles:
             snap = wait(h, deadline=30.0)
             self.assertEqual(snap["exit_code"], 0)
