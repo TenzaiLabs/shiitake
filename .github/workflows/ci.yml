@@ -53,3 +53,16 @@ jobs:
           shared-key: rust-${{ hashFiles('rust-toolchain.toml') }}
       - name: 🧪 Test
         run: cargo test --workspace --locked
+
+  version:
+    name: 🔢 Version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v6
+      - name: 🔢 Lockstep + bump-since-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/check-version.sh

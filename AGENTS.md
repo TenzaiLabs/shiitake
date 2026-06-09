@@ -61,7 +61,7 @@ Local + CI e2e tooling (k3d, kubectl, python) is managed by `mise` (`mise.toml`)
 toolchain is the one exception, pinned in `rust-toolchain.toml`.
 
 CI runs all of the above (`.github/workflows/{ci,test}.yml`). `ci.yml` runs
-format, clippy, and test as three parallel jobs; clippy and test share a
+format, clippy, test, and version as four parallel jobs; clippy and test share a
 `Swatinem/rust-cache` keyed on `rust-toolchain.toml` (a toolchain bump starts
 from a clean cache). The toolchain is pinned in `rust-toolchain.toml` (edition
 2024, Rust 1.96.0); the format check is its own job under nightly because
@@ -89,6 +89,15 @@ inherit that already-bumped version and leave it alone — only raise it further
 if their change warrants a larger bump than what's already pending. Bump both
 files together so the Rust and Python artifacts stay on the same version. The
 release tag must then match the in-code version.
+
+The `version` job in `ci.yml` (`.github/scripts/check-version.sh`) enforces this
+as a single invariant: the in-code version must be **strictly greater** than the
+last published release (so the first PR of each cycle is forced to bump), and
+`Cargo.toml` must equal `pyproject.toml` (lockstep). CI verifies *that* a bump
+happened, not whether its size matches the change's scope — that stays a reviewer
+call. Before the first release the bump check has no baseline and is skipped;
+once a release exists it gates every PR. Wire it into branch protection as a
+required check.
 
 ## Gotchas
 
