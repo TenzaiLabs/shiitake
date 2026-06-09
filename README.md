@@ -59,7 +59,7 @@ The HTTP API is versioned under `/api/v1`. The worker dispatch endpoint
 
 ```json
 {
-  "cmd": ["python3", "-c", "print(2 + 2)"],
+  "command": "python3 -c 'print(2 + 2)'",
   "workdir": "/tmp",
   "timeout": 300.0,
   "env": {"PATH": "/usr/bin:/bin"},
@@ -67,7 +67,8 @@ The HTTP API is versioned under `/api/v1`. The worker dispatch endpoint
 }
 ```
 
-`cmd` is shell-quoted and joined, then run as `bash -c <cmd>`. The command runs
+`command` is a single string, run verbatim as `bash -c <command>` — use ordinary
+shell syntax for pipes, redirects, and multi-statement scripts. The command runs
 with **only** the `env` you pass (the worker clears its own environment first),
 so include `PATH` for any command that calls an external binary.
 
@@ -130,7 +131,9 @@ SHIITAKE_AUTH_TOKEN=dev-token SHIITAKE_CAPTURE_ROOT=/tmp/capture cargo run --bin
 SHIITAKE_WORKER_ID=worker-0 SHIITAKE_CAPTURE_ROOT=/tmp/capture cargo run --bin shiitake-worker
 
 # Terminal 3 — drive it
-curl -sX POST localhost:8080/api/v1/exec -d '{"cmd":["echo","hi"]}'
+curl -sX POST localhost:8080/api/v1/exec \
+  -H "Authorization: Bearer dev-token" \
+  -d '{"command": "echo hi"}'
 ```
 
 (The worker exits after one command; re-run it for the next.)
