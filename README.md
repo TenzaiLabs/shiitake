@@ -145,6 +145,12 @@ cargo test --workspace                      # unit + in-process integration test
 bash tests/setup.sh && bash tests/run.sh    # full k3d cluster e2e (see tests/)
 ```
 
+## How to contribute
+
+Contributions are welcome! Feel free to open an issue or a pull request. By
+contributing, you agree that your contributions are licensed under the same
+[Apache License 2.0](LICENSE) that covers this repository.
+
 ## License
 
-To be finalized before public release.
+This project is licensed under the [Apache License 2.0](LICENSE).
