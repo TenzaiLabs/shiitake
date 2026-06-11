@@ -10,6 +10,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   fmt:
     name: 🎨 Format
@@ -57,8 +60,6 @@ jobs:
   version:
     name: 🔢 Version
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v6
