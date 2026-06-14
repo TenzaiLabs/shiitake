@@ -8,10 +8,11 @@ use axum::{
     routing::get,
 };
 use futures_util::{SinkExt, StreamExt};
-use std::{collections::BTreeMap, process::Command, time::Duration};
+use std::{collections::BTreeMap, time::Duration};
 use tempfile::TempDir;
 use tokio::{
     net::TcpListener,
+    process::Command,
     sync::mpsc,
     time::{sleep, timeout},
 };
@@ -53,7 +54,10 @@ async fn worker_honors_cancel_mid_exec() {
         .expect("no result frame")
         .expect("channel closed");
 
-    assert!(child.wait().expect("worker exit").success());
+    // Resident worker: it resets and stays connected after the cancelled
+    // command rather than exiting, so kill it instead of waiting for an exit.
+    child.kill().await.expect("kill worker");
+    let _ = child.wait().await;
     assert_eq!(result["cancelled"], true);
     assert_eq!(result["timed_out"], false);
 

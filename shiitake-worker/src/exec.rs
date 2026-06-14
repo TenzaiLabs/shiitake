@@ -5,8 +5,8 @@
 //! SIGKILL the process group mid-command.
 //!
 //! Memory/CPU bounds are not enforced here: the worker container's k8s
-//! resource limits bound the command (one command per container), and OOM is
-//! detected externally from the kubelet's container status.
+//! resource limits bound it, and OOM is detected externally from the kubelet's
+//! container status.
 
 use crate::cgroup::{CpuTimes, read_cpu_times, read_memory_limit, read_memory_peak};
 use anyhow::{Context, Result};

@@ -65,6 +65,11 @@ spec:
         - name: worker-{{ $i }}
           image: {{ $.Values.worker.image }}
           imagePullPolicy: IfNotPresent
+          # Per-container restartPolicy so each worker recycles independently
+          # when it hits its SHIITAKE_RESTART_AFTER quota (ContainerRestartRules;
+          # requires k8s >= 1.35). The worker always exits 0, so a recycle reads
+          # as Completed, not CrashLoopBackOff.
+          restartPolicy: Always
           env:
             - name: SHIITAKE_WORKER_ID
               value: "worker-{{ $i }}"
@@ -72,6 +77,10 @@ spec:
               value: {{ $.Values.server.dispatchPort | quote }}
             - name: SHIITAKE_CAPTURE_ROOT
               value: {{ $.Values.captureRoot | quote }}
+            - name: SHIITAKE_RESET_PATHS
+              value: {{ $.Values.worker.resetPaths | quote }}
+            - name: SHIITAKE_RESTART_AFTER
+              value: {{ $.Values.worker.restartAfter | quote }}
           resources:
             {{- toYaml $.Values.worker.resources | nindent 12 }}
           volumeMounts:
