@@ -8,6 +8,7 @@
 use k8s_openapi::api::core::v1::Pod;
 use kube::{Client, api::Api, config::Config};
 use std::time::Duration;
+use tokio::time::sleep;
 use tracing::warn;
 
 /// Probes the Kubernetes API for whether a worker container was OOM-killed
@@ -41,7 +42,7 @@ impl ClusterProbe {
                 Ok(_) => {}
                 Err(e) => warn!("kube get({pod}) error: {e}"),
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            sleep(Duration::from_secs(1)).await;
         }
         false
     }

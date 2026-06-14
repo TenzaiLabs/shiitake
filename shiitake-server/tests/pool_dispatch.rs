@@ -9,7 +9,10 @@ use shiitake_server::{
 use shiitake_worker_api::{ExecuteFrame, Frame, ResultFrame};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tempfile::TempDir;
-use tokio::{net::TcpListener, time::timeout};
+use tokio::{
+    net::TcpListener,
+    time::{sleep, timeout},
+};
 use tokio_tungstenite::tungstenite::Message;
 
 #[tokio::test]
@@ -71,7 +74,7 @@ async fn dispatch_with_one_fake_worker_marks_handle_completed() {
     });
 
     // Give the fake worker time to connect + Hello.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    sleep(Duration::from_millis(150)).await;
 
     let env: BTreeMap<String, String> = BTreeMap::new();
     let snap = pool
@@ -134,7 +137,7 @@ async fn worker_drop_marks_handle_worker_died() {
         ws.close(None).await.ok();
     });
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    sleep(Duration::from_millis(150)).await;
     let snap = pool
         .dispatch(ExecuteFrame {
             request_id: "req-die".into(),
