@@ -25,8 +25,13 @@ ROOT="$(cd "$HERE/.." && pwd)"
 if k3d cluster list "$CLUSTER" >/dev/null 2>&1; then
   log "Cluster '${CLUSTER}' already exists — reusing"
 else
-  log "Creating k3d cluster '${CLUSTER}'"
-  k3d cluster create "$CLUSTER" --wait --timeout 180s
+  # Per-container restartPolicy on a regular container (the worker's
+  # SHIITAKE_RESTART_AFTER recycle path) is the ContainerRestartRules feature,
+  # beta/on-by-default from k8s 1.35. k3d's default k3s is older and the API
+  # server would reject the pod template, so pin a >=1.35 k3s image here.
+  K3S_IMAGE="${K3S_IMAGE:-rancher/k3s:v1.35.5-k3s1}"
+  log "Creating k3d cluster '${CLUSTER}' (image ${K3S_IMAGE})"
+  k3d cluster create "$CLUSTER" --image "$K3S_IMAGE" --wait --timeout 180s
 fi
 
 log "Importing images into k3d"

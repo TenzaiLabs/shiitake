@@ -4,10 +4,12 @@
 //! worker itself; the kubelet's container `OOMKilled` status is the only
 //! reliable signal and the server reads it externally.
 //!
-//! Each worker container runs one command and exits, so these readings (taken
-//! after the command finishes, while the worker is still alive) are that
-//! command's usage. Every reader returns `None` when the file isn't present
-//! (non-cgroup-v2 host, or dev macOS).
+//! The worker is resident and serves many commands, so `cpu.stat` (cumulative)
+//! is reported as an after-minus-before delta. `memory.peak` is the cgroup's
+//! high-water mark; it is bounded by the container memory limit (and the
+//! OOM-kill that limit triggers is the only real memory protection), so the
+//! worker does not reset it between commands. Every reader returns `None` when
+//! the file isn't present (non-cgroup-v2 host, or dev macOS).
 
 use std::path::Path;
 

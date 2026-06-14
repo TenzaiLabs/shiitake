@@ -6,8 +6,9 @@ architecture, the wire protocol, or the build/test flow changes.
 ## What this is
 
 A generic, open-source command dispatcher: `shiitake-server` (HTTP + WebSocket
-dispatcher + worker pool) hands commands to `shiitake-worker` processes that each
-run one command and exit. It has no application-specific code — privilege and
+dispatcher + worker pool) hands commands to `shiitake-worker` processes that
+serve commands resident, resetting their sandbox between each. It has no
+application-specific code — privilege and
 identity are expressed only as the generic `drop_to` directive on the wire.
 
 ## Layout
@@ -26,7 +27,8 @@ shiitake-server-api/ shiitake-server-api — lib. The HTTP API request/response
 shiitake-server/  shiitake-server — lib + bin. http/ (routes, auth, range reads,
           dispatch), pool/ (registry, k8s_status OOM probe), metrics.rs +
           telemetry.rs (OTel), serve.rs
-shiitake-worker/  shiitake-worker — bin only. client.rs (connect/Hello/run/exit),
+shiitake-worker/  shiitake-worker — bin only. client.rs (connect/Hello/serve-loop),
+          reset.rs (between-command sandbox reset: process sweep, scratch clear, IPC),
           exec.rs (bash -c, own process group, fd-redirect to capture files),
           cgroup.rs (memory.peak/cpu.stat/limit reads for resource metrics)
 clients/shiitake-rs/  shiitake-rs — lib. Async reqwest client over the HTTP API.
@@ -109,9 +111,24 @@ required check.
   Use ordinary shell syntax for pipes, redirects, and multi-statement scripts;
   the caller does its own quoting (there is no argv array — the worker always
   goes through a shell, so an argv form would just be re-joined).
-- **Workers are one-shot.** A worker runs one command and exits; the deployment
-  restarts it. Don't add a serve-loop to the worker — the clean-slate-per-command
-  property depends on the exit.
+- **Workers are resident.** A worker connects once and serves commands in a
+  loop, resetting its sandbox between each instead of exiting (`reset.rs`: sweep
+  every leftover process — the worker is its container's pid 1, so it SIGKILLs
+  all other pids in the namespace; empty the configured `SHIITAKE_RESET_PATHS`
+  scratch dirs; best-effort SysV IPC removal). Staying resident avoids the
+  kubelet CrashLoopBackOff that per-command container exits incur. The
+  clean-slate-per-command property now depends on `reset` being equivalent to a
+  container teardown — if you change exec or the mounts, keep `reset` in sync.
+  Shiitake never assumes a path layout: the embedding layer lists the scratch
+  paths to clear and omits anything that must persist across commands.
+- **`SHIITAKE_RESTART_AFTER` re-adds a full-teardown layer.** After N commands
+  the worker exits (process ends → fresh container via the container
+  `restartPolicy: Always`), bounding anything `reset` can't scrub. `0` = never
+  (pure resident); `1` = exit after every command (a fresh container each time);
+  `N` = every N. The worker **always exits 0** — quota hit or session error —
+  so a recycle reads as `Completed`, never CrashLoopBackOff. The command's own
+  exit status rides the Result frame, never the worker process exit code. The
+  per-container `restartPolicy` needs k8s ≥ 1.35 (ContainerRestartRules).
 - **Dispatch is loopback-only.** The worker takes only `SHIITAKE_DISPATCH_PORT`
   and always dials `ws://127.0.0.1:<port>/dispatch`; server and workers must
   share a network namespace.

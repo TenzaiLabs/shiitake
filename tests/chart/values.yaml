@@ -19,6 +19,15 @@ server:
 worker:
   image: shiitake-test-worker:e2e
   count: 8
+  # Comma-separated scratch paths the worker empties between commands. Exercises
+  # the resident-worker reset path end-to-end in k8s. /dev/mqueue holds POSIX
+  # message queues (not SysV, so remove_sysv_ipc skips them) — clearing the dir
+  # unlinks the queues a fresh container would have discarded.
+  resetPaths: "/tmp,/var/tmp,/dev/shm,/dev/mqueue"
+  # Exit (recycle the container) after this many commands. 0 = stay resident
+  # and rely on the in-process reset; N>0 adds a periodic full-container
+  # teardown. Set >0 to exercise the restartPolicy/recycle path in the e2e.
+  restartAfter: 0
   resources:
     requests:
       cpu: 50m

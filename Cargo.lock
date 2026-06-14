@@ -1932,6 +1932,7 @@ dependencies = [
  "axum",
  "clap",
  "futures-util",
+ "itertools",
  "libc",
  "nix",
  "serde_json",
