@@ -262,21 +262,23 @@ impl WorkerPool {
         Some(snapshot_from(&row.state, &runtime))
     }
 
-    /// Cancel a handle: signal the worker to quit, then mark the handle
-    /// `Cancelled` immediately. We don't wait for a Result — the worker is
-    /// expected to exit on the Cancel and be restarted by the kubelet, so its
-    /// connection will just drop. Idempotent on terminal handles. Returns None
-    /// if the handle is unknown.
+    /// Cancel a handle: signal the worker to SIGKILL the command, then mark the
+    /// handle `Cancelled` immediately without waiting for a Result. The resident
+    /// worker SIGKILLs the command, resets its sandbox, and sends a
+    /// `Result(cancelled)`; we keep the inflight slot so that Result re-idles
+    /// the worker (see `complete_request`) rather than stranding it. Idempotent
+    /// on terminal handles. Returns None if the handle is unknown.
     pub async fn cancel(&self, handle_id: &str) -> Option<HandleSnapshot> {
         let row = {
             let s = self.state.lock().await;
             s.handles.get(handle_id).cloned()
         }?;
-        // Drop the inflight slot (releasing the sink) and use it to signal the
-        // worker to quit.
+        // Clone the worker's sink (shared) to send Cancel, but leave the
+        // inflight slot in place: the worker is still running and will report a
+        // Result once it has killed the command and reset.
         let sink = {
-            let mut s = self.state.lock().await;
-            s.inflight.remove(handle_id).map(|p| p.sink)
+            let s = self.state.lock().await;
+            s.inflight.get(handle_id).map(|p| p.sink.clone())
         };
         if let Some(sink) = sink {
             let frame = Frame::Cancel {
@@ -405,11 +407,20 @@ impl WorkerPool {
     }
 
     async fn complete_request(&self, result: ResultFrame) {
-        // Remove inflight entry (releasing the held sink) and snapshot
-        // the handle row.
+        // Re-advertise the worker. A resident worker has, by the time it sends
+        // Result, already run the command and reset its sandbox to a clean
+        // slate, so it's ready for the next one: recover its sink from the
+        // inflight slot and return it to the idle set. (Done regardless of the
+        // handle's state below, so a worker whose handle was already finalized
+        // by cancel is still reused rather than stranded.)
         let row = {
             let mut s = self.state.lock().await;
-            s.inflight.remove(&result.request_id);
+            if let Some(p) = s.inflight.remove(&result.request_id) {
+                s.idle.push(WorkerEntry {
+                    worker_id: p.worker_id,
+                    sink: p.sink,
+                });
+            }
             s.handles.get(&result.request_id).cloned()
         };
         let Some(row) = row else { return };
@@ -496,8 +507,9 @@ impl WorkerPool {
                 .filter_map(|rid| s.inflight.remove(&rid).map(|p| (rid, p)))
                 .collect()
         };
-        // Also drop any stale idle entry. Workers re-register fresh after
-        // their per-command exit cycle.
+        // Also drop any stale idle entry. A resident worker only reaches this
+        // path on a real disconnect (crash/eviction); on reconnect it Hellos
+        // and registers afresh.
         {
             let mut s = self.state.lock().await;
             s.idle.retain(|w| w.worker_id != worker_id);

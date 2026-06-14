@@ -1,6 +1,7 @@
 //! Shiitake server: a small dispatcher that accepts HTTP `/exec` requests
 //! and hands them off to worker containers over a websocket pool. Workers
-//! are end-user-built — they connect, run one command, exit. Neither the
+//! are end-user-built — they connect and serve commands, resetting their
+//! sandbox between each. Neither the
 //! server nor the workers hold command output in memory: workers redirect
 //! the command's stdout/stderr straight into the capture files defined by
 //! `shiitake_worker_api::capture`, and the server reads them back with HTTP

@@ -14,7 +14,7 @@ use shiitake_worker_api::{
 };
 use std::{sync::Arc, time::Duration};
 use tempfile::TempDir;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, time::sleep};
 use tokio_tungstenite::tungstenite::Message;
 
 const TOKEN: &str = "test-token";
@@ -109,7 +109,7 @@ async fn reads_full_and_range_and_suffix() {
     });
 
     // Wait for the worker to register.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    sleep(Duration::from_millis(200)).await;
 
     let base = format!("http://127.0.0.1:{}/api/v1", api_addr.port());
     let client = reqwest::Client::new();
@@ -142,7 +142,7 @@ async fn reads_full_and_range_and_suffix() {
             assert_eq!(status["stdout_bytes_written"].as_u64().unwrap(), 200_000);
             break;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
     }
 
     let expected = payload();
