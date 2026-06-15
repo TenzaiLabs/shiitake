@@ -15,7 +15,7 @@ use futures_util::{
     SinkExt, StreamExt,
     stream::{SplitSink, SplitStream},
 };
-use shiitake_worker_api::{ExecuteFrame, Frame, ResourceUsage, ResultFrame, WorkerId, capture};
+use shiitake_worker_api::{ExecId, ExecuteFrame, Frame, ResourceUsage, ResultFrame, WorkerId, capture};
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -54,8 +54,8 @@ struct PendingEntry {
 
 struct PoolState {
     idle: Vec<WorkerEntry>,
-    inflight: HashMap<String, PendingEntry>,
-    handles: HashMap<String, HandleRow>,
+    inflight: HashMap<ExecId, PendingEntry>,
+    handles: HashMap<ExecId, HandleRow>,
     liveness: HashMap<WorkerId, WorkerLiveness>,
 }
 
@@ -77,7 +77,7 @@ struct HandleRow {
 }
 
 struct HandleStateInner {
-    handle_id: String,
+    handle_id: ExecId,
     worker_id: WorkerId,
     started_at: SystemTime,
     inner: Mutex<HandleRuntime>,
@@ -105,7 +105,7 @@ struct HandleRuntime {
 /// A snapshot of a handle. Cheap to construct, safe to serialize.
 #[derive(Debug, Clone)]
 pub struct HandleSnapshot {
-    pub handle_id: String,
+    pub handle_id: ExecId,
     pub worker_id: WorkerId,
     pub started_at: SystemTime,
     pub status: HandleStatus,
@@ -252,7 +252,7 @@ impl WorkerPool {
     /// Look up a handle and bump its last_polled_at timestamp. Used by
     /// all GET endpoints so the idle TTL sweeper can tell forgotten
     /// handles from actively-watched ones.
-    pub async fn touch_and_snapshot(&self, handle_id: &str) -> Option<HandleSnapshot> {
+    pub async fn touch_and_snapshot(&self, handle_id: &ExecId) -> Option<HandleSnapshot> {
         let row = {
             let s = self.state.lock().await;
             s.handles.get(handle_id).cloned()
@@ -268,7 +268,7 @@ impl WorkerPool {
     /// `Result(cancelled)`; we keep the inflight slot so that Result re-idles
     /// the worker (see `complete_request`) rather than stranding it. Idempotent
     /// on terminal handles. Returns None if the handle is unknown.
-    pub async fn cancel(&self, handle_id: &str) -> Option<HandleSnapshot> {
+    pub async fn cancel(&self, handle_id: &ExecId) -> Option<HandleSnapshot> {
         let row = {
             let s = self.state.lock().await;
             s.handles.get(handle_id).cloned()
@@ -282,7 +282,7 @@ impl WorkerPool {
         };
         if let Some(sink) = sink {
             let frame = Frame::Cancel {
-                request_id: handle_id.to_string(),
+                request_id: handle_id.clone(),
             };
             if let Ok(serialized) = serde_json::to_string(&frame)
                 && let Err(e) = sink
@@ -319,7 +319,7 @@ impl WorkerPool {
 
     /// Remove a handle's capture data and drop it from the registry.
     /// Idempotent.
-    pub async fn purge_handle(&self, handle_id: &str) {
+    pub async fn purge_handle(&self, handle_id: &ExecId) {
         let removed = {
             let mut s = self.state.lock().await;
             s.handles.remove(handle_id).is_some()
@@ -494,9 +494,9 @@ impl WorkerPool {
         // Find any inflight requests on this worker. The worker may have
         // disconnected mid-command; we use the K8s probe to disambiguate
         // OOM-killed-container from generic disconnect.
-        let pending: Vec<(String, PendingEntry)> = {
+        let pending: Vec<(ExecId, PendingEntry)> = {
             let mut s = self.state.lock().await;
-            let to_remove: Vec<String> = s
+            let to_remove: Vec<ExecId> = s
                 .inflight
                 .iter()
                 .filter(|(_, p)| p.worker_id == *worker_id)
@@ -570,7 +570,7 @@ impl WorkerPool {
     /// Block until the handle transitions out of `Running` (or it
     /// disappears). Used by the synchronous /terminal/execute path and
     /// the Python client's `wait()` helper.
-    pub async fn wait_for_terminal(&self, handle_id: &str) {
+    pub async fn wait_for_terminal(&self, handle_id: &ExecId) {
         let row = {
             let s = self.state.lock().await;
             s.handles.get(handle_id).cloned()
@@ -688,7 +688,7 @@ impl WorkerPool {
         }
     }
 
-    async fn last_polled(&self, handle_id: &str) -> Option<SystemTime> {
+    async fn last_polled(&self, handle_id: &ExecId) -> Option<SystemTime> {
         let row = {
             let s = self.state.lock().await;
             s.handles.get(handle_id).cloned()
