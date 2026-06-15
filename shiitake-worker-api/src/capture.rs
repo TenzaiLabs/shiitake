@@ -66,6 +66,7 @@ pub async fn stream_len(root: &Path, request_id: &ExecId, stream: Stream) -> u64
 /// Free space on the filesystem backing the capture root, in bytes. `None`
 /// if the path can't be `statvfs`'d. Sampled into a gauge so the unbounded
 /// storage decision stays observable (alert on this, don't cap writes).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn free_bytes(root: &std::path::Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(root.as_os_str().as_bytes()).ok()?;
@@ -74,7 +75,27 @@ pub fn free_bytes(root: &std::path::Path) -> Option<u64> {
     if unsafe { libc::statvfs(c.as_ptr(), &mut stat) } != 0 {
         return None;
     }
-    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+    Some(available_bytes(&stat))
+}
+
+/// Other targets have no `statvfs` binding here, so free space is unknown.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn free_bytes(_root: &std::path::Path) -> Option<u64> {
+    None
+}
+
+// `available blocks × fragment size`, widened to u64. The statvfs field widths
+// differ by OS, so the product is typed per-platform rather than cast.
+#[cfg(target_os = "linux")]
+fn available_bytes(stat: &libc::statvfs) -> u64 {
+    // Both fields are already u64 on Linux.
+    stat.f_bavail * stat.f_frsize
+}
+
+#[cfg(target_os = "macos")]
+fn available_bytes(stat: &libc::statvfs) -> u64 {
+    // f_bavail is u32 on macOS; f_frsize is u64.
+    u64::from(stat.f_bavail) * stat.f_frsize
 }
 
 /// Remove a handle's entire capture directory. Idempotent.
