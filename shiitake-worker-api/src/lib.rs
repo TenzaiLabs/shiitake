@@ -7,14 +7,16 @@ pub mod capture;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fmt;
 
 /// Identifier a worker advertises to the dispatcher (operator-supplied via
 /// `SHIITAKE_WORKER_ID`). A newtype so it can't be confused with other string
 /// ids (e.g. a request id) in the pool. `#[serde(transparent)]` keeps it a bare
 /// string on the wire.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, derive_more::Display,
+)]
 #[serde(transparent)]
+#[display("{_0}")]
 pub struct WorkerId(String);
 
 impl WorkerId {
@@ -29,19 +31,16 @@ impl WorkerId {
     }
 }
 
-impl fmt::Display for WorkerId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
 /// Identifier for one command execution: minted by the server as a UUID, it is
 /// the request id on the wire, the handle in the HTTP API, and the capture
 /// directory name on disk — all the same value. A newtype so it can't be
 /// confused with other string ids (e.g. a worker id). `#[serde(transparent)]`
 /// keeps it a bare string on the wire.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, derive_more::Display,
+)]
 #[serde(transparent)]
+#[display("{_0}")]
 pub struct ExecId(String);
 
 impl ExecId {
@@ -53,12 +52,6 @@ impl ExecId {
 
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-}
-
-impl fmt::Display for ExecId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
     }
 }
 
