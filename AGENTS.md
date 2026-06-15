@@ -124,9 +124,10 @@ required check.
   a per-worker `shutdown` `Notify` that ends the read loop. Sinks are
   `Arc<Mutex<WsSink>>` so the pinger never holds the pool lock across a send.
 - **Everything is a static musl binary.** Both the server and the worker build
-  for `*-unknown-linux-musl` with `musl-gcc`. The server image (`Dockerfile`) is
-  Alpine; the worker ships as a standalone binary that drops into any base image
-  (`tests/Dockerfile.worker` bakes it into `python:3-alpine`).
+  for `*-unknown-linux-musl` with `musl-gcc`. The server image
+  (`Dockerfile.server`) is Alpine; the worker image (`Dockerfile.worker`) is the
+  bare static binary on `scratch` for downstream `COPY --from`; the e2e worker
+  (`tests/Dockerfile.worker`) bakes that binary into `python:3-alpine`.
 - **rustls on `ring` only — no aws-lc-rs / OpenSSL / native-tls.** `kube`
   (`rustls-tls`) and `tokio-tungstenite` (`rustls-tls-webpki-roots`) use rustls;
   `opentelemetry-otlp` enables all three transports (`http-proto`, `http-json`,

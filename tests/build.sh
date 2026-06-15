@@ -11,5 +11,5 @@ ROOT="$(cd "$HERE/.." && pwd)"
 . "$HERE/lib.sh"
 
 log "Building images"
-docker build -t "$SERVER_IMAGE" -f "$ROOT/Dockerfile" "$ROOT"
+docker build -t "$SERVER_IMAGE" -f "$ROOT/Dockerfile.server" "$ROOT"
 docker build -t "$WORKER_IMAGE" -f "$ROOT/tests/Dockerfile.worker" "$ROOT"
