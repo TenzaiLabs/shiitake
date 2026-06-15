@@ -18,24 +18,14 @@ use std::fmt;
 pub struct WorkerId(String);
 
 impl WorkerId {
+    /// Wrap an identifier. Call at the true origin of a worker id — the worker's
+    /// config / `Hello` handshake — never to convert an arbitrary string mid-chain.
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-}
-
-impl From<String> for WorkerId {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-
-impl From<&str> for WorkerId {
-    fn from(s: &str) -> Self {
-        Self(s.to_owned())
     }
 }
 

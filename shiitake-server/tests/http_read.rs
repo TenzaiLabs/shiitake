@@ -9,7 +9,7 @@ use shiitake_server::{
     pool::WorkerPool,
 };
 use shiitake_worker_api::{
-    Frame, ResultFrame,
+    Frame, ResultFrame, WorkerId,
     capture::{Stream, handle_dir, stream_path},
 };
 use std::{sync::Arc, time::Duration};
@@ -67,7 +67,7 @@ async fn reads_full_and_range_and_suffix() {
         let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
         ws.send(Message::Text(
             serde_json::to_string(&Frame::Hello {
-                worker_id: "fake".into(),
+                worker_id: WorkerId::new("fake"),
             })
             .unwrap()
             .into(),

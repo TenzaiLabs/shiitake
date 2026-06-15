@@ -6,7 +6,7 @@ use shiitake_server::{
     http::build_dispatch_router,
     pool::{ExitCause, HandleStatus, WorkerPool},
 };
-use shiitake_worker_api::{ExecId, ExecuteFrame, Frame, ResultFrame};
+use shiitake_worker_api::{ExecId, ExecuteFrame, Frame, ResultFrame, WorkerId};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tokio::{
@@ -39,7 +39,7 @@ async fn dispatch_with_one_fake_worker_marks_handle_completed() {
         let url = format!("ws://127.0.0.1:{}/dispatch", addr.port());
         let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
         let hello = serde_json::to_string(&Frame::Hello {
-            worker_id: "fake-0".into(),
+            worker_id: WorkerId::new("fake-0"),
         })
         .unwrap();
         ws.send(Message::Text(hello.into())).await.unwrap();
@@ -128,7 +128,7 @@ async fn worker_drop_marks_handle_worker_died() {
         let url = format!("ws://127.0.0.1:{}/dispatch", addr.port());
         let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
         let hello = serde_json::to_string(&Frame::Hello {
-            worker_id: "doomed".into(),
+            worker_id: WorkerId::new("doomed"),
         })
         .unwrap();
         ws.send(Message::Text(hello.into())).await.unwrap();
