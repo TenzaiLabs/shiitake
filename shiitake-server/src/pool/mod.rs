@@ -489,7 +489,8 @@ impl WorkerPool {
     /// Report current pool occupancy to the metrics pipeline.
     async fn report_occupancy(&self) {
         let (idle, inflight) = self.snapshot().await;
-        metrics().set_pool_workers(idle as u64, inflight as u64);
+        let count = |n: usize| u64::try_from(n).expect("pool worker count fits u64");
+        metrics().set_pool_workers(count(idle), count(inflight));
     }
 
     async fn handle_worker_drop(&self, worker_id: &WorkerId) {
@@ -563,7 +564,7 @@ impl WorkerPool {
             }
             let waited = p.started_at.elapsed();
             warn!(
-                %worker_id, ?cause, waited_ms = waited.as_millis() as u64,
+                %worker_id, ?cause, waited_ms = %waited.as_millis(),
                 "handle fulfilled by worker_drop reconciler"
             );
         }

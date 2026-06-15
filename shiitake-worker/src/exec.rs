@@ -81,10 +81,8 @@ pub async fn run(
     }
 
     let mut child = cmd.spawn().context("spawn bash -c")?;
-    let pid = child
-        .id()
-        .map(|p| Pid::from_raw(p as i32))
-        .context("child has no pid")?;
+    let raw_pid = child.id().context("child has no pid")?;
+    let pid = Pid::from_raw(i32::try_from(raw_pid).context("pid out of range for pid_t")?);
 
     let dur = Duration::from_secs_f64(execute.timeout_secs.max(0.001));
     let (cancelled, timed_out, exit_status) = wait_with_signals(&mut child, pid, dur, cancel).await;
@@ -131,8 +129,14 @@ pub async fn run(
 async fn usage(cpu_before: Option<CpuTimes>) -> ResourceUsage {
     let (cpu_user_seconds, cpu_system_seconds) = match (cpu_before, read_cpu_times().await) {
         (Some(before), Some(after)) => (
-            Some(after.user_usec.saturating_sub(before.user_usec) as f64 / 1e6),
-            Some(after.system_usec.saturating_sub(before.system_usec) as f64 / 1e6),
+            Some(
+                Duration::from_micros(after.user_usec.saturating_sub(before.user_usec))
+                    .as_secs_f64(),
+            ),
+            Some(
+                Duration::from_micros(after.system_usec.saturating_sub(before.system_usec))
+                    .as_secs_f64(),
+            ),
         ),
         _ => (None, None),
     };
@@ -201,9 +205,10 @@ fn apply_drop_to(d: &DropTo) -> std::io::Result<()> {
     nix::unistd::setgroups(&supp).map_err(io_err)?;
     nix::unistd::setuid(uid).map_err(io_err)?;
     if let Some(mask) = d.umask {
-        // SAFETY: umask is async-signal-safe.
+        // SAFETY: umask is async-signal-safe. `mask` is the u32 the DropTo
+        // carries; mode_t is u32 on Linux, so no conversion is needed.
         unsafe {
-            libc::umask(mask as libc::mode_t);
+            libc::umask(mask);
         }
     }
     Ok(())
@@ -215,7 +220,7 @@ fn apply_drop_to(_d: &DropTo) -> std::io::Result<()> {
 }
 
 fn io_err(e: nix::errno::Errno) -> std::io::Error {
-    std::io::Error::from_raw_os_error(e as i32)
+    e.into()
 }
 
 #[cfg(test)]
@@ -235,7 +240,7 @@ mod tests {
     use tokio::sync::watch;
 
     const STREAMS: usize = 16;
-    const BYTES_PER_STREAM: usize = 8 * 1024 * 1024; // 8 MiB
+    const BYTES_PER_STREAM: u64 = 8 * 1024 * 1024; // 8 MiB
 
     fn exec_frame(request_id: &ExecId, command: String) -> ExecuteFrame {
         let mut env = BTreeMap::new();
@@ -275,7 +280,7 @@ mod tests {
 
                 let stdout_len = stream_len(&root_path, &request_id, Stream::Stdout).await;
                 assert_eq!(
-                    stdout_len, BYTES_PER_STREAM as u64,
+                    stdout_len, BYTES_PER_STREAM,
                     "stream {i} captured stdout length"
                 );
 

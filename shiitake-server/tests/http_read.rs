@@ -20,7 +20,8 @@ use tokio_tungstenite::tungstenite::Message;
 const TOKEN: &str = "test-token";
 
 fn payload() -> Vec<u8> {
-    (0..200_000u32).map(|i| (i % 251) as u8).collect()
+    // 0,1,…,250,0,1,… — a u8 cycle, so no integer conversion is needed.
+    (0u8..251).cycle().take(200_000).collect()
 }
 
 #[tokio::test]
