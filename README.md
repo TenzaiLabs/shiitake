@@ -119,9 +119,6 @@ kubelet's container status, never self-reported by the worker.
   ENTRYPOINT ["/usr/local/bin/shiitake-worker"]
   ```
 
-  The same binary is also attached to each GitHub release if you'd rather fetch
-  and `COPY` it yourself.
-
 Run one server container and N worker containers in a single Pod that shares the
 pod network namespace (so workers reach the dispatcher on `127.0.0.1`) and a
 capture volume (mounted into the server and every worker at the same path; an

@@ -6,7 +6,7 @@ on:
       - published
 
 permissions:
-  contents: write
+  contents: read
   packages: write
 
 env:
@@ -143,49 +143,3 @@ jobs:
           IMAGE: ${{ steps.image.outputs.image }}
           VERSION: ${{ steps.meta.outputs.version }}
         run: docker buildx imagetools inspect "${IMAGE}:${VERSION}"
-
-  worker-binary:
-    name: 🏗️ Worker binary (${{ matrix.platform }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-24.04
-            triple: x86_64-unknown-linux-musl
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-            triple: aarch64-unknown-linux-musl
-    steps:
-      - name: 📥 Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-      - name: 🔢 Stamp version from release tag
-        env:
-          TAG: ${{ github.event.release.tag_name }}
-        run: |
-          v="${TAG#v}"
-          sed -i "s/^version = \".*\"/version = \"$v\"/" Cargo.toml
-          awk -v v="$v" '/^name = "shiitake-/{print; getline; sub(/^version = .*/, "version = \"" v "\""); print; next} {print}' Cargo.lock > Cargo.lock.tmp
-          mv Cargo.lock.tmp Cargo.lock
-      - name: 🎯 Add target
-        run: rustup target add ${{ matrix.triple }}
-      - name: 🧰 musl toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends musl-tools
-      - name: 🛠️ Build worker
-        env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
-          CC_aarch64_unknown_linux_musl: musl-gcc
-        run: |
-          cargo build --release --locked --target "${{ matrix.triple }}" --bin shiitake-worker
-          bin="shiitake-worker-${{ matrix.triple }}"
-          cp "target/${{ matrix.triple }}/release/shiitake-worker" "$bin"
-          sha256sum "$bin" > "$bin.sha256"
-      - name: ⬆️ Upload to release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          bin="shiitake-worker-${{ matrix.triple }}"
-          gh release upload "${{ github.event.release.tag_name }}" "$bin" "$bin.sha256" --clobber
