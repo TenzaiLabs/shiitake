@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 // `DropTo` is part of the `/exec` request body (and the on-the-wire frame), so
 // re-export it for callers building requests against this API. `WorkerId`
 // likewise appears on `StatusResponse`.
-pub use shiitake_worker_api::{DropTo, WorkerId};
+pub use shiitake_worker_api::{DropTo, ExecId, WorkerId};
 use std::collections::BTreeMap;
 use strum::IntoStaticStr;
 
@@ -33,7 +33,7 @@ pub struct ExecRequest {
 /// command. No output or exit code yet; the command is running.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnResponse {
-    pub handle: String,
+    pub handle: ExecId,
     pub started_at: f64,
 }
 
@@ -67,7 +67,7 @@ pub enum ExitCause {
 /// range, from `/api/v1/exec/{handle}/{stdout,stderr}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
-    pub handle: String,
+    pub handle: ExecId,
     pub worker_id: WorkerId,
     pub status: HandleStatus,
     pub started_at: f64,
@@ -93,7 +93,7 @@ pub struct StatusResponse {
 /// process group was killed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandleSnapshotJson {
-    pub handle: String,
+    pub handle: ExecId,
     pub status: HandleStatus,
     #[serde(default)]
     pub exit_cause: Option<ExitCause>,

@@ -18,6 +18,7 @@
 //! than the whole file, and the server reports output sizes as metrics, so a
 //! runaway command is observable after the fact rather than truncated.
 
+use crate::ExecId;
 use std::path::{Path, PathBuf};
 
 /// The two streams a handle captures.
@@ -37,12 +38,12 @@ impl Stream {
 }
 
 /// Directory holding one handle's capture files (`<root>/<request_id>`).
-pub fn handle_dir(root: &Path, request_id: &str) -> PathBuf {
-    root.join(sanitize_id(request_id))
+pub fn handle_dir(root: &Path, request_id: &ExecId) -> PathBuf {
+    root.join(sanitize_id(request_id.as_str()))
 }
 
 /// Path of one stream's capture file (`<root>/<request_id>/<stream>`).
-pub fn stream_path(root: &Path, request_id: &str, stream: Stream) -> PathBuf {
+pub fn stream_path(root: &Path, request_id: &ExecId, stream: Stream) -> PathBuf {
     handle_dir(root, request_id).join(stream.file_name())
 }
 
@@ -55,7 +56,7 @@ pub fn sanitize_id(s: &str) -> String {
 
 /// Byte length of a stream's capture file. Returns 0 when the file does not
 /// exist yet (the command produced no output on that stream, or hasn't run).
-pub async fn stream_len(root: &Path, request_id: &str, stream: Stream) -> u64 {
+pub async fn stream_len(root: &Path, request_id: &ExecId, stream: Stream) -> u64 {
     match tokio::fs::metadata(stream_path(root, request_id, stream)).await {
         Ok(m) => m.len(),
         Err(_) => 0,
@@ -77,7 +78,7 @@ pub fn free_bytes(root: &std::path::Path) -> Option<u64> {
 }
 
 /// Remove a handle's entire capture directory. Idempotent.
-pub async fn purge(root: &Path, request_id: &str) -> std::io::Result<()> {
+pub async fn purge(root: &Path, request_id: &ExecId) -> std::io::Result<()> {
     match tokio::fs::remove_dir_all(handle_dir(root, request_id)).await {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -99,12 +100,13 @@ mod tests {
     #[test]
     fn paths_are_under_root() {
         let root = Path::new("/capture");
+        let id = ExecId::new("abc-123");
         assert_eq!(
-            stream_path(root, "abc-123", Stream::Stdout),
+            stream_path(root, &id, Stream::Stdout),
             Path::new("/capture/abc-123/stdout")
         );
         assert_eq!(
-            stream_path(root, "abc-123", Stream::Stderr),
+            stream_path(root, &id, Stream::Stderr),
             Path::new("/capture/abc-123/stderr")
         );
     }

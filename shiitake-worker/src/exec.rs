@@ -227,7 +227,7 @@ mod tests {
 
     use super::run;
     use shiitake_worker_api::{
-        ExecuteFrame,
+        ExecId, ExecuteFrame,
         capture::{Stream, stream_len, stream_path},
     };
     use std::collections::BTreeMap;
@@ -237,14 +237,14 @@ mod tests {
     const STREAMS: usize = 16;
     const BYTES_PER_STREAM: usize = 8 * 1024 * 1024; // 8 MiB
 
-    fn exec_frame(request_id: &str, command: String) -> ExecuteFrame {
+    fn exec_frame(request_id: &ExecId, command: String) -> ExecuteFrame {
         let mut env = BTreeMap::new();
         env.insert(
             "PATH".to_string(),
             std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
         );
         ExecuteFrame {
-            request_id: request_id.to_string(),
+            request_id: request_id.clone(),
             command,
             working_dir: std::env::temp_dir().to_string_lossy().into_owned(),
             env,
@@ -263,7 +263,7 @@ mod tests {
         let futs = (0..STREAMS).map(|i| {
             let root_path = root_path.clone();
             async move {
-                let request_id = format!("stress-{i}");
+                let request_id = ExecId::new(format!("stress-{i}"));
                 let frame = exec_frame(
                     &request_id,
                     format!("head -c {BYTES_PER_STREAM} /dev/zero | tr '\\0' 'x'; echo err 1>&2"),

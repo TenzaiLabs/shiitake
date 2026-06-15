@@ -15,7 +15,7 @@ use axum::{
 };
 use shiitake_server_api::{ExecRequest, HandleSnapshotJson, SpawnResponse, StatusResponse};
 use shiitake_worker_api::{
-    ExecuteFrame,
+    ExecId, ExecuteFrame,
     capture::{self, Stream},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,7 +34,7 @@ pub async fn exec(
         .workdir
         .unwrap_or_else(|| state.default_workdir.to_string_lossy().into_owned());
     let frame = ExecuteFrame {
-        request_id: Uuid::new_v4().simple().to_string(),
+        request_id: ExecId::new(Uuid::new_v4().simple().to_string()),
         command: req.command,
         working_dir: workdir,
         env: req.env,
@@ -69,7 +69,7 @@ pub async fn dispatch(
 
 pub async fn status(
     State(state): State<AppState>,
-    Path(handle): Path<String>,
+    Path(handle): Path<ExecId>,
 ) -> Result<Json<StatusResponse>, (StatusCode, String)> {
     let snap = state
         .pool
@@ -99,7 +99,7 @@ pub async fn status(
 /// suffix range — no custom offset protocol.
 pub async fn read_stdout(
     State(state): State<AppState>,
-    Path(handle): Path<String>,
+    Path(handle): Path<ExecId>,
     req: Request,
 ) -> Response {
     read_stream(state, handle, req, Stream::Stdout).await
@@ -107,13 +107,13 @@ pub async fn read_stdout(
 
 pub async fn read_stderr(
     State(state): State<AppState>,
-    Path(handle): Path<String>,
+    Path(handle): Path<ExecId>,
     req: Request,
 ) -> Response {
     read_stream(state, handle, req, Stream::Stderr).await
 }
 
-async fn read_stream(state: AppState, handle: String, req: Request, stream: Stream) -> Response {
+async fn read_stream(state: AppState, handle: ExecId, req: Request, stream: Stream) -> Response {
     if state.pool.touch_and_snapshot(&handle).await.is_none() {
         return (StatusCode::NOT_FOUND, "unknown handle").into_response();
     }
@@ -131,7 +131,7 @@ async fn read_stream(state: AppState, handle: String, req: Request, stream: Stre
 
 pub async fn kill(
     State(state): State<AppState>,
-    Path(handle): Path<String>,
+    Path(handle): Path<ExecId>,
 ) -> Result<Json<HandleSnapshotJson>, (StatusCode, String)> {
     let snap = state
         .pool

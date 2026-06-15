@@ -6,7 +6,7 @@ use shiitake_server::{
     http::build_dispatch_router,
     pool::{ExitCause, HandleStatus, WorkerPool},
 };
-use shiitake_worker_api::{ExecuteFrame, Frame, ResultFrame};
+use shiitake_worker_api::{ExecId, ExecuteFrame, Frame, ResultFrame};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tokio::{
@@ -79,7 +79,7 @@ async fn dispatch_with_one_fake_worker_marks_handle_completed() {
     let env: BTreeMap<String, String> = BTreeMap::new();
     let snap = pool
         .dispatch(ExecuteFrame {
-            request_id: "req-A".into(),
+            request_id: ExecId::new("req-A"),
             command: "echo hi".into(),
             working_dir: "/tmp".into(),
             env,
@@ -140,7 +140,7 @@ async fn worker_drop_marks_handle_worker_died() {
     sleep(Duration::from_millis(150)).await;
     let snap = pool
         .dispatch(ExecuteFrame {
-            request_id: "req-die".into(),
+            request_id: ExecId::new("req-die"),
             command: "sleep 99".into(),
             working_dir: "/tmp".into(),
             env: BTreeMap::new(),
@@ -177,7 +177,7 @@ async fn dispatch_without_idle_worker_returns_no_idle() {
 
     let err = pool
         .dispatch(ExecuteFrame {
-            request_id: "req".into(),
+            request_id: ExecId::new("req"),
             command: "echo".into(),
             working_dir: "/tmp".into(),
             env: BTreeMap::new(),

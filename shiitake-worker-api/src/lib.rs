@@ -45,6 +45,33 @@ impl fmt::Display for WorkerId {
     }
 }
 
+/// Identifier for one command execution: minted by the server as a UUID, it is
+/// the request id on the wire, the handle in the HTTP API, and the capture
+/// directory name on disk — all the same value. A newtype so it can't be
+/// confused with other string ids (e.g. a worker id). `#[serde(transparent)]`
+/// keeps it a bare string on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ExecId(String);
+
+impl ExecId {
+    /// Mint a fresh id. Call only at the true origin of an execution — the
+    /// server's UUID mint — never to convert an arbitrary string mid-chain.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ExecId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Optional privilege-drop directive carried on an Execute frame.
 ///
 /// When present, the worker performs `setgid → setgroups → setuid → umask`
@@ -74,7 +101,7 @@ pub enum Frame {
     /// Server → worker: cancel the in-flight command. Worker SIGKILLs the
     /// process group and follows up with a Result frame whose `cancelled`
     /// flag is set.
-    Cancel { request_id: String },
+    Cancel { request_id: ExecId },
     /// Worker → server: the result of an Execute. The output lives on
     /// disk under `<capture_root>/<request_id>/{stdout,stderr}` — the server
     /// stats those files for byte counts, so only exit metadata and the
@@ -84,7 +111,7 @@ pub enum Frame {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecuteFrame {
-    pub request_id: String,
+    pub request_id: ExecId,
     pub command: String,
     pub working_dir: String,
     pub env: BTreeMap<String, String>,
@@ -112,7 +139,7 @@ pub struct ResourceUsage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResultFrame {
-    pub request_id: String,
+    pub request_id: ExecId,
     pub exit_code: Option<i32>,
     pub exit_signal: Option<i32>,
     pub timed_out: bool,
@@ -123,7 +150,7 @@ pub struct ResultFrame {
 
 impl ResultFrame {
     #[allow(dead_code)] // server doesn't construct these — worker does
-    pub fn errored(request_id: String, message: impl Into<String>) -> Self {
+    pub fn errored(request_id: ExecId, message: impl Into<String>) -> Self {
         let _ = message.into();
         Self {
             request_id,
@@ -158,6 +185,24 @@ mod tests {
         match parsed {
             Frame::Hello { worker_id } => assert_eq!(worker_id.as_str(), "worker-7"),
             _ => panic!("expected Hello"),
+        }
+    }
+
+    // `ExecId` is also `#[serde(transparent)]`: the request_id on every frame
+    // stays a bare JSON string, and an old-format Cancel still deserializes.
+    #[test]
+    fn exec_id_is_wire_transparent() {
+        let frame = Frame::Cancel {
+            request_id: ExecId::new("req-1"),
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert_eq!(json, r#"{"kind":"cancel","request_id":"req-1"}"#);
+
+        let parsed: Frame =
+            serde_json::from_str(r#"{"kind":"cancel","request_id":"req-2"}"#).unwrap();
+        match parsed {
+            Frame::Cancel { request_id } => assert_eq!(request_id.as_str(), "req-2"),
+            _ => panic!("expected Cancel"),
         }
     }
 }
