@@ -1938,6 +1938,7 @@ version = "0.2.0"
 dependencies = [
  "libc",
  "serde",
+ "serde_json",
  "tokio",
 ]
 

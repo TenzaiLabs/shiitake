@@ -7,6 +7,43 @@ pub mod capture;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
+
+/// Identifier a worker advertises to the dispatcher (operator-supplied via
+/// `SHIITAKE_WORKER_ID`). A newtype so it can't be confused with other string
+/// ids (e.g. a request id) in the pool. `#[serde(transparent)]` keeps it a bare
+/// string on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WorkerId(String);
+
+impl WorkerId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for WorkerId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for WorkerId {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+impl fmt::Display for WorkerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// Optional privilege-drop directive carried on an Execute frame.
 ///
@@ -31,7 +68,7 @@ pub struct DropTo {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Frame {
     /// Worker → server: first frame after connect, advertises availability.
-    Hello { worker_id: String },
+    Hello { worker_id: WorkerId },
     /// Server → worker: a command to run.
     Execute(ExecuteFrame),
     /// Server → worker: cancel the in-flight command. Worker SIGKILLs the
@@ -95,6 +132,32 @@ impl ResultFrame {
             timed_out: false,
             cancelled: false,
             usage: ResourceUsage::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `WorkerId` is `#[serde(transparent)]`, so it must be wire-identical to the
+    // bare `String` it replaced: a `Hello` frame serializes its worker_id as a
+    // plain JSON string, and an old-format payload still deserializes. This
+    // pins the protocol so the newtype can never silently change the wire shape.
+    #[test]
+    fn worker_id_is_wire_transparent() {
+        let frame = Frame::Hello {
+            worker_id: WorkerId::new("worker-0"),
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert_eq!(json, r#"{"kind":"hello","worker_id":"worker-0"}"#);
+
+        // The pre-newtype payload (a bare string) still deserializes.
+        let parsed: Frame =
+            serde_json::from_str(r#"{"kind":"hello","worker_id":"worker-7"}"#).unwrap();
+        match parsed {
+            Frame::Hello { worker_id } => assert_eq!(worker_id.as_str(), "worker-7"),
+            _ => panic!("expected Hello"),
         }
     }
 }

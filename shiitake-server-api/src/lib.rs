@@ -5,8 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 // `DropTo` is part of the `/exec` request body (and the on-the-wire frame), so
-// re-export it for callers building requests against this API.
-pub use shiitake_worker_api::DropTo;
+// re-export it for callers building requests against this API. `WorkerId`
+// likewise appears on `StatusResponse`.
+pub use shiitake_worker_api::{DropTo, WorkerId};
 use std::collections::BTreeMap;
 use strum::IntoStaticStr;
 
@@ -67,7 +68,7 @@ pub enum ExitCause {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub handle: String,
-    pub worker_id: String,
+    pub worker_id: WorkerId,
     pub status: HandleStatus,
     pub started_at: f64,
     #[serde(default)]

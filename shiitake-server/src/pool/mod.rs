@@ -15,7 +15,7 @@ use futures_util::{
     SinkExt, StreamExt,
     stream::{SplitSink, SplitStream},
 };
-use shiitake_worker_api::{ExecuteFrame, Frame, ResourceUsage, ResultFrame, capture};
+use shiitake_worker_api::{ExecuteFrame, Frame, ResourceUsage, ResultFrame, WorkerId, capture};
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -48,7 +48,7 @@ pub enum DispatchError {
 
 struct PendingEntry {
     sink: SharedSink,
-    worker_id: String,
+    worker_id: WorkerId,
     started_at: Instant,
 }
 
@@ -56,7 +56,7 @@ struct PoolState {
     idle: Vec<WorkerEntry>,
     inflight: HashMap<String, PendingEntry>,
     handles: HashMap<String, HandleRow>,
-    liveness: HashMap<String, WorkerLiveness>,
+    liveness: HashMap<WorkerId, WorkerLiveness>,
 }
 
 /// Last time a worker sent any frame, plus a signal the keepalive pinger
@@ -67,7 +67,7 @@ struct WorkerLiveness {
 }
 
 struct WorkerEntry {
-    worker_id: String,
+    worker_id: WorkerId,
     sink: SharedSink,
 }
 
@@ -78,7 +78,7 @@ struct HandleRow {
 
 struct HandleStateInner {
     handle_id: String,
-    worker_id: String,
+    worker_id: WorkerId,
     started_at: SystemTime,
     inner: Mutex<HandleRuntime>,
     /// Notifies waiters every time the runtime transitions. Used by the
@@ -106,7 +106,7 @@ struct HandleRuntime {
 #[derive(Debug, Clone)]
 pub struct HandleSnapshot {
     pub handle_id: String,
-    pub worker_id: String,
+    pub worker_id: WorkerId,
     pub started_at: SystemTime,
     pub status: HandleStatus,
     pub finished_at: Option<SystemTime>,
@@ -348,7 +348,7 @@ impl WorkerPool {
     /// drive its read loop. Returns when the WS closes.
     pub async fn register_and_run(
         &self,
-        worker_id: String,
+        worker_id: WorkerId,
         sink: WorkerSink,
         mut stream: WorkerStream,
     ) -> Result<()> {
@@ -399,7 +399,7 @@ impl WorkerPool {
     /// Refresh a worker's last-seen timestamp. Called on every inbound frame
     /// (Result, Pong, …) so the keepalive pinger can tell a live worker from
     /// a wedged one.
-    async fn touch_worker(&self, worker_id: &str) {
+    async fn touch_worker(&self, worker_id: &WorkerId) {
         let mut s = self.state.lock().await;
         if let Some(l) = s.liveness.get_mut(worker_id) {
             l.last_seen = Instant::now();
@@ -490,7 +490,7 @@ impl WorkerPool {
         metrics().set_pool_workers(idle as u64, inflight as u64);
     }
 
-    async fn handle_worker_drop(&self, worker_id: &str) {
+    async fn handle_worker_drop(&self, worker_id: &WorkerId) {
         // Find any inflight requests on this worker. The worker may have
         // disconnected mid-command; we use the K8s probe to disambiguate
         // OOM-killed-container from generic disconnect.
@@ -499,7 +499,7 @@ impl WorkerPool {
             let to_remove: Vec<String> = s
                 .inflight
                 .iter()
-                .filter(|(_, p)| p.worker_id == worker_id)
+                .filter(|(_, p)| p.worker_id == *worker_id)
                 .map(|(rid, _)| rid.clone())
                 .collect();
             to_remove
@@ -512,7 +512,7 @@ impl WorkerPool {
         // and registers afresh.
         {
             let mut s = self.state.lock().await;
-            s.idle.retain(|w| w.worker_id != worker_id);
+            s.idle.retain(|w| w.worker_id != *worker_id);
             s.liveness.remove(worker_id);
         }
         self.report_occupancy().await;
@@ -523,7 +523,7 @@ impl WorkerPool {
         let oom_killed = match &self.probe {
             Some(probe) => {
                 probe
-                    .was_oom_killed(&self.pod_name, &self.namespace, worker_id)
+                    .was_oom_killed(&self.pod_name, &self.namespace, worker_id.as_str())
                     .await
             }
             None => false,
@@ -644,7 +644,7 @@ impl WorkerPool {
         loop {
             ticker.tick().await;
             let now = Instant::now();
-            let workers: Vec<(String, SharedSink, Instant, Arc<Notify>)> = {
+            let workers: Vec<(WorkerId, SharedSink, Instant, Arc<Notify>)> = {
                 let s = self.state.lock().await;
                 s.idle
                     .iter()

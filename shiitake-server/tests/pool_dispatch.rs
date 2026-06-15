@@ -161,7 +161,7 @@ async fn worker_drop_marks_handle_worker_died() {
     let after = pool.touch_and_snapshot(&snap.handle_id).await.unwrap();
     assert_eq!(after.status, HandleStatus::Error);
     assert_eq!(after.exit_cause, Some(ExitCause::WorkerDied));
-    assert_eq!(after.worker_id, "doomed");
+    assert_eq!(after.worker_id.as_str(), "doomed");
 }
 
 #[tokio::test]
