@@ -15,7 +15,9 @@ use futures_util::{
     SinkExt, StreamExt,
     stream::{SplitSink, SplitStream},
 };
-use shiitake_worker_api::{ExecId, ExecuteFrame, Frame, ResourceUsage, ResultFrame, WorkerId, capture};
+use shiitake_worker_api::{
+    ExecId, ExecuteFrame, Frame, ResourceUsage, ResultFrame, WorkerId, capture,
+};
 use std::{
     collections::HashMap,
     path::PathBuf,
