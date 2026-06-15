@@ -5,16 +5,11 @@
 
 pub mod capture;
 
+use derive_more::Display;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Identifier a worker advertises to the dispatcher (operator-supplied via
-/// `SHIITAKE_WORKER_ID`). A newtype so it can't be confused with other string
-/// ids (e.g. a request id) in the pool. `#[serde(transparent)]` keeps it a bare
-/// string on the wire.
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, derive_more::Display,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Display)]
 #[serde(transparent)]
 #[display("{_0}")]
 pub struct WorkerId(String);
@@ -31,14 +26,7 @@ impl WorkerId {
     }
 }
 
-/// Identifier for one command execution: minted by the server as a UUID, it is
-/// the request id on the wire, the handle in the HTTP API, and the capture
-/// directory name on disk — all the same value. A newtype so it can't be
-/// confused with other string ids (e.g. a worker id). `#[serde(transparent)]`
-/// keeps it a bare string on the wire.
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, derive_more::Display,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Display)]
 #[serde(transparent)]
 #[display("{_0}")]
 pub struct ExecId(String);
