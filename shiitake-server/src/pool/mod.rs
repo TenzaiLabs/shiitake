@@ -297,7 +297,7 @@ impl WorkerPool {
         let finished_at = SystemTime::now();
         {
             let mut runtime = row.state.inner.lock().await;
-            if matches!(runtime.status, HandleStatus::Running) {
+            if runtime.status == HandleStatus::Running {
                 runtime.finished_at = Some(finished_at);
                 runtime.cancelled = true;
                 runtime.status = HandleStatus::Error;
@@ -430,7 +430,7 @@ impl WorkerPool {
             let mut runtime = row.state.inner.lock().await;
             // Ignore a late Result for a handle already marked terminal (e.g.
             // cancelled), which set its own outcome and won't be overwritten.
-            if !matches!(runtime.status, HandleStatus::Running) {
+            if runtime.status != HandleStatus::Running {
                 return;
             }
             runtime.finished_at = Some(finished_at);
@@ -545,7 +545,7 @@ impl WorkerPool {
                     runtime.finished_at = Some(finished_at);
                     runtime.status = status;
                     runtime.exit_cause = Some(cause);
-                    if matches!(cause, ExitCause::OomContainer) {
+                    if cause == ExitCause::OomContainer {
                         runtime.exit_signal = Some(libc::SIGKILL);
                     }
                     self.finalize_telemetry(
@@ -582,7 +582,7 @@ impl WorkerPool {
             // Subscribe *before* the status check to avoid the race where
             // complete_request fires between our check and our subscribe.
             let runtime = row.state.inner.lock().await;
-            if !matches!(runtime.status, HandleStatus::Running) {
+            if runtime.status != HandleStatus::Running {
                 return;
             }
             drop(runtime);
