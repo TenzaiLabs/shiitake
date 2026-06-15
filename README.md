@@ -105,14 +105,22 @@ kubelet's container status, never self-reported by the worker.
 ## Distribution & deployment
 
 - The **server** ships as a container image (`ghcr.io/tenzailabs/shiitake-server`).
-- The **worker** ships as a statically-linked binary. Drop it into your own
-  toolchain image as the entrypoint:
+- The **worker** ships as a minimal container image holding just the
+  statically-linked binary (`ghcr.io/tenzailabs/shiitake-worker`) — copy it
+  straight into your own toolchain image at build time:
 
   ```dockerfile
   FROM your/toolchain:latest
-  COPY shiitake-worker /usr/local/bin/shiitake-worker
+  # Pin by immutable digest — GHCR tags (incl. release tags) are mutable, so a
+  # `COPY --from` by tag can be silently moved. Get the digest for a release
+  # from the package page or `docker buildx imagetools inspect <image>:<tag>`.
+  COPY --from=ghcr.io/tenzailabs/shiitake-worker@sha256:<digest> \
+       /usr/local/bin/shiitake-worker /usr/local/bin/shiitake-worker
   ENTRYPOINT ["/usr/local/bin/shiitake-worker"]
   ```
+
+  The same binary is also attached to each GitHub release if you'd rather fetch
+  and `COPY` it yourself.
 
 Run one server container and N worker containers in a single Pod that shares the
 pod network namespace (so workers reach the dispatcher on `127.0.0.1`) and a
