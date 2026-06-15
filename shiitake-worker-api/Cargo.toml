@@ -7,3 +7,6 @@ version.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1", features = ["fs"] }
 libc = "0.2"
+
+[dev-dependencies]
+serde_json = "1.0"

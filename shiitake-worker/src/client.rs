@@ -7,7 +7,7 @@
 use crate::exec;
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
-use shiitake_worker_api::{Frame, ResultFrame};
+use shiitake_worker_api::{Frame, ResultFrame, WorkerId};
 use std::{path::Path, time::Duration};
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
@@ -41,7 +41,7 @@ pub async fn run_one_command(
     let (mut sink, mut stream) = ws.split();
 
     let hello = serde_json::to_string(&Frame::Hello {
-        worker_id: worker_id.to_string(),
+        worker_id: WorkerId::new(worker_id),
     })?;
     sink.send(Message::Text(hello.into()))
         .await
