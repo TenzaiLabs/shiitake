@@ -1,0 +1,41 @@
+# syntax=docker/dockerfile:1
+
+# Publishable worker image: a minimal, scratch-based image whose only content is
+# the statically-linked `shiitake-worker` binary. It exists to be a COPY source
+# for downstream worker images, so they don't have to fetch the binary from the
+# GitHub release:
+#
+#   COPY --from=ghcr.io/tenzailabs/shiitake-worker:<tag> \
+#        /usr/local/bin/shiitake-worker /usr/local/bin/shiitake-worker
+#
+# The binary is static musl, so it also runs as-is — but a real worker image
+# pairs it with a toolchain (bash, interpreters, …) to execute commands. For the
+# representative end-to-end image that does that, see tests/Dockerfile.worker.
+#
+# Build context is the repository root: `docker build -f Dockerfile.worker .`
+
+# Base image pinned by digest (tags are mutable). rust:1-slim-bookworm:
+FROM rust:1-slim-bookworm@sha256:c8a94a78f67ec8c4d474ec7f71e0720f21eb7e584e158daec0874cafa7c30e4d AS builder
+ARG TARGETARCH
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends musl-tools \
+ && rm -rf /var/lib/apt/lists/*
+ENV CC_x86_64_unknown_linux_musl=musl-gcc \
+    CC_aarch64_unknown_linux_musl=musl-gcc
+WORKDIR /src
+COPY . .
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) triple=x86_64-unknown-linux-musl ;; \
+      arm64) triple=aarch64-unknown-linux-musl ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    rustup target add "$triple"; \
+    cargo build --release --locked --target "$triple" --bin shiitake-worker; \
+    install -D "target/${triple}/release/shiitake-worker" /out/shiitake-worker
+
+# scratch: the static binary needs no runtime, keeping the image to just the
+# binary — the leanest possible COPY source.
+FROM scratch
+COPY --from=builder /out/shiitake-worker /usr/local/bin/shiitake-worker
+ENTRYPOINT ["/usr/local/bin/shiitake-worker"]
