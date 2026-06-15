@@ -1876,7 +1876,7 @@ dependencies = [
 
 [[package]]
 name = "shiitake-rs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "reqwest 0.12.28",
  "shiitake-server-api",
@@ -1885,7 +1885,7 @@ dependencies = [
 
 [[package]]
 name = "shiitake-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1917,7 +1917,7 @@ dependencies = [
 
 [[package]]
 name = "shiitake-server-api"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "shiitake-worker-api",
@@ -1926,7 +1926,7 @@ dependencies = [
 
 [[package]]
 name = "shiitake-worker"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1946,7 +1946,7 @@ dependencies = [
 
 [[package]]
 name = "shiitake-worker-api"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "derive_more",
  "libc",

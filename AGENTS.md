@@ -72,15 +72,15 @@ options. Each crate declares its own dependencies (no `[workspace.dependencies]`
 kept current with `cargo upgrade --incompatible`. Release Drafter maintains a draft release and autolabels PRs.
 Publishing a release triggers `release.yml`, which stamps the workspace `version`
 from the release tag (in-place, no commit) before building, then pushes the
-server image to GHCR and the worker binary as release assets.
+server and worker images to GHCR.
 
 ## Versioning
 
 The version is managed in-code and kept in lockstep across the two published
 artifacts:
 
-- Cargo workspace — `Cargo.toml` `[workspace.package] version` (server image +
-  worker binary).
+- Cargo workspace — `Cargo.toml` `[workspace.package] version` (server +
+  worker images).
 - Python client — `clients/shiitake-py/pyproject.toml` `version`.
 
 A PR is responsible for bumping the version (semver: major / minor / patch,
