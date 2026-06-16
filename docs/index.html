@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Shiitake — sandboxing for untrusted commands</title>
+<meta name="description" content="Shiitake is an HTTP server that fans commands out to a pool of resident, resource-bounded worker containers on Kubernetes. Each command runs in its own worker, which resets to a clean slate between commands." />
+
+<!-- Open Graph -->
+<meta property="og:title" content="🍄 Shiitake" />
+<meta property="og:description" content="Sandboxing for untrusted commands on Kubernetes. Each command runs in its own resource-bounded worker that resets to a clean slate between commands." />
+<meta property="og:type" content="website" />
+
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🍄</text></svg>" />
+
+<style>
+  :root {
+    --bg: #f7fafa;
+    --bg-alt: #ecf3f4;
+    --card: #ffffff;
+    --ink: #1f2a2c;
+    --ink-soft: #5b6e72;
+    --accent: #00a8bf;
+    --accent-ink: #007a8b;
+    --accent-soft: #cdeef3;
+    --accent-contrast: #ffffff;
+    --tz-cyan: #00a8bf;
+    --line: #dde8ea;
+    --code-bg: #20292b;
+    --code-ink: #e6f2f4;
+    --radius: 16px;
+    --max: 1080px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #222727;
+      --bg-alt: #282e2e;
+      --card: #2c3333;
+      --ink: #ecf4f5;
+      --ink-soft: #9fb3b6;
+      --accent: #88ffff;
+      --accent-ink: #88ffff;
+      --accent-soft: #134247;
+      --accent-contrast: #103033;
+      --tz-cyan: #88ffff;
+      --line: #394243;
+      --code-bg: #181d1e;
+      --code-ink: #e6f2f4;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--ink);
+    background: var(--bg);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent-ink); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: var(--max); margin: 0 auto; padding: 0 24px; }
+
+  /* Nav */
+  nav {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 20px 24px; max-width: var(--max); margin: 0 auto;
+  }
+  nav .brand { font-weight: 700; font-size: 1.15rem; letter-spacing: -0.02em; }
+  nav .links { display: flex; gap: 22px; align-items: center; font-size: 0.95rem; }
+  nav .links a { color: var(--ink-soft); font-weight: 500; }
+  nav .links a:hover { color: var(--accent-ink); text-decoration: none; }
+
+  /* Hero */
+  .hero { text-align: center; padding: 56px 0 72px; }
+  .hero .shroom { font-size: 5rem; line-height: 1; filter: drop-shadow(0 6px 18px rgba(0,168,191,0.25)); }
+  .hero h1 {
+    font-size: clamp(2.6rem, 6vw, 4rem); margin: 14px 0 6px;
+    letter-spacing: -0.03em; font-weight: 800;
+  }
+  .hero .tagline {
+    font-size: clamp(1.2rem, 3vw, 1.6rem); font-weight: 600;
+    color: var(--ink); margin: 0 auto 18px; max-width: 26ch;
+  }
+  .hero .lede {
+    font-size: 1.1rem; color: var(--ink-soft);
+    max-width: 60ch; margin: 0 auto 32px;
+  }
+  .cta { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 12px 22px; border-radius: 999px; font-weight: 600; font-size: 1rem;
+    border: 1px solid transparent; transition: transform .08s ease, box-shadow .2s ease;
+  }
+  .btn:hover { text-decoration: none; transform: translateY(-1px); }
+  .btn-primary { background: var(--accent); color: var(--accent-contrast); box-shadow: 0 8px 22px rgba(0,168,191,0.3); }
+  .btn-ghost { background: transparent; color: var(--ink); border-color: var(--line); }
+
+  /* Section scaffolding */
+  section { padding: 56px 0; }
+  section.alt { background: var(--bg-alt); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  h2 { font-size: clamp(1.7rem, 4vw, 2.2rem); letter-spacing: -0.02em; margin: 0 0 8px; text-align: center; }
+  .section-sub { text-align: center; color: var(--ink-soft); max-width: 56ch; margin: 0 auto 40px; }
+  .read-more { text-align: center; margin: 36px 0 0; }
+  .read-more a { font-weight: 600; font-size: 0.98rem; }
+
+  /* Benefits list */
+  .benefits { list-style: none; max-width: 680px; margin: 0 auto; padding: 0; }
+  .benefits li { padding: 24px 0; border-bottom: 1px solid var(--line); }
+  .benefits li:last-child { border-bottom: none; padding-bottom: 0; }
+  .benefits h3 { margin: 0 0 6px; font-size: 1.15rem; }
+  .benefits p { margin: 0; color: var(--ink-soft); }
+
+  /* How it works */
+  .flow {
+    display: flex; align-items: stretch; justify-content: center; gap: 0; flex-wrap: wrap;
+    max-width: 860px; margin: 0 auto;
+  }
+  .node {
+    background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 18px 20px; text-align: center; flex: 1; min-width: 150px;
+  }
+  .node .k { font-weight: 700; }
+  .node .d { font-size: 0.85rem; color: var(--ink-soft); }
+  .arrow { display: flex; align-items: center; color: var(--accent); font-size: 1.5rem; padding: 0 10px; }
+  @media (max-width: 640px) { .arrow { transform: rotate(90deg); padding: 6px 0; } .flow { flex-direction: column; align-items: stretch; } }
+
+  /* Code */
+  .code-card { max-width: 760px; margin: 0 auto; }
+  pre {
+    background: var(--code-bg); color: var(--code-ink); border-radius: var(--radius);
+    padding: 22px 24px; overflow-x: auto; font-size: 0.9rem; line-height: 1.7;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    border: 1px solid rgba(255,255,255,0.06);
+  }
+  pre .c { color: #8fa6a9; }
+  pre .p { color: #88ffff; }
+
+  /* Contributors */
+  .contributors {
+    display: flex; flex-wrap: wrap; justify-content: center; gap: 18px;
+    max-width: 760px; margin: 0 auto; padding: 0; list-style: none;
+  }
+  .contributors a {
+    display: flex; flex-direction: column; align-items: center; gap: 8px;
+    width: 96px; color: var(--ink-soft); font-size: 0.85rem; font-weight: 500;
+  }
+  .contributors a:hover { color: var(--accent-ink); text-decoration: none; }
+  .contributors img {
+    width: 64px; height: 64px; border-radius: 50%;
+    border: 2px solid var(--line); background: var(--card);
+    transition: transform .08s ease, border-color .2s ease;
+  }
+  .contributors a:hover img { transform: translateY(-2px); border-color: var(--accent); }
+  .contributors .login { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* Footer */
+  footer { padding: 48px 0 56px; border-top: 1px solid var(--line); text-align: center; color: var(--ink-soft); }
+  .built {
+    display: inline-flex; align-items: center; gap: 10px; font-size: 1.05rem; font-weight: 500;
+    margin-bottom: 8px;
+  }
+  .built .tenzai { display: inline-flex; align-items: center; color: var(--ink); }
+  .built .tenzai svg { display: block; }
+  .built .tenzai .wordmark { fill: currentColor; }
+  .built .tenzai .plus { fill: var(--tz-cyan); }
+  footer .small { font-size: 0.85rem; opacity: 0.8; }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="brand">🍄 Shiitake</div>
+  <div class="links">
+    <a href="#quickstart">Quickstart</a>
+    <a href="#how">How it works</a>
+    <a href="#use-cases">What it's for</a>
+    <a href="docs.html">Docs</a>
+    <a href="https://github.com/TenzaiLabs/shiitake">GitHub</a>
+  </div>
+</nav>
+
+<header class="hero wrap">
+  <div class="shroom">🍄</div>
+  <h1>Shiitake</h1>
+  <p class="tagline">Sandboxing for untrusted commands on Kubernetes.</p>
+  <p class="lede">
+    An HTTP server that fans commands out to a pool of <strong>resident, resource-bounded
+    worker containers</strong> in your Kubernetes cluster. Each command runs in its own
+    worker, which resets to a clean slate between commands — no state bleed, ever.
+  </p>
+  <div class="cta">
+    <a class="btn btn-primary" href="docs.html">📖 Read the docs</a>
+    <a class="btn btn-ghost" href="https://github.com/TenzaiLabs/shiitake">★ View on GitHub</a>
+  </div>
+</header>
+
+<section class="alt" id="quickstart">
+  <div class="wrap">
+    <h2>Quickstart</h2>
+    <p class="section-sub">Run a server, run a worker, dispatch a command. The worker stays resident and resets between commands.</p>
+    <div class="code-card">
+<pre><span class="c"># Terminal 1 — the server (the only ingress)</span>
+SHIITAKE_AUTH_TOKEN=dev-token SHIITAKE_CAPTURE_ROOT=/tmp/capture \
+  cargo run --bin shiitake-server
+
+<span class="c"># Terminal 2 — one worker, joining the pool</span>
+SHIITAKE_WORKER_ID=worker-0 SHIITAKE_CAPTURE_ROOT=/tmp/capture \
+  cargo run --bin shiitake-worker
+
+<span class="c"># Terminal 3 — dispatch a command, get a handle back</span>
+curl -s <span class="p">-H</span> <span class="p">"Authorization: Bearer dev-token"</span> \
+  <span class="p">-X</span> POST localhost:8080/api/v1/exec \
+  <span class="p">-d</span> <span class="p">'{"command": "echo hello from a sandboxed worker"}'</span></pre>
+    </div>
+    <p class="read-more"><a href="docs.html#quickstart">Read more in the docs →</a></p>
+  </div>
+</section>
+
+<section id="how">
+  <div class="wrap">
+    <h2>How it works</h2>
+    <p class="section-sub">
+      One server is the only ingress. It hands each command to a worker over an in-pod
+      WebSocket; the worker runs it, streams output to disk, reports the result, then
+      resets its sandbox before the next command.
+    </p>
+    <div class="flow">
+      <div class="node"><div class="k">POST /exec</div><div class="d">your request</div></div>
+      <div class="arrow">→</div>
+      <div class="node"><div class="k">Server</div><div class="d">the only ingress</div></div>
+      <div class="arrow">→</div>
+      <div class="node"><div class="k">Worker pool</div><div class="d">N idle workers</div></div>
+      <div class="arrow">→</div>
+      <div class="node"><div class="k">Isolated run</div><div class="d">bounded · isolated · resets</div></div>
+    </div>
+    <p class="read-more"><a href="docs.html#architecture">Read more in the docs →</a></p>
+  </div>
+</section>
+
+<section class="alt" id="use-cases">
+  <div class="wrap">
+    <h2>What it's for</h2>
+    <p class="section-sub">Shiitake is generic — it knows nothing about your application. A few things it's particularly good at:</p>
+    <ul class="benefits">
+      <li>
+        <h3>🛡️ Sandbox untrusted commands</h3>
+        <p>
+          Every command runs in its own resource-bounded worker container — it can't see
+          or touch another command's process, files, or output. The worker resets to a clean
+          slate between commands (and recycles a fresh container if it can't), so nothing
+          carries over to the next caller.
+        </p>
+      </li>
+      <li>
+        <h3>⚡ Run commands without pod-create rights</h3>
+        <p>
+          Skip giving your workload Kubernetes permissions to spawn a Job or Pod per task. A fixed pool
+          of workers is already running and waiting — you just <code>POST</code> a command and get a
+          handle back. No RBAC to create pods, no per-task scheduling latency.
+        </p>
+      </li>
+      <li>
+        <h3>💥 OOM-killed protection</h3>
+        <p>
+          Memory limits are enforced at the container level, so an allocation bomb only kills its own
+          worker — the server and every other worker keep running. The kill is detected from the
+          kubelet's container status and reported as <code>oom_container</code>, never silently lost.
+        </p>
+      </li>
+      <li>
+        <h3>🌊 Handle large outputs</h3>
+        <p>
+          The worker redirects stdout/stderr straight into capture files via inherited fds — the kernel
+          writes to disk, so neither process buffers output in memory. Read it back over HTTP with
+          <code>Range</code> support, and watch output size as a metric instead of truncating it.
+        </p>
+      </li>
+    </ul>
+    <p class="read-more"><a href="docs.html#overview">Read more in the docs →</a></p>
+  </div>
+</section>
+
+<section id="contributors" hidden>
+  <div class="wrap">
+    <h2>Thank you, contributors 💙</h2>
+    <p class="section-sub">
+      Shiitake is better because of the people who pitch in from outside the team —
+      thank you for every issue, review, and pull request.
+    </p>
+    <ul class="contributors" id="contributors-grid"></ul>
+  </div>
+</section>
+
+<script>
+(async () => {
+  try {
+    // contributors.json is baked at deploy time by .github/workflows/pages.yml —
+    // it already excludes org members & owners (including private memberships,
+    // which an unauthenticated browser call can't see). No runtime GitHub API.
+    const res = await fetch('./contributors.json');
+    if (!res.ok) return;
+    const external = await res.json();
+    if (!Array.isArray(external) || external.length === 0) return;
+    const grid = document.getElementById('contributors-grid');
+    for (const c of external) {
+      const li = document.createElement('li');
+      const a = document.createElement('a');
+      a.href = c.html_url;
+      const img = document.createElement('img');
+      img.src = c.avatar_url + (c.avatar_url.includes('?') ? '&' : '?') + 's=128';
+      img.alt = c.login;
+      img.loading = 'lazy';
+      const login = document.createElement('span');
+      login.className = 'login';
+      login.textContent = c.login;
+      a.append(img, login);
+      li.append(a);
+      grid.append(li);
+    }
+    document.getElementById('contributors').hidden = false;
+  } catch {
+    // No baked list (e.g. local preview) or fetch failed — leave it hidden.
+  }
+})();
+</script>
+
+<footer>
+  <div class="wrap">
+    <div class="built">
+      <span>Made with 🤩 by</span>
+      <a class="tenzai" href="https://tenzai.com" aria-label="Tenzai">
+        <svg width="96" height="24" viewBox="0 0 192 48" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Tenzai">
+          <defs>
+            <radialGradient cx="50%" cy="50%" fx="50%" fy="50%" r="60.1985575%" gradientTransform="translate(0.5, 0.5), scale(1, 0.825), rotate(-90), translate(-0.5, -0.5)" id="tz-grad">
+              <stop stop-color="#00A8BF" offset="0%"></stop>
+              <stop stop-color="#88FFFF" offset="100%"></stop>
+            </radialGradient>
+          </defs>
+          <g stroke="none" fill="none" fill-rule="evenodd">
+            <path class="wordmark" d="M54,17 L54,11 L76,11 L76,17 L68,17 L68,37 L62,37 L62,17 L54,17 Z M79,11 L98,11 L98,17 L85,17 L85,21 L97,21 L97,27 L85,27 L85,31 L98,31 L98,37 L79,37 L79,11 Z M138,17 L127,17 L127,11 L146,11 L146,17 L135,31 L146,31 L146,37 L127,37 L127,31 L138,17 Z M155,37 L148,37 L156,11 L165,11 L173,37 L166,37 L164.385,31 L156.615,31 L155,37 Z M160.5,16.572 L158.231,25 L162.769,25 L160.5,16.572 Z M123,37 L117,37 L108,22 L108,37 L102,37 L102,11 L108,11 L117,26 L117,11 L123,11 L123,37 Z M175,11 L181,11 L181,37 L175,37 L175,11 Z"></path>
+            <g transform="translate(-8, -8)">
+              <path d="M40.2417576,35.999 L46.8492424,42.6066017 L42.6066017,46.8492424 L35.9997576,40.242 L36,36 L40.2417576,35.999 Z M23.7567576,35.999 L28,36 L27.9997576,40.242 L21.3933983,46.8492424 L17.1507576,42.6066017 L23.7567576,35.999 Z M35,14 L35,24.756 L42.6066017,17.1507576 L46.8492424,21.3933983 L40.2437576,27.999 L23.7577576,27.999 L17.1507576,21.3933983 L21.3933983,17.1507576 L29,24.756 L29,14 L35,14 Z" fill="url(#tz-grad)"></path>
+              <polygon class="plus" points="50 29 50 35 35 35 35 50 29 50 29 35 14 35 14 29"></polygon>
+            </g>
+          </g>
+        </svg>
+      </a>
+    </div>
+    <div class="small">🍄 Shiitake is open source · <a href="docs.html">Docs</a> · <a href="https://github.com/TenzaiLabs/shiitake">github.com/TenzaiLabs/shiitake</a></div>
+  </div>
+</footer>
+
+</body>
+</html>

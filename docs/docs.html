@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Shiitake — Documentation</title>
+<meta name="description" content="Documentation for Shiitake: architecture, installation, Kubernetes deployment, building a custom worker image, the HTTP API, configuration, and security considerations." />
+
+<meta property="og:title" content="🍄 Shiitake — Documentation" />
+<meta property="og:description" content="Install Shiitake, deploy it on Kubernetes, build a custom worker image, and call the HTTP API — plus the security model end to end." />
+<meta property="og:type" content="website" />
+
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🍄</text></svg>" />
+
+<style>
+  :root {
+    --bg: #f7fafa;
+    --bg-alt: #ecf3f4;
+    --card: #ffffff;
+    --ink: #1f2a2c;
+    --ink-soft: #5b6e72;
+    --accent: #00a8bf;
+    --accent-ink: #007a8b;
+    --accent-soft: #cdeef3;
+    --accent-contrast: #ffffff;
+    --tz-cyan: #00a8bf;
+    --line: #dde8ea;
+    --code-bg: #20292b;
+    --code-ink: #e6f2f4;
+    --warn-bg: #fff5e6;
+    --warn-line: #f0c885;
+    --warn-ink: #7a5512;
+    --radius: 16px;
+    --max: 1180px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #222727;
+      --bg-alt: #282e2e;
+      --card: #2c3333;
+      --ink: #ecf4f5;
+      --ink-soft: #9fb3b6;
+      --accent: #88ffff;
+      --accent-ink: #88ffff;
+      --accent-soft: #134247;
+      --accent-contrast: #103033;
+      --tz-cyan: #88ffff;
+      --line: #394243;
+      --code-bg: #181d1e;
+      --code-ink: #e6f2f4;
+      --warn-bg: #332a1a;
+      --warn-line: #6b551f;
+      --warn-ink: #f0d29a;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--ink);
+    background: var(--bg);
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent-ink); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* Nav */
+  nav {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 28px; border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; background: var(--bg); z-index: 20;
+  }
+  nav .brand { font-weight: 700; font-size: 1.15rem; letter-spacing: -0.02em; color: var(--ink); }
+  nav .brand a { color: inherit; }
+  nav .brand a:hover { text-decoration: none; }
+  nav .links { display: flex; gap: 22px; align-items: center; font-size: 0.95rem; }
+  nav .links a { color: var(--ink-soft); font-weight: 500; }
+  nav .links a:hover { color: var(--accent-ink); text-decoration: none; }
+
+  /* Layout */
+  .layout { max-width: var(--max); margin: 0 auto; display: flex; gap: 40px; padding: 0 28px; }
+  aside {
+    flex: 0 0 230px; position: sticky; top: 73px; align-self: flex-start;
+    height: calc(100vh - 73px); overflow-y: auto; padding: 32px 0 48px;
+  }
+  aside h4 {
+    margin: 18px 0 8px; font-size: 0.72rem; text-transform: uppercase;
+    letter-spacing: 0.08em; color: var(--ink-soft); font-weight: 700;
+  }
+  aside ul { list-style: none; margin: 0 0 6px; padding: 0; }
+  aside li a {
+    display: block; padding: 4px 10px; border-radius: 8px;
+    color: var(--ink-soft); font-size: 0.9rem; font-weight: 500;
+  }
+  aside li a:hover { background: var(--bg-alt); color: var(--accent-ink); text-decoration: none; }
+
+  main { flex: 1 1 auto; min-width: 0; padding: 32px 0 96px; max-width: 820px; }
+
+  /* Typography */
+  main h1 { font-size: clamp(2rem, 5vw, 2.6rem); letter-spacing: -0.03em; margin: 0 0 8px; font-weight: 800; }
+  main .subtitle { color: var(--ink-soft); font-size: 1.1rem; margin: 0 0 8px; }
+  main h2 {
+    font-size: 1.55rem; letter-spacing: -0.02em; margin: 52px 0 14px;
+    padding-top: 12px; border-top: 1px solid var(--line); scroll-margin-top: 88px;
+  }
+  main h2:first-of-type { border-top: none; }
+  main h3 { font-size: 1.15rem; margin: 30px 0 10px; scroll-margin-top: 88px; }
+  main p { margin: 0 0 14px; }
+  main ul, main ol { margin: 0 0 14px; padding-left: 22px; }
+  main li { margin: 6px 0; }
+  main strong { color: var(--ink); }
+
+  /* Inline + block code */
+  code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.86em; background: var(--bg-alt); padding: 0.12em 0.4em;
+    border-radius: 6px; border: 1px solid var(--line);
+  }
+  pre {
+    background: var(--code-bg); color: var(--code-ink); border-radius: var(--radius);
+    padding: 20px 22px; overflow-x: auto; font-size: 0.86rem; line-height: 1.65;
+    border: 1px solid rgba(255,255,255,0.06); margin: 0 0 18px;
+  }
+  pre code { background: none; border: none; padding: 0; font-size: inherit; color: inherit; }
+
+  /* Mermaid diagram */
+  .diagram {
+    background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 18px; margin: 0 0 18px; overflow-x: auto;
+  }
+  .diagram pre.mermaid { background: none; border: none; padding: 0; margin: 0; text-align: center; }
+  .diagram svg { display: block; margin: 0 auto; max-width: 100%; height: auto; }
+  pre .c { color: #8fa6a9; }
+  pre .p { color: #88ffff; }
+  pre .s { color: #b7e4a0; }
+
+  /* Tables */
+  .table-wrap { overflow-x: auto; margin: 0 0 18px; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--ink); font-weight: 700; background: var(--bg-alt); }
+  td code, th code { white-space: nowrap; }
+
+  /* Method pills */
+  .ep { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 22px 0 6px; }
+  .verb {
+    font-family: ui-monospace, monospace; font-size: 0.72rem; font-weight: 700;
+    padding: 3px 8px; border-radius: 6px; letter-spacing: 0.04em; color: #fff;
+  }
+  .verb.get { background: #2f8f6b; }
+  .verb.post { background: #2f6f8f; }
+  .verb.delete { background: #97402f; }
+  .ep .path { font-family: ui-monospace, monospace; font-size: 0.92rem; font-weight: 600; }
+
+  /* Callouts */
+  .note, .warn {
+    border-radius: 12px; padding: 14px 18px; margin: 0 0 18px; font-size: 0.94rem;
+    border: 1px solid var(--accent-soft); background: var(--accent-soft);
+    color: var(--ink);
+  }
+  .warn { background: var(--warn-bg); border-color: var(--warn-line); color: var(--warn-ink); }
+  .note strong, .warn strong { color: inherit; }
+  .note p:last-child, .warn p:last-child { margin-bottom: 0; }
+
+  footer { border-top: 1px solid var(--line); text-align: center; color: var(--ink-soft); padding: 36px 0; font-size: 0.9rem; }
+
+  @media (max-width: 880px) {
+    aside { display: none; }
+    .layout { padding: 0 20px; }
+  }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="brand"><a href="./">🍄 Shiitake</a></div>
+  <div class="links">
+    <a href="./">Home</a>
+    <a href="#installation">Install</a>
+    <a href="#http-api">API</a>
+    <a href="#security">Security</a>
+    <a href="https://github.com/TenzaiLabs/shiitake">GitHub</a>
+  </div>
+</nav>
+
+<div class="layout">
+  <aside>
+    <h4>Getting started</h4>
+    <ul>
+      <li><a href="#overview">Overview</a></li>
+      <li><a href="#architecture">Architecture</a></li>
+      <li><a href="#quickstart">Local quickstart</a></li>
+    </ul>
+    <h4>Deploy</h4>
+    <ul>
+      <li><a href="#installation">Installation</a></li>
+      <li><a href="#kubernetes">Kubernetes</a></li>
+      <li><a href="#custom-image">Custom worker image</a></li>
+      <li><a href="#configuration">Configuration</a></li>
+    </ul>
+    <h4>Use</h4>
+    <ul>
+      <li><a href="#http-api">HTTP API</a></li>
+      <li><a href="#clients">Clients</a></li>
+      <li><a href="#observability">Observability</a></li>
+    </ul>
+    <h4>Operate</h4>
+    <ul>
+      <li><a href="#security">Security</a></li>
+      <li><a href="#development">Development</a></li>
+      <li><a href="#license">License</a></li>
+    </ul>
+  </aside>
+
+  <main>
+    <h1>Documentation</h1>
+    <p class="subtitle">Sandboxing for untrusted commands on Kubernetes.</p>
+    <p>
+      Shiitake is an HTTP server that fans commands out to a pool of resident,
+      resource-bounded worker containers. Each command runs in its own worker,
+      which resets to a clean slate between commands — so there is no state bleed
+      from one caller to the next. The server is the only ingress; workers never
+      bind a public port.
+    </p>
+    <p>
+      Shiitake is <strong>generic</strong>: it has no knowledge of any particular
+      application. You bring the toolchain image, drop in the worker binary as its
+      entrypoint, and the server dispatches commands to the pool.
+    </p>
+
+    <h2 id="overview">Overview</h2>
+    <p>The project is a small Rust workspace plus two thin clients:</p>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>Component</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td><code>shiitake-server</code></td><td>The control plane. An axum HTTP API, a WebSocket dispatcher, the worker pool, the Kubernetes OOM probe, and OpenTelemetry. Owns the capture-file layout and serves range reads. The <strong>only</strong> ingress. Ships as a container image.</td></tr>
+        <tr><td><code>shiitake-worker</code></td><td>Runs one command at a time in its own process group, redirects output to capture files, reports resource usage, and resets between commands. Drops into your toolchain image as the entrypoint.</td></tr>
+        <tr><td><code>shiitake-server-api</code></td><td>Library. The HTTP request/response types — the contract between the server and any client. Pure types, no transport.</td></tr>
+        <tr><td><code>shiitake-worker-api</code></td><td>Library. The server↔worker wire frames plus the on-disk capture layout. The worker depends only on this.</td></tr>
+        <tr><td><code>clients/shiitake-rs</code></td><td>Async Rust client over the HTTP API (<code>reqwest</code>).</td></tr>
+        <tr><td><code>clients/shiitake-py</code></td><td>Python client over the HTTP API (<code>httpx</code>).</td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <h2 id="architecture">Architecture</h2>
+    <p>
+      One server process is the single entry point. It accepts <code>POST /api/v1/exec</code>,
+      picks an idle worker from the pool, and hands the command to it over an
+      in-pod WebSocket on the loopback dispatch port. The worker runs the command,
+      streams stdout/stderr straight to capture files on a shared volume, reports
+      the result, and then resets its sandbox before serving the next command.
+    </p>
+    <div class="diagram">
+      <pre class="mermaid">
+flowchart TB
+  client["Client"]
+
+  subgraph cluster["Kubernetes cluster"]
+    api["Kubernetes API"]
+    subgraph pod["Shiitake Pod"]
+      server["server"]
+      subgraph workers["worker pool"]
+        w0["worker-0"]
+        w1["worker-1"]
+        wn["worker-N"]
+      end
+      vol[("shared volume")]
+    end
+  end
+
+  client -->|"exec"| server
+  server -->|"dispatch"| w0
+  server --> w1
+  server --> wn
+  server -.->|"get pods"| api
+  w0 -->|"write"| vol
+  w1 --> vol
+  wn --> vol
+  server -.->|"read"| vol
+      </pre>
+    </div>
+    <pre><code>POST /api/v1/exec  →  Server (only ingress)  →  Worker pool  →  one command per worker
+                                                      ↑               ↓ resets between commands
+                                                      └───── re-advertised idle ─────┘</code></pre>
+
+    <h3>Resident workers &amp; the clean slate</h3>
+    <p>
+      A worker connects once and serves commands in a loop. Between commands it
+      <strong>resets its sandbox</strong> to reproduce the effect of a container
+      teardown without the cost of one:
+    </p>
+    <ul>
+      <li><strong>Process sweep.</strong> The worker is its container's <code>pid 1</code>, so it SIGKILLs every other process in the PID namespace — no leftover background processes from the previous command.</li>
+      <li><strong>Scratch clear.</strong> It empties the scratch directories listed in <code>SHIITAKE_RESET_PATHS</code> (symlink-safe), e.g. <code>/tmp</code>, <code>/var/tmp</code>, <code>/dev/shm</code>.</li>
+      <li><strong>IPC removal.</strong> It removes SysV IPC objects and re-reads <code>/proc/sysvipc</code> to verify they are gone.</li>
+    </ul>
+    <p>
+      If a reset cannot be trusted clean — a process won't die, a scratch clear
+      fails, or an IPC object survives — the worker <strong>recycles into a fresh
+      container</strong> rather than serving on a dirty sandbox. Staying resident
+      avoids the kubelet <code>CrashLoopBackOff</code> that per-command container
+      exits would otherwise incur.
+    </p>
+    <div class="note">
+      <p><strong>Defense in depth:</strong> set <code>SHIITAKE_RESTART_AFTER=N</code>
+      to make the worker exit (and the container recycle) after every <code>N</code>
+      commands, bounding anything the in-process reset can't scrub. <code>0</code>
+      = stay resident; <code>1</code> = a fresh container for every command.</p>
+    </div>
+
+    <h3>Output capture</h3>
+    <p>
+      The worker redirects the command's stdout/stderr file descriptors straight
+      into per-stream capture files — the kernel writes to disk, so neither the
+      worker nor the server buffers output in memory. The server reads it back
+      with HTTP <code>Range</code> support. Storage is bounded only by the volume;
+      output sizes are exported as metrics so a runaway command is observable
+      rather than silently truncated.
+    </p>
+
+    <h2 id="quickstart">Local quickstart</h2>
+    <p>Run the server and a worker locally with Cargo, then dispatch a command:</p>
+    <pre><code><span class="c"># Terminal 1 — the server (the only ingress)</span>
+SHIITAKE_AUTH_TOKEN=dev-token SHIITAKE_CAPTURE_ROOT=/tmp/capture \
+  cargo run --bin shiitake-server
+
+<span class="c"># Terminal 2 — one worker, joining the pool</span>
+SHIITAKE_WORKER_ID=worker-0 SHIITAKE_CAPTURE_ROOT=/tmp/capture \
+  cargo run --bin shiitake-worker
+
+<span class="c"># Terminal 3 — dispatch a command, get a handle back</span>
+curl -s <span class="p">-H</span> <span class="s">"Authorization: Bearer dev-token"</span> \
+  <span class="p">-X</span> POST localhost:8080/api/v1/exec \
+  <span class="p">-d</span> <span class="s">'{"command": "echo hello from a sandboxed worker"}'</span></code></pre>
+    <div class="note"><p>Running outside Kubernetes, the container-OOM probe and per-command container recycle are inert — the worker simply resets in-process. This is the right setup for development and for the in-process integration tests.</p></div>
+
+    <h2 id="installation">Installation</h2>
+    <p>Shiitake is distributed as two OCI images published to GitHub Container Registry:</p>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>Artifact</th><th>Image</th></tr></thead>
+      <tbody>
+        <tr><td>Server</td><td><code>ghcr.io/tenzailabs/shiitake-server</code></td></tr>
+        <tr><td>Worker</td><td><code>ghcr.io/tenzailabs/shiitake-worker</code> — a minimal image holding just the static binary</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p>
+      The server image is a minimal Alpine wrapping a static musl binary; it makes
+      outbound TLS calls to the Kubernetes API (for OOM detection) but never
+      executes user commands itself. The worker is shipped <strong>only</strong>
+      as a binary so you can layer it into whatever toolchain image your commands
+      need — see <a href="#custom-image">building a custom worker image</a>.
+    </p>
+
+    <h2 id="kubernetes">Deploying on Kubernetes</h2>
+    <p>
+      The unit of deployment is a single <strong>Pod</strong> running one server
+      container and <code>N</code> worker containers. Two things must be shared
+      across them:
+    </p>
+    <ul>
+      <li><strong>The pod network namespace</strong> — so workers reach the dispatcher on <code>127.0.0.1</code>. Within a Pod this is automatic.</li>
+      <li><strong>A capture volume</strong> — mounted into the server and every worker at the same path (<code>SHIITAKE_CAPTURE_ROOT</code>). Use an <code>emptyDir</code>, or a persistent volume if you want output to survive the Pod.</li>
+    </ul>
+    <p>A minimal pod spec looks like this:</p>
+    <pre><code><span class="c"># one server + workers in one Pod, sharing netns + a capture volume</span>
+spec:
+  serviceAccountName: shiitake        <span class="c"># bound to the pod-reader Role below</span>
+  containers:
+    - name: server
+      image: ghcr.io/tenzailabs/shiitake-server
+      env:
+        - name: SHIITAKE_AUTH_TOKEN
+          valueFrom: { secretKeyRef: { name: shiitake, key: token } }
+        - name: SHIITAKE_CAPTURE_ROOT
+          value: /capture
+        - name: POD_NAME
+          valueFrom: { fieldRef: { fieldPath: metadata.name } }
+        - name: POD_NAMESPACE
+          valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+      readinessProbe:
+        httpGet: { path: /api/v1/health, port: 8080 }
+      volumeMounts:
+        - { name: capture, mountPath: /capture }
+    - name: worker-0
+      image: your-registry/your-worker:latest   <span class="c"># your toolchain + the worker binary</span>
+      restartPolicy: Always                       <span class="c"># recycle this container on its own</span>
+      env:
+        - { name: SHIITAKE_WORKER_ID,   value: worker-0 }
+        - { name: SHIITAKE_CAPTURE_ROOT, value: /capture }
+        - { name: SHIITAKE_RESET_PATHS,  value: "/tmp,/var/tmp,/dev/shm" }
+      volumeMounts:
+        - { name: capture, mountPath: /capture }
+  volumes:
+    - { name: capture, emptyDir: {} }</code></pre>
+    <div class="note"><p>The per-container <code>restartPolicy: Always</code> lets each worker recycle independently when it hits its <code>SHIITAKE_RESTART_AFTER</code> quota or fails a reset. This relies on Kubernetes <strong>≥ 1.35</strong> (ContainerRestartRules). The worker always exits <code>0</code>, so a recycle reads as <code>Completed</code>, never <code>CrashLoopBackOff</code>.</p></div>
+
+    <h3>RBAC for the OOM probe</h3>
+    <p>
+      The server detects out-of-memory kills by reading the kubelet's container
+      status from the Kubernetes API. Bind its ServiceAccount to a Role that can
+      <code>get</code> pods in its own namespace — nothing more:
+    </p>
+    <pre><code>apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: shiitake-pod-reader }
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]</code></pre>
+
+    <h3>Example Helm chart</h3>
+    <p>
+      The repository ships a reference chart under
+      <a href="https://github.com/TenzaiLabs/shiitake/tree/main/tests/chart"><code>tests/chart</code></a>
+      that deploys exactly this topology — server + a configurable worker count,
+      the pod-reader RBAC, an optional OpenTelemetry Collector, and tunable
+      <code>resources.limits</code>. It is built for the end-to-end suite, so treat
+      it as a worked example rather than a production-hardened chart.
+    </p>
+
+    <h2 id="custom-image">Building a custom worker image</h2>
+    <p>
+      The worker is application-agnostic and ships as a static binary so it can
+      run inside <em>your</em> toolchain. Copy it out of the published worker image
+      into your own base image and set it as the entrypoint:
+    </p>
+    <pre><code>FROM your/toolchain:latest
+
+<span class="c"># Pin by immutable digest — GHCR tags (incl. release tags) are mutable,</span>
+<span class="c"># so a `COPY --from` by tag can be silently moved. Get the digest from</span>
+<span class="c"># the package page or `docker buildx imagetools inspect &lt;image&gt;:&lt;tag&gt;`.</span>
+COPY --from=ghcr.io/tenzailabs/shiitake-worker@sha256:&lt;digest&gt; \
+     /usr/local/bin/shiitake-worker /usr/local/bin/shiitake-worker
+
+ENTRYPOINT [<span class="s">"/usr/local/bin/shiitake-worker"</span>]</code></pre>
+    <p>A few things to get right in a custom image:</p>
+    <ul>
+      <li><strong>Ship <code>bash</code>.</strong> Commands run as <code>bash -c &lt;command&gt;</code>, so your base image must provide <code>bash</code>.</li>
+      <li><strong>Include the tools your commands need.</strong> The worker clears the command environment, so any external binary must be on the <code>PATH</code> you pass in the request (see the <a href="#http-api">API</a>).</li>
+      <li><strong>List scratch paths to reset.</strong> Set <code>SHIITAKE_RESET_PATHS</code> to every directory that must be wiped between commands, and <em>omit</em> anything that must persist. Shiitake never assumes a path layout — clearing the wrong directory, or failing to clear a writable one, is your call to make.</li>
+    </ul>
+    <p>
+      Both the server and the worker are built for <code>*-unknown-linux-musl</code>,
+      so the worker binary is fully static and runs in any Linux base image,
+      including <code>scratch</code> (though you'll still want <code>bash</code> and
+      your toolchain).
+    </p>
+
+    <h2 id="configuration">Configuration</h2>
+    <p>Both binaries take their configuration from flags with <code>SHIITAKE_*</code> environment fallbacks.</p>
+
+    <h3>Server</h3>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>Variable</th><th>Default</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>SHIITAKE_AUTH_TOKEN</code></td><td>(empty)</td><td><strong>Required.</strong> Bearer token guarding every <code>/exec</code> route. The server refuses to start if unset.</td></tr>
+        <tr><td><code>SHIITAKE_HOST</code></td><td><code>0.0.0.0</code></td><td>HTTP API listen address.</td></tr>
+        <tr><td><code>SHIITAKE_PORT</code></td><td><code>8080</code></td><td>HTTP API listen port.</td></tr>
+        <tr><td><code>SHIITAKE_DISPATCH_HOST</code></td><td><code>127.0.0.1</code></td><td>Worker dispatch listen address. Keep on loopback.</td></tr>
+        <tr><td><code>SHIITAKE_DISPATCH_PORT</code></td><td><code>8090</code></td><td>Worker dispatch listen port.</td></tr>
+        <tr><td><code>SHIITAKE_DEFAULT_WORKDIR</code></td><td><code>/</code></td><td>Working directory when a request omits <code>workdir</code>.</td></tr>
+        <tr><td><code>SHIITAKE_MAX_BODY_BYTES</code></td><td><code>268435456</code></td><td>Maximum accepted request body size (256 MiB).</td></tr>
+        <tr><td><code>SHIITAKE_CAPTURE_ROOT</code></td><td><code>/capture</code></td><td>Root for the stdout/stderr capture files.</td></tr>
+        <tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td>(unset)</td><td>OTLP endpoint. When set, the server exports traces + metrics; otherwise it logs to stdout only.</td></tr>
+        <tr><td><code>OTEL_EXPORTER_OTLP_PROTOCOL</code></td><td><code>http/protobuf</code></td><td>OTLP transport: <code>grpc</code>, <code>http/protobuf</code>, or <code>http/json</code> (all plaintext).</td></tr>
+        <tr><td><code>POD_NAME</code> / <code>POD_NAMESPACE</code></td><td>(downward API)</td><td>Used by the Kubernetes container-OOM probe.</td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <h3>Worker</h3>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>Variable</th><th>Default</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>SHIITAKE_WORKER_ID</code></td><td><code>worker-unknown</code></td><td>Identifier advertised to the dispatcher.</td></tr>
+        <tr><td><code>SHIITAKE_DISPATCH_PORT</code></td><td><code>8090</code></td><td>Dispatcher port. The host is always loopback (<code>127.0.0.1</code>) — server and workers share the pod network namespace.</td></tr>
+        <tr><td><code>SHIITAKE_CAPTURE_ROOT</code></td><td><code>/capture</code></td><td>Must match the server's capture root (shared volume).</td></tr>
+        <tr><td><code>SHIITAKE_RESET_PATHS</code></td><td>(empty)</td><td>Comma-separated scratch directories to empty between commands. Empty means "clear nothing".</td></tr>
+        <tr><td><code>SHIITAKE_RESTART_AFTER</code></td><td><code>0</code></td><td>Exit (recycle the container) after this many commands. <code>0</code> = stay resident; <code>N</code> = a full container teardown every <code>N</code> commands.</td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <h2 id="http-api">HTTP API</h2>
+    <p>
+      The public API is versioned under <code>/api/v1</code>. Every <code>/exec</code>
+      route requires <code>Authorization: Bearer &lt;token&gt;</code>; only
+      <code>/health</code> is unauthenticated. The worker dispatch endpoint
+      (<code>/dispatch</code>) is a separate internal router on the loopback port
+      and is never publicly reachable.
+    </p>
+
+    <div class="ep"><span class="verb post">POST</span><span class="path">/api/v1/exec</span></div>
+    <p>Spawn a command. Returns <code>{handle, started_at}</code> with <code>202 Accepted</code>; <code>429</code> if the pool has no idle worker. Request body:</p>
+    <pre><code>{
+  <span class="p">"command"</span>: <span class="s">"python3 -c 'print(2 + 2)'"</span>,
+  <span class="p">"workdir"</span>: <span class="s">"/tmp"</span>,
+  <span class="p">"timeout"</span>: 300.0,
+  <span class="p">"env"</span>: { <span class="p">"PATH"</span>: <span class="s">"/usr/bin:/bin"</span> },
+  <span class="p">"drop_to"</span>: { <span class="p">"uid"</span>: 1000, <span class="p">"gid"</span>: 1000, <span class="p">"supplementary_gids"</span>: [], <span class="p">"umask"</span>: 7 }
+}</code></pre>
+    <p>Only <code>command</code> is required. Notes:</p>
+    <ul>
+      <li><code>command</code> is a single string, run verbatim as <code>bash -c &lt;command&gt;</code> — use ordinary shell syntax for pipes, redirects, and multi-statement scripts. There is no argv array; the worker always goes through a shell.</li>
+      <li><strong>The command runs with only the <code>env</code> you pass</strong> — the worker clears its own environment first. Include <code>PATH</code> for any command that calls an external binary (bash builtins like <code>echo</code> work without it).</li>
+      <li><code>timeout</code> is in seconds (default <code>300</code>). <code>workdir</code> defaults to the server's <code>SHIITAKE_DEFAULT_WORKDIR</code>.</li>
+      <li><code>drop_to</code> is optional; see <a href="#security">privilege drop</a>.</li>
+    </ul>
+
+    <div class="ep"><span class="verb get">GET</span><span class="path">/api/v1/exec/{handle}</span></div>
+    <p>Status of a handle: <code>status</code> (<code>running</code> / <code>completed</code> / <code>timeout</code> / <code>oomkilled</code> / <code>error</code>), <code>exit_code</code>, <code>exit_signal</code>, <code>exit_cause</code>, timestamps, and per-stream byte counters.</p>
+
+    <div class="ep"><span class="verb get">GET</span><span class="path">/api/v1/exec/{handle}/stdout</span></div>
+    <div class="ep"><span class="verb get">GET</span><span class="path">/api/v1/exec/{handle}/stderr</span></div>
+    <p>Read captured output. Serves the capture file with HTTP <code>Range</code> support (<code>206</code> / <code>416</code>); tail the last <code>N</code> bytes with <code>Range: bytes=-N</code>.</p>
+
+    <div class="ep"><span class="verb delete">DELETE</span><span class="path">/api/v1/exec/{handle}</span></div>
+    <p>Terminate the command (SIGTERM → SIGKILL the process group). Idempotent on already-terminal handles.</p>
+
+    <div class="ep"><span class="verb get">GET</span><span class="path">/api/v1/health</span></div>
+    <p>Liveness plus a pool snapshot (<code>workers_idle</code>, <code>workers_inflight</code>). Unauthenticated — suitable for a readiness probe.</p>
+
+    <h3>Exit causes</h3>
+    <p>A finished handle reports one <code>exit_cause</code>:</p>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>Cause</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>normal</code></td><td>The command exited on its own (see <code>exit_code</code>).</td></tr>
+        <tr><td><code>signal</code></td><td>The command was killed by a signal (see <code>exit_signal</code>).</td></tr>
+        <tr><td><code>oom_container</code></td><td>The container was OOM-killed. Detected externally from the kubelet's container status, never self-reported.</td></tr>
+        <tr><td><code>timeout</code></td><td>The command exceeded its <code>timeout</code>.</td></tr>
+        <tr><td><code>worker_died</code></td><td>The worker connection dropped mid-command for a non-OOM reason.</td></tr>
+        <tr><td><code>cancelled</code></td><td>The command was killed via <code>DELETE</code>.</td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <h2 id="clients">Clients</h2>
+    <p>Two first-party clients wrap the HTTP API so you don't hand-roll requests.</p>
+    <h3>Python (<code>httpx</code>)</h3>
+    <pre><code>from shiitake.client import AsyncShiitakeClient
+
+async with AsyncShiitakeClient("http://shiitake:8080", auth_token="...") as c:
+    result = await c.run({"command": "echo hi", "env": {"PATH": "/bin"}})
+    print(result.stdout)</code></pre>
+    <p>The client also exposes lower-level <code>spawn</code> / <code>status</code> / <code>read</code> / <code>kill</code> calls and an <code>AsyncHandle</code> with <code>wait()</code> and <code>slurp()</code> helpers. A synchronous <code>ShiitakeClient</code> is available too.</p>
+    <h3>Rust (<code>reqwest</code>)</h3>
+    <pre><code>use shiitake_rs::{Client, ExecRequest};
+
+let client = Client::new("http://shiitake:8080", Some(token));
+let handle = client.spawn(&ExecRequest { command: "echo hi".into(), ..Default::default() }).await?;
+let status = client.status(&handle.handle).await?;</code></pre>
+    <p>The request/response types are re-exported from <code>shiitake-server-api</code>, so callers depend on just the one client crate.</p>
+
+    <h2 id="observability">Observability</h2>
+    <p>
+      Telemetry lives entirely in the server — the worker stays lean (no OTel
+      dependencies). When <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> is set, the
+      server exports over OTLP:
+    </p>
+    <ul>
+      <li><strong>Traces</strong> — one <code>shiitake.exec</code> span per command.</li>
+      <li><strong>Metrics</strong> — <code>shiitake_</code>-prefixed gauges/counters for exit cause, duration, memory and CPU (from the worker's cgroup readings), per-stream output sizes, capture-volume free space, and pool occupancy.</li>
+    </ul>
+    <p>Without an endpoint set, the server logs to stdout only. The OTLP exporter is plaintext-only by design (no TLS feature, to keep the static musl link free of <code>aws-lc-rs</code>); terminate TLS at a sidecar collector if you need it.</p>
+
+    <h2 id="security">Security considerations</h2>
+    <p>Shiitake runs untrusted commands by design. Its isolation properties — and where they stop — are worth understanding before you expose it.</p>
+
+    <h3>What Shiitake provides</h3>
+    <ul>
+      <li><strong>Single ingress, authenticated.</strong> Every <code>/exec</code> route requires the bearer token (<code>SHIITAKE_AUTH_TOKEN</code>); the server refuses to start without one. Treat the token as a secret — mount it from a Kubernetes <code>Secret</code>, not a plaintext env literal.</li>
+      <li><strong>Workers never face the network.</strong> The dispatch endpoint binds loopback only and is reachable solely from within the shared pod network namespace. Workers bind no public port.</li>
+      <li><strong>Per-command isolation.</strong> Each command runs in its own resource-bounded worker container; it cannot see or touch another command's processes, files, or output. Between commands the worker resets to a clean slate (process sweep, scratch clear, IPC removal), and if that reset can't be trusted the worker recycles into a fresh container instead of serving dirty.</li>
+      <li><strong>Resource bounds.</strong> Memory and CPU are enforced at the container level via the Pod's <code>resources.limits</code>. An allocation bomb kills only its own worker — the server and every other worker keep running. The kill is surfaced as <code>oom_container</code>, never silently lost.</li>
+      <li><strong>Identity-agnostic privilege drop.</strong> An <code>/exec</code> request may carry a <code>drop_to</code> directive (<code>uid</code>, <code>gid</code>, supplementary gids, <code>umask</code>); the worker applies it in the post-fork <code>pre_exec</code> hook before <code>exec</code>. Shiitake never decides identities — your embedding layer maps its own auth to <code>drop_to</code>.</li>
+      <li><strong>Clean command environment.</strong> The worker clears its own environment before running a command, so the worker's secrets and config don't leak into the command. The command sees only the <code>env</code> in the request.</li>
+    </ul>
+
+    <h3>What you must handle</h3>
+    <div class="warn">
+      <p><strong>Container isolation is not a security boundary against a kernel exploit.</strong> Shiitake relies on the container runtime (and the limits you set) for isolation. For genuinely hostile workloads, run the worker pods under a hardened runtime such as gVisor or Kata Containers, apply a restrictive <code>seccomp</code>/AppArmor profile, drop Linux capabilities, and consider <code>NetworkPolicy</code> to keep commands from reaching your cluster network.</p>
+    </div>
+    <ul>
+      <li><strong>The reset list is yours to get right.</strong> The clean-slate guarantee is only as good as <code>SHIITAKE_RESET_PATHS</code>. Any writable directory that isn't listed — or any state outside a filesystem the reset can reach — persists across commands. When in doubt, lean on <code>SHIITAKE_RESTART_AFTER</code> for periodic full container teardown.</li>
+      <li><strong>The process sweep needs pid 1.</strong> The worker sweeps leftover processes only when it is its container's <code>pid 1</code> (its own PID namespace). Don't run it behind an init shim or share a PID namespace across workers.</li>
+      <li><strong>Output storage is unbounded.</strong> Capture files grow until the volume is full; sizes are reported as metrics rather than capped. Size the capture volume for your workloads and alert on free space.</li>
+      <li><strong>Capture is shared.</strong> The server and every worker mount the same capture volume. The worker writes; the server reads. Don't widen those mounts beyond what's needed.</li>
+      <li><strong>No TLS on the API itself.</strong> Terminate TLS at an ingress / sidecar in front of the server. The OTLP exporter is likewise plaintext-only.</li>
+    </ul>
+
+    <h2 id="development">Development &amp; testing</h2>
+    <pre><code>cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace                <span class="c"># unit + in-process integration tests</span>
+
+<span class="c"># full k3d cluster end-to-end (docker, k3d, kubectl, helm, python3, uv)</span>
+bash tests/build.sh &amp;&amp; bash tests/setup.sh &amp;&amp; bash tests/run.sh</code></pre>
+    <p>
+      Local + CI e2e tooling (k3d, kubectl, python) is managed by <code>mise</code> —
+      run <code>mise install</code>. The Rust toolchain is pinned in
+      <code>rust-toolchain.toml</code>. See
+      <a href="https://github.com/TenzaiLabs/shiitake/blob/main/AGENTS.md">AGENTS.md</a>
+      for the architecture notes and gotchas that keep the static musl build and
+      the worker's clean-slate guarantee intact.
+    </p>
+
+    <h2 id="license">License</h2>
+    <p>
+      Shiitake is licensed under the
+      <a href="https://github.com/TenzaiLabs/shiitake/blob/main/LICENSE">Apache License 2.0</a>.
+      Contributions are welcome — open an issue or a pull request; by contributing
+      you agree your contributions are licensed under the same terms.
+    </p>
+  </main>
+</div>
+
+<footer>
+  🍄 Shiitake · <a href="./">Home</a> · <a href="https://github.com/TenzaiLabs/shiitake">github.com/TenzaiLabs/shiitake</a>
+</footer>
+
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+  const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: dark ? "dark" : "default",
+    themeVariables: {
+      fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
+      fontSize: "14px",
+    },
+  });
+</script>
+
+</body>
+</html>
