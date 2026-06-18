@@ -15,36 +15,47 @@
 
 <style>
   :root {
-    --bg: #f7fafa;
-    --bg-alt: #ecf3f4;
+    --bg: #f4fafb;
+    --bg-alt: #e4f2f4;
     --card: #ffffff;
-    --ink: #1f2a2c;
-    --ink-soft: #5b6e72;
+    --ink: #14242b;
+    --ink-soft: #50686d;
     --accent: #00a8bf;
-    --accent-ink: #007a8b;
+    --accent-ink: #00788a;
     --accent-soft: #cdeef3;
-    --accent-contrast: #ffffff;
+    --accent-contrast: #08272d;
     --tz-cyan: #00a8bf;
-    --line: #dde8ea;
-    --code-bg: #20292b;
+    --tz-bright: #1fd3e6;
+    /* Tenzai's dark, on-brand band — navy ground, electric cyan on top. */
+    --navy: #0e2229;
+    --navy-2: #123944;
+    --navy-ink: #eafcff;
+    --navy-soft: #93c4cc;
+    --line: #d2e5e9;
+    --code-bg: #0e2229;
     --code-ink: #e6f2f4;
     --radius: 16px;
     --max: 1080px;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #222727;
-      --bg-alt: #282e2e;
-      --card: #2c3333;
+      --bg: #0f1719;
+      --bg-alt: #15201f;
+      --card: #182223;
       --ink: #ecf4f5;
       --ink-soft: #9fb3b6;
       --accent: #88ffff;
       --accent-ink: #88ffff;
-      --accent-soft: #134247;
-      --accent-contrast: #103033;
+      --accent-soft: #103a40;
+      --accent-contrast: #06231f;
       --tz-cyan: #88ffff;
-      --line: #394243;
-      --code-bg: #181d1e;
+      --tz-bright: #88ffff;
+      --navy: #081417;
+      --navy-2: #0e2a31;
+      --navy-ink: #eafcff;
+      --navy-soft: #8fb6bd;
+      --line: #2a3839;
+      --code-bg: #081417;
       --code-ink: #e6f2f4;
     }
   }
@@ -73,36 +84,98 @@
   nav .links a { color: var(--ink-soft); font-weight: 500; }
   nav .links a:hover { color: var(--accent-ink); text-decoration: none; }
 
-  /* Hero */
-  .hero { text-align: center; padding: 56px 0 72px; }
-  .hero .shroom { font-size: 5rem; line-height: 1; filter: drop-shadow(0 6px 18px rgba(0,168,191,0.25)); }
+  /* Hero — a dark, on-brand band: navy ground, electric cyan glow. */
+  .hero-band {
+    background:
+      radial-gradient(1100px 480px at 50% -8%, rgba(31,211,230,0.22), transparent 60%),
+      linear-gradient(180deg, var(--navy) 0%, var(--navy-2) 100%);
+    border-bottom: 1px solid var(--line);
+    position: relative; overflow: hidden;
+  }
+  .hero-band::after {
+    content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2px;
+    background: linear-gradient(90deg, transparent, var(--tz-cyan), var(--tz-bright), var(--tz-cyan), transparent);
+    opacity: 0.7;
+  }
+  .hero { text-align: center; padding: 64px 0 76px; position: relative; z-index: 1; }
+  .hero .shroom { font-size: 5rem; line-height: 1; filter: drop-shadow(0 8px 26px rgba(31,211,230,0.5)); }
   .hero h1 {
-    font-size: clamp(2.6rem, 6vw, 4rem); margin: 14px 0 6px;
-    letter-spacing: -0.03em; font-weight: 800;
+    font-size: clamp(2.6rem, 6vw, 4rem); margin: 14px 0 8px;
+    letter-spacing: -0.03em; font-weight: 800; color: var(--navy-ink);
   }
   .hero .tagline {
     font-size: clamp(1.2rem, 3vw, 1.6rem); font-weight: 600;
-    color: var(--ink); margin: 0 auto 18px; max-width: 26ch;
+    margin: 0 auto 18px; max-width: 28ch;
+    background: linear-gradient(90deg, var(--tz-cyan), var(--tz-bright));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
   }
   .hero .lede {
-    font-size: 1.1rem; color: var(--ink-soft);
+    font-size: 1.1rem; color: var(--navy-soft);
     max-width: 60ch; margin: 0 auto 32px;
   }
+  .hero .lede strong { color: var(--navy-ink); }
   .cta { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
   .btn {
     display: inline-flex; align-items: center; gap: 8px;
-    padding: 12px 22px; border-radius: 999px; font-weight: 600; font-size: 1rem;
-    border: 1px solid transparent; transition: transform .08s ease, box-shadow .2s ease;
+    padding: 12px 22px; border-radius: 999px; font-weight: 700; font-size: 1rem;
+    border: 1px solid transparent; transition: transform .08s ease, box-shadow .2s ease, background .15s ease, color .15s ease;
   }
   .btn:hover { text-decoration: none; transform: translateY(-1px); }
-  .btn-primary { background: var(--accent); color: var(--accent-contrast); box-shadow: 0 8px 22px rgba(0,168,191,0.3); }
-  .btn-ghost { background: transparent; color: var(--ink); border-color: var(--line); }
+  /* Tenzai primary: bright cyan, dark ink, glowing. */
+  .btn-primary {
+    background: linear-gradient(90deg, var(--tz-cyan), var(--tz-bright));
+    color: #062227; box-shadow: 0 10px 28px rgba(31,211,230,0.4);
+  }
+  .btn-primary:hover { box-shadow: 0 12px 34px rgba(31,211,230,0.55); }
+  .btn-ghost { background: transparent; color: var(--navy-ink); border-color: rgba(143,210,221,0.45); }
+  .btn-ghost:hover { border-color: var(--tz-bright); color: var(--tz-bright); }
 
   /* Section scaffolding */
-  section { padding: 56px 0; }
+  section { padding: 60px 0; }
   section.alt { background: var(--bg-alt); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
   h2 { font-size: clamp(1.7rem, 4vw, 2.2rem); letter-spacing: -0.02em; margin: 0 0 8px; text-align: center; }
+  h2 .accent {
+    background: linear-gradient(90deg, var(--accent-ink), var(--accent));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .eyebrow {
+    text-align: center; text-transform: uppercase; letter-spacing: 0.14em;
+    font-size: 0.74rem; font-weight: 800; color: var(--accent-ink); margin: 0 0 6px;
+  }
   .section-sub { text-align: center; color: var(--ink-soft); max-width: 56ch; margin: 0 auto 40px; }
+
+  /* The problem */
+  .problems {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px;
+    max-width: 920px; margin: 0 auto 26px;
+  }
+  @media (max-width: 720px) { .problems { grid-template-columns: 1fr; } }
+  .p-card {
+    background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 20px 22px;
+  }
+  .p-card .ico { font-size: 1.5rem; line-height: 1; }
+  .p-card h3 { margin: 10px 0 6px; font-size: 1.02rem; }
+  .p-card p { margin: 0; color: var(--ink-soft); font-size: 0.95rem; }
+  .solution {
+    max-width: 920px; margin: 0 auto; border-radius: var(--radius);
+    border: 1px solid var(--accent-soft); padding: 22px 26px;
+    background:
+      radial-gradient(600px 200px at 0% 0%, rgba(31,211,230,0.10), transparent 70%),
+      var(--accent-soft);
+    color: var(--ink);
+  }
+  .solution .tag {
+    display: inline-block; text-transform: uppercase; letter-spacing: 0.12em;
+    font-size: 0.7rem; font-weight: 800; color: var(--accent-ink); margin: 0 0 8px;
+  }
+  .solution p { margin: 0; font-size: 1.05rem; }
+  .solution strong { color: var(--accent-ink); }
+  .solution code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.85em; background: rgba(255,255,255,0.5); padding: 0.1em 0.4em;
+    border-radius: 5px; border: 1px solid var(--accent-soft); color: var(--ink);
+  }
   .read-more { text-align: center; margin: 36px 0 0; }
   .read-more a { font-weight: 600; font-size: 0.98rem; }
 
@@ -113,30 +186,79 @@
   .benefits h3 { margin: 0 0 6px; font-size: 1.15rem; }
   .benefits p { margin: 0; color: var(--ink-soft); }
 
-  /* How it works */
-  .flow {
-    display: flex; align-items: stretch; justify-content: center; gap: 0; flex-wrap: wrap;
-    max-width: 860px; margin: 0 auto;
+  /* How it works — round-trip diagram + numbered steps */
+  .trip {
+    background: linear-gradient(180deg, var(--navy) 0%, var(--navy-2) 100%);
+    border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 24px; margin: 0 auto 40px; max-width: 920px; overflow-x: auto;
   }
-  .node {
-    background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
-    padding: 18px 20px; text-align: center; flex: 1; min-width: 150px;
+  .trip svg { display: block; margin: 0 auto; width: 100%; height: auto; min-width: 600px; }
+  .legend {
+    display: flex; gap: 22px; justify-content: center; flex-wrap: wrap;
+    margin: 14px 0 0; font-size: 0.82rem; color: var(--navy-soft);
   }
-  .node .k { font-weight: 700; }
-  .node .d { font-size: 0.85rem; color: var(--ink-soft); }
-  .arrow { display: flex; align-items: center; color: var(--accent); font-size: 1.5rem; padding: 0 10px; }
-  @media (max-width: 640px) { .arrow { transform: rotate(90deg); padding: 6px 0; } .flow { flex-direction: column; align-items: stretch; } }
+  .legend span { display: inline-flex; align-items: center; gap: 8px; }
+  .legend .dash { width: 26px; height: 0; border-top: 2px dashed var(--tz-bright); }
+  .legend .solid { width: 26px; height: 0; border-top: 2px solid var(--tz-cyan); }
+
+  .steps { max-width: 760px; margin: 0 auto; padding: 0; list-style: none; counter-reset: step; }
+  .steps li {
+    position: relative; padding: 0 0 22px 58px; counter-increment: step;
+  }
+  .steps li::before {
+    content: counter(step); position: absolute; left: 0; top: 0;
+    width: 38px; height: 38px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 800; font-size: 1rem; color: #062227;
+    background: linear-gradient(135deg, var(--tz-cyan), var(--tz-bright));
+    box-shadow: 0 4px 14px rgba(0,168,191,0.35);
+  }
+  .steps li:not(:last-child)::after {
+    content: ""; position: absolute; left: 18px; top: 42px; bottom: 2px;
+    width: 2px; background: linear-gradient(180deg, var(--accent), transparent);
+  }
+  .steps h3 { margin: 4px 0 4px; font-size: 1.08rem; }
+  .steps h3 .ret {
+    font-size: 0.68rem; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--accent-ink); border: 1px solid var(--accent-soft); background: var(--accent-soft);
+    padding: 2px 7px; border-radius: 999px; margin-left: 8px; vertical-align: middle;
+  }
+  .steps p { margin: 0; color: var(--ink-soft); }
+  .steps code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.85em; background: var(--bg-alt); padding: 0.1em 0.4em;
+    border-radius: 5px; border: 1px solid var(--line); color: var(--ink);
+  }
 
   /* Code */
-  .code-card { max-width: 760px; margin: 0 auto; }
+  .code-card { max-width: 820px; margin: 0 auto; }
+  .code-card h3 {
+    font-size: 0.95rem; margin: 26px 0 10px; color: var(--ink);
+    display: flex; align-items: center; gap: 10px;
+  }
+  .code-card h3:first-child { margin-top: 0; }
+  .code-card h3 .n {
+    flex: 0 0 auto; width: 26px; height: 26px; border-radius: 50%;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 0.82rem; font-weight: 800; color: #062227;
+    background: linear-gradient(135deg, var(--tz-cyan), var(--tz-bright));
+  }
   pre {
     background: var(--code-bg); color: var(--code-ink); border-radius: var(--radius);
-    padding: 22px 24px; overflow-x: auto; font-size: 0.9rem; line-height: 1.7;
+    padding: 20px 22px; overflow-x: auto; font-size: 0.88rem; line-height: 1.7;
     font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-    border: 1px solid rgba(255,255,255,0.06);
+    border: 1px solid rgba(31,211,230,0.16);
   }
-  pre .c { color: #8fa6a9; }
-  pre .p { color: #88ffff; }
+  pre .c { color: #7fa6ad; }
+  pre .p { color: #1fd3e6; }
+  pre .s { color: #b7e4a0; }
+  pre .k { color: #88ffff; font-weight: 600; }
+  .caption { max-width: 820px; margin: 0 auto; color: var(--ink-soft); font-size: 0.95rem; }
+  .caption code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.85em; background: var(--bg-alt); padding: 0.1em 0.4em;
+    border-radius: 5px; border: 1px solid var(--line); color: var(--ink);
+  }
 
   /* Contributors */
   .contributors {
@@ -174,6 +296,7 @@
 <nav>
   <div class="brand">🍄 Shiitake</div>
   <div class="links">
+    <a href="#problem">Problem</a>
     <a href="#quickstart">Quickstart</a>
     <a href="#how">How it works</a>
     <a href="#use-cases">What it's for</a>
@@ -182,67 +305,312 @@
   </div>
 </nav>
 
-<header class="hero wrap">
-  <div class="shroom">🍄</div>
-  <h1>Shiitake</h1>
-  <p class="tagline">Sandboxing for untrusted commands on Kubernetes.</p>
-  <p class="lede">
-    An HTTP server that fans commands out to a pool of <strong>resident, resource-bounded
-    worker containers</strong> in your Kubernetes cluster. Each command runs in its own
-    worker, which resets to a clean slate between commands — no state bleed, ever.
-  </p>
-  <div class="cta">
-    <a class="btn btn-primary" href="docs.html">📖 Read the docs</a>
-    <a class="btn btn-ghost" href="https://github.com/TenzaiLabs/shiitake">★ View on GitHub</a>
+<div class="hero-band">
+  <header class="hero wrap">
+    <div class="shroom">🍄</div>
+    <h1>Shiitake</h1>
+    <p class="tagline">Sandboxing for untrusted commands on Kubernetes.</p>
+    <p class="lede">
+      An HTTP server that fans commands out to a pool of <strong>resident, resource-bounded
+      worker containers</strong> in your Kubernetes cluster. Each command runs in its own
+      worker, which resets to a clean slate between commands — no state bleed, ever.
+    </p>
+    <div class="cta">
+      <a class="btn btn-primary" href="#quickstart">🚀 Quickstart</a>
+      <a class="btn btn-ghost" href="docs.html">📖 Read the docs</a>
+      <a class="btn btn-ghost" href="https://github.com/TenzaiLabs/shiitake">★ GitHub</a>
+    </div>
+  </header>
+</div>
+
+<section id="problem">
+  <div class="wrap">
+    <p class="eyebrow">The problem</p>
+    <h2>Running untrusted commands is <span class="accent">hard</span></h2>
+    <p class="section-sub">
+      Lots of systems need to run short-lived, untrusted commands for someone else —
+      user-submitted code, AI-agent tool calls, CI steps, scraped build scripts.
+      Doing it safely is awkward.
+    </p>
+    <div class="problems">
+      <div class="p-card">
+        <div class="ico">🩸</div>
+        <h3>State bleeds between commands</h3>
+        <p>Run them in your own process or container and one command's leftover
+        processes, temp files, or a fork bomb leak into the next caller — or take the
+        whole service down.</p>
+      </div>
+      <div class="p-card">
+        <div class="ico">🔑</div>
+        <h3>Pod-per-command is heavy</h3>
+        <p>Spawning a Job or Pod per task means handing your workload Kubernetes
+        pod-create rights and paying per-task scheduling latency every single time.</p>
+      </div>
+      <div class="p-card">
+        <div class="ico">💧</div>
+        <h3>Output overruns memory</h3>
+        <p>A chatty command whose output you buffer in memory turns into an
+        out-of-memory kill of <em>your</em> service, not its own.</p>
+      </div>
+    </div>
+    <div class="solution">
+      <span class="tag">How Shiitake solves it</span>
+      <p>
+        A fixed pool of <strong>resident, resource-bounded worker containers</strong>
+        behind one authenticated HTTP server. You <code>POST</code> a command and get a
+        handle back; the server hands it to an idle worker that runs it in isolation,
+        streams output straight to disk, and <strong>resets to a clean slate before the
+        next command</strong>. No pod-create rights, no per-task scheduling latency, no
+        state bleed — and a runaway command can only take down its own worker.
+      </p>
+    </div>
   </div>
-</header>
+</section>
 
 <section class="alt" id="quickstart">
   <div class="wrap">
-    <h2>Quickstart</h2>
-    <p class="section-sub">Run a server, run a worker, dispatch a command. The worker stays resident and resets between commands.</p>
+    <p class="eyebrow">Quickstart</p>
+    <h2>Deploy a <span class="accent">sandbox</span>, run a command</h2>
+    <p class="section-sub">
+      A Shiitake Pod — one server, one worker — on any Kubernetes cluster, then a command
+      dispatched over HTTP. Built images only; no <code>cargo</code> required.
+      Works on a local <code>kind</code> or <code>k3d</code> cluster.
+    </p>
     <div class="code-card">
-<pre><span class="c"># Terminal 1 — the server (the only ingress)</span>
-SHIITAKE_AUTH_TOKEN=dev-token SHIITAKE_CAPTURE_ROOT=/tmp/capture \
-  cargo run --bin shiitake-server
 
-<span class="c"># Terminal 2 — one worker, joining the pool</span>
-SHIITAKE_WORKER_ID=worker-0 SHIITAKE_CAPTURE_ROOT=/tmp/capture \
-  cargo run --bin shiitake-worker
+      <h3><span class="n">1</span> Build a runnable worker image</h3>
+      <p class="caption" style="margin-bottom:12px">
+        The published <code>shiitake-worker</code> image is <em>just the static binary</em> (a
+        <code>scratch</code> image), so pair it with a base that has <code>bash</code> — commands
+        run as <code>bash&nbsp;-c</code> — plus whatever tools your commands need.
+      </p>
+<pre><span class="c"># a minimal worker: bash + the published Shiitake worker binary</span>
+cat &gt; Dockerfile &lt;&lt;<span class="s">'EOF'</span>
+<span class="k">FROM</span> alpine:3
+<span class="k">RUN</span> apk add --no-cache bash
+<span class="k">COPY</span> --from=ghcr.io/tenzailabs/shiitake-worker:latest \
+     /usr/local/bin/shiitake-worker /usr/local/bin/shiitake-worker
+<span class="k">ENTRYPOINT</span> [<span class="s">"/usr/local/bin/shiitake-worker"</span>]
+<span class="s">EOF</span>
 
-<span class="c"># Terminal 3 — dispatch a command, get a handle back</span>
-curl -s <span class="p">-H</span> <span class="p">"Authorization: Bearer dev-token"</span> \
+docker build <span class="p">-t</span> shiitake-worker-demo:latest .
+kind load docker-image shiitake-worker-demo:latest   <span class="c"># k3d: k3d image import …</span></pre>
+
+      <h3><span class="n">2</span> Apply the smallest possible deployment</h3>
+      <p class="caption" style="margin-bottom:12px">
+        One Pod, two containers — the <strong>server</strong> (the only ingress) and one
+        <strong>worker</strong> — sharing a capture volume. That's the whole footprint.
+      </p>
+<pre><span class="c"># shiitake.yaml</span>
+<span class="k">apiVersion:</span> apps/v1
+<span class="k">kind:</span> Deployment
+<span class="k">metadata:</span> { <span class="k">name:</span> shiitake }
+<span class="k">spec:</span>
+  <span class="k">replicas:</span> 1
+  <span class="k">selector:</span> { <span class="k">matchLabels:</span> { <span class="k">app:</span> shiitake } }
+  <span class="k">template:</span>
+    <span class="k">metadata:</span> { <span class="k">labels:</span> { <span class="k">app:</span> shiitake } }
+    <span class="k">spec:</span>
+      <span class="k">containers:</span>
+        <span class="c"># the control plane — accepts HTTP, dispatches to workers, serves output</span>
+        - <span class="k">name:</span> server
+          <span class="k">image:</span> ghcr.io/tenzailabs/shiitake-server:latest
+          <span class="k">env:</span>
+            - { <span class="k">name:</span> SHIITAKE_AUTH_TOKEN, <span class="k">value:</span> dev-secret-token }
+            - { <span class="k">name:</span> SHIITAKE_CAPTURE_ROOT, <span class="k">value:</span> /capture }
+          <span class="k">ports:</span> [{ <span class="k">containerPort:</span> 8080 }]
+          <span class="k">volumeMounts:</span> [{ <span class="k">name:</span> capture, <span class="k">mountPath:</span> /capture }]
+        <span class="c"># one resident worker; reaches the server on 127.0.0.1 (shared pod netns)</span>
+        - <span class="k">name:</span> worker
+          <span class="k">image:</span> shiitake-worker-demo:latest
+          <span class="k">imagePullPolicy:</span> IfNotPresent
+          <span class="k">env:</span>
+            - { <span class="k">name:</span> SHIITAKE_WORKER_ID, <span class="k">value:</span> worker-0 }
+            - { <span class="k">name:</span> SHIITAKE_CAPTURE_ROOT, <span class="k">value:</span> /capture }
+          <span class="k">volumeMounts:</span> [{ <span class="k">name:</span> capture, <span class="k">mountPath:</span> /capture }]
+      <span class="c"># SHIITAKE_CAPTURE_ROOT is a SHARED VOLUME mounted into both containers at the</span>
+      <span class="c"># same path: the worker writes each command's stdout/stderr here, the server</span>
+      <span class="c"># reads it back over HTTP. An emptyDir lives and dies with the Pod.</span>
+      <span class="k">volumes:</span> [{ <span class="k">name:</span> capture, <span class="k">emptyDir:</span> {} }]</pre>
+<pre>kubectl apply <span class="p">-f</span> shiitake.yaml
+kubectl rollout status deploy/shiitake</pre>
+      <p class="caption" style="margin:-6px 0 0">
+        Minimal on purpose. OOM detection (needs pod-read RBAC), per-worker recycling, and
+        scaling the pool are all in the <a href="docs.html#kubernetes">Kubernetes docs</a>.
+      </p>
+
+      <h3><span class="n">3</span> Reach the API</h3>
+<pre><span class="c"># the server is the only ingress; forward its port to your machine</span>
+kubectl port-forward deploy/shiitake 8080:8080</pre>
+
+      <h3><span class="n">4</span> Dispatch a command and read it back</h3>
+<pre><span class="c"># POST a command — get a handle back immediately (202 Accepted)</span>
+curl -s <span class="p">-H</span> <span class="s">"Authorization: Bearer dev-secret-token"</span> \
   <span class="p">-X</span> POST localhost:8080/api/v1/exec \
-  <span class="p">-d</span> <span class="p">'{"command": "echo hello from a sandboxed worker"}'</span></pre>
+  <span class="p">-d</span> <span class="s">'{"command": "echo hello from a sandboxed worker"}'</span>
+<span class="c"># → {"handle":"01J…","started_at":"…"}</span>
+
+<span class="c"># read the captured stdout for that handle</span>
+curl -s <span class="p">-H</span> <span class="s">"Authorization: Bearer dev-secret-token"</span> \
+  localhost:8080/api/v1/exec/<span class="p">01J…</span>/stdout
+<span class="c"># → hello from a sandboxed worker</span></pre>
+      <p class="caption" style="margin:-6px 0 0">
+        <code>echo</code> is a bash builtin, so it needs nothing else. A command that calls an
+        external binary must carry a <code>PATH</code> in the request's <code>env</code> — the
+        worker runs with a cleared environment. See the <a href="docs.html#http-api">API reference</a>.
+      </p>
     </div>
-    <p class="read-more"><a href="docs.html#quickstart">Read more in the docs →</a></p>
   </div>
 </section>
 
 <section id="how">
   <div class="wrap">
-    <h2>How it works</h2>
+    <p class="eyebrow">How it works</p>
+    <h2>One command, <span class="accent">there and back</span></h2>
     <p class="section-sub">
-      One server is the only ingress. It hands each command to a worker over an in-pod
-      WebSocket; the worker runs it, streams output to disk, reports the result, then
-      resets its sandbox before the next command.
+      Follow a single command through the system — from your <code>POST</code>, into an
+      isolated worker, and all the way back to you as captured output.
     </p>
-    <div class="flow">
-      <div class="node"><div class="k">POST /exec</div><div class="d">your request</div></div>
-      <div class="arrow">→</div>
-      <div class="node"><div class="k">Server</div><div class="d">the only ingress</div></div>
-      <div class="arrow">→</div>
-      <div class="node"><div class="k">Worker pool</div><div class="d">N idle workers</div></div>
-      <div class="arrow">→</div>
-      <div class="node"><div class="k">Isolated run</div><div class="d">bounded · isolated · resets</div></div>
+
+    <div class="trip">
+      <svg viewBox="0 0 900 446" role="img" aria-label="Sequence diagram: a command travels from the client to the server, is dispatched to a worker, runs and streams output to the shared volume, then the result and output return to the client.">
+        <defs>
+          <linearGradient id="badge" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#00a8bf"/>
+            <stop offset="100%" stop-color="#88ffff"/>
+          </linearGradient>
+          <marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path d="M0,0 L7,3 L0,6 Z" fill="#2bdcef"/>
+          </marker>
+          <style>
+            .ll { stroke: #38555d; stroke-width: 1.5; stroke-dasharray: 3 4; }
+            .box { fill: #102f37; stroke: #2bdcef; stroke-width: 1.5; }
+            .box.entry { fill: #123f49; }
+            .lbl { fill: #eafcff; font: 700 13px -apple-system, "Segoe UI", sans-serif; text-anchor: middle; }
+            .msg { stroke: #2bdcef; stroke-width: 2; fill: none; }
+            .msg.ret { stroke: #7fe3ee; stroke-dasharray: 5 4; }
+            .cap { fill: #bfe9ef; font: 500 11.5px ui-monospace, Menlo, monospace; }
+            .cap.r { fill: #9fd6df; }
+            .bnum { fill: #062227; font: 800 12px -apple-system, sans-serif; text-anchor: middle; }
+          </style>
+        </defs>
+
+        <!-- lifelines -->
+        <line class="ll" x1="90"  y1="50" x2="90"  y2="414"/>
+        <line class="ll" x1="340" y1="50" x2="340" y2="414"/>
+        <line class="ll" x1="590" y1="50" x2="590" y2="414"/>
+        <line class="ll" x1="800" y1="50" x2="800" y2="414"/>
+
+        <!-- headers -->
+        <rect class="box entry" x="22"  y="16" width="136" height="30" rx="9"/>
+        <text class="lbl" x="90"  y="36">You · client</text>
+        <rect class="box" x="270" y="16" width="140" height="30" rx="9"/>
+        <text class="lbl" x="340" y="36">Server</text>
+        <rect class="box" x="512" y="16" width="156" height="30" rx="9"/>
+        <text class="lbl" x="590" y="36">Worker</text>
+        <rect class="box" x="726" y="16" width="148" height="30" rx="9"/>
+        <text class="lbl" x="800" y="36">Shared volume</text>
+
+        <!-- 1: client -> server -->
+        <text class="cap" x="215" y="76" text-anchor="middle">POST /api/v1/exec · Bearer</text>
+        <line class="msg" x1="90" y1="84" x2="332" y2="84" marker-end="url(#arr)"/>
+        <circle cx="215" cy="84" r="11" fill="url(#badge)"/><text class="bnum" x="215" y="88">1</text>
+
+        <!-- 2: server -> worker -->
+        <text class="cap" x="465" y="114" text-anchor="middle">dispatch · in-pod WebSocket</text>
+        <line class="msg" x1="340" y1="122" x2="582" y2="122" marker-end="url(#arr)"/>
+        <circle cx="465" cy="122" r="11" fill="url(#badge)"/><text class="bnum" x="465" y="126">2</text>
+
+        <!-- 3: server -> client (return) -->
+        <text class="cap r" x="215" y="150" text-anchor="middle">202 Accepted · { handle }</text>
+        <line class="msg ret" x1="340" y1="158" x2="98" y2="158" marker-end="url(#arr)"/>
+        <circle cx="215" cy="158" r="11" fill="url(#badge)"/><text class="bnum" x="215" y="162">3</text>
+
+        <!-- 4: worker self-loop -->
+        <path class="msg" d="M590,190 H660 V208 H598" marker-end="url(#arr)"/>
+        <text class="cap" x="668" y="195">bash -c</text>
+        <text class="cap" x="668" y="210">sandboxed, bounded</text>
+        <circle cx="590" cy="199" r="11" fill="url(#badge)"/><text class="bnum" x="590" y="203">4</text>
+
+        <!-- 5: worker -> volume -->
+        <text class="cap" x="695" y="238" text-anchor="middle">stream stdout/stderr</text>
+        <line class="msg" x1="590" y1="246" x2="792" y2="246" marker-end="url(#arr)"/>
+        <circle cx="695" cy="246" r="11" fill="url(#badge)"/><text class="bnum" x="695" y="250">5</text>
+
+        <!-- 6: worker -> server (return) -->
+        <text class="cap r" x="465" y="276" text-anchor="middle">report · exit code · cause · bytes</text>
+        <line class="msg ret" x1="590" y1="284" x2="348" y2="284" marker-end="url(#arr)"/>
+        <circle cx="465" cy="284" r="11" fill="url(#badge)"/><text class="bnum" x="465" y="288">6</text>
+
+        <!-- 7: client -> server, server -> volume, server -> client -->
+        <text class="cap" x="215" y="322" text-anchor="middle">GET /exec/{handle} · /stdout</text>
+        <line class="msg" x1="90" y1="330" x2="332" y2="330" marker-end="url(#arr)"/>
+        <circle cx="215" cy="330" r="11" fill="url(#badge)"/><text class="bnum" x="215" y="334">7</text>
+
+        <text class="cap" x="570" y="358" text-anchor="middle">read bytes (Range)</text>
+        <line class="msg" x1="340" y1="366" x2="792" y2="366" marker-end="url(#arr)"/>
+
+        <text class="cap r" x="215" y="392" text-anchor="middle">status + captured output</text>
+        <line class="msg ret" x1="340" y1="400" x2="98" y2="400" marker-end="url(#arr)"/>
+      </svg>
+      <div class="legend">
+        <span><span class="solid"></span> request path</span>
+        <span><span class="dash"></span> response path — back to you</span>
+      </div>
     </div>
-    <p class="read-more"><a href="docs.html#architecture">Read more in the docs →</a></p>
+
+    <ol class="steps">
+      <li>
+        <h3>You POST the command</h3>
+        <p>The client sends <code>POST /api/v1/exec</code> with the command and an
+        <code>Authorization: Bearer</code> token to the server — the single, authenticated
+        ingress. Workers never face the network.</p>
+      </li>
+      <li>
+        <h3>The server schedules it</h3>
+        <p>It picks an idle worker from the resident pool and hands the command over an
+        in-pod WebSocket on loopback. If every worker is busy you get <code>429</code> —
+        Shiitake never silently queues behind a slow command.</p>
+      </li>
+      <li>
+        <h3>You get a handle, immediately <span class="ret">↩ to you</span></h3>
+        <p>The server replies <code>202 Accepted</code> with a <code>{ handle }</code>. You
+        don't hold a connection open while the command runs — everything after this is
+        polled against that handle.</p>
+      </li>
+      <li>
+        <h3>The worker runs it</h3>
+        <p>The worker executes the command as <code>bash -c</code> in its own process group,
+        inside a resource-bounded container it can't escape. No other command's processes,
+        files, or environment are visible to it.</p>
+      </li>
+      <li>
+        <h3>Output streams to the shared volume</h3>
+        <p>stdout/stderr file descriptors are redirected straight into per-handle capture
+        files on the shared capture volume. The kernel writes to disk, so neither process
+        buffers output in memory — gigabytes of output is fine.</p>
+      </li>
+      <li>
+        <h3>The worker reports and resets</h3>
+        <p>On exit it reports the exit code, cause, and byte counts back to the server, which
+        marks the handle done. The worker then sweeps leftover processes, clears scratch, and
+        re-advertises itself idle — recycling its container if a reset can't be trusted clean.</p>
+      </li>
+      <li>
+        <h3>You read the result back <span class="ret">↩ to you</span></h3>
+        <p>Poll <code>GET /api/v1/exec/{handle}</code> for status, then <code>GET …/stdout</code>
+        (and <code>/stderr</code>). The server serves the captured bytes from the shared volume
+        with HTTP <code>Range</code> support, so you can tail the end or resume a partial read.</p>
+      </li>
+    </ol>
+    <p class="read-more"><a href="docs.html#architecture">See the full architecture in the docs →</a></p>
   </div>
 </section>
 
 <section class="alt" id="use-cases">
   <div class="wrap">
-    <h2>What it's for</h2>
+    <p class="eyebrow">What it's for</p>
+    <h2>Built for <span class="accent">hostile input</span></h2>
     <p class="section-sub">Shiitake is generic — it knows nothing about your application. A few things it's particularly good at:</p>
     <ul class="benefits">
       <li>
