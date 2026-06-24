@@ -8,7 +8,7 @@
 #
 # Build context is the repository root: `docker build -f tests/Dockerfile.worker .`
 
-FROM rust:1-slim-trixie@sha256:3b05f7c617a200c41c3506097f0d15fc193a1c93bfd8f141007b47cac8f95d3c AS builder
+FROM rust:1-slim-trixie@sha256:4ddd2ebb0043566905e1e5e82ba7c66c03444b32ef16caa6bf5a20155d6ffb15 AS builder
 ARG TARGETARCH
 RUN apt-get update \
  && apt-get install -y --no-install-recommends musl-tools \
@@ -27,7 +27,7 @@ RUN set -eux; \
     cargo build --release --locked --target "$triple" --bin shiitake-worker; \
     install -D "target/${triple}/release/shiitake-worker" /out/shiitake-worker
 
-FROM python:3-alpine@sha256:003970a263347645cd23d4f90929ad16ba7ce7d808ee4674ffcc93cb21cc289f
+FROM python:3-alpine@sha256:26730869004e2b9c4b9ad09cab8625e81d256d1ce97e72df5520e806b1709f92
 RUN apk add --no-cache bash
 COPY --from=builder /out/shiitake-worker /usr/local/bin/shiitake-worker
 ENTRYPOINT ["/usr/local/bin/shiitake-worker"]
