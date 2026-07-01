@@ -23,7 +23,7 @@ jobs:
       pull-requests: read
     steps:
       - name: 📥 Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: 🔢 Resolve version from Cargo.toml
         id: version
         # The in-code version is the source of truth (enforced by
@@ -33,7 +33,7 @@ jobs:
         # code was already at v0.2.0).
         run: echo "version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "(.*)"/\1/')" >> "$GITHUB_OUTPUT"
       - name: 📝 Release Drafter
-        uses: release-drafter/release-drafter@693d20e7c1ce1a81d3a41962f85914253b518449 # v7
+        uses: release-drafter/release-drafter@4d75298e00d9e34c483e5ff8c68d0ea1c1940c1e # v7
         with:
           config-name: release-drafter.yml
           version: ${{ steps.version.outputs.version }}
@@ -47,6 +47,6 @@ jobs:
       pull-requests: write
     steps:
       - name: 🏷️ Autolabeler
-        uses: release-drafter/release-drafter/autolabeler@693d20e7c1ce1a81d3a41962f85914253b518449 # v7
+        uses: release-drafter/release-drafter/autolabeler@4d75298e00d9e34c483e5ff8c68d0ea1c1940c1e # v7
         with:
           config-name: release-drafter.yml
