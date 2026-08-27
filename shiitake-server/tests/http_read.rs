@@ -98,6 +98,7 @@ async fn reads_full_and_range_and_suffix() {
             timed_out: false,
             cancelled: false,
             usage: Default::default(),
+            error: None,
         };
         ws.send(Message::Text(
             serde_json::to_string(&Frame::Result(result))
@@ -113,9 +114,6 @@ async fn reads_full_and_range_and_suffix() {
     sleep(Duration::from_millis(200)).await;
 
     let base = format!("http://127.0.0.1:{}/api/v1", api_addr.port());
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("nothing else installs a provider in this test process");
     let client = reqwest::Client::new();
 
     let spawn: serde_json::Value = client
