@@ -2044,6 +2044,7 @@ dependencies = [
  "rustls",
  "shiitake-server-api",
  "thiserror",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]

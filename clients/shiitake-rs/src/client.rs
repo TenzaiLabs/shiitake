@@ -4,7 +4,7 @@
 use shiitake_server_api::{
     DropTo, ExecRequest, HandleSnapshotJson, HealthResponse, SpawnResponse, StatusResponse,
 };
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 /// Which captured stream to read.
 #[derive(Debug, Clone, Copy)]
@@ -52,15 +52,12 @@ impl Client {
     /// `base_url` is the server origin, e.g. `http://localhost:8080`. The
     /// `/api/v1` prefix is added by the client.
     pub fn new(base_url: impl Into<String>, auth_token: Option<String>) -> Self {
-        // reqwest is built with `rustls-no-provider` (the `rustls` feature would
-        // drag in aws-lc-rs, which this workspace excludes), so it panics unless
-        // a process-level provider is installed. Pin ring, ignoring the error
-        // when something else — the server's `telemetry::init`, another client —
-        // already installed one.
-        let _ = rustls::crypto::ring::default_provider().install_default();
         Self {
             base: base_url.into().trim_end_matches('/').to_string(),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .use_preconfigured_tls(tls_config())
+                .build()
+                .expect("the TLS config is built here, from constants"),
             auth_token,
         }
     }
@@ -176,4 +173,18 @@ async fn error_for_status(resp: reqwest::Response) -> Result<reqwest::Response, 
     let code = status.as_u16();
     let body = resp.text().await.unwrap_or_default();
     Err(ClientError::Status { status: code, body })
+}
+
+/// reqwest is built with `rustls-no-provider` — its `rustls` feature implies
+/// aws-lc-rs, which this workspace excludes. Hand it an explicit ring-backed
+/// config rather than installing a process-global provider.
+fn tls_config() -> rustls::ClientConfig {
+    let roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth()
 }

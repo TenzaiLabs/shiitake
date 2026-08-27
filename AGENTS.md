@@ -152,12 +152,9 @@ required check.
   `tls-*` features) — those TLS features drag in `aws-lc-rs`, which breaks the
   static musl link *and* leaves rustls unable to auto-pick a provider. Because
   several crates pull rustls with differing provider features, `telemetry::init`
-  pins the ring provider via `CryptoProvider::install_default()`. `reqwest`
-  (the `shiitake-rs` transport) is on `rustls-no-provider`, **not** `rustls` —
-  since 0.13 the latter implies aws-lc-rs, and the provider-less variant panics
-  on `Client::new` unless a provider is installed, so `Client::new` pins ring
-  the same way. Keep the graph
-  free of `aws-lc-rs`/`native-tls`/`openssl`/`security-framework`
+  pins the ring provider via `CryptoProvider::install_default()`. `reqwest` is on
+  `rustls-no-provider` — since 0.13 its `rustls` feature implies aws-lc-rs.
+  Keep the graph free of `aws-lc-rs`/`native-tls`/`openssl`/`security-framework`
   (`cargo tree -i aws-lc-rs -e no-dev` must be empty); don't add a TLS feature to
   the OTLP exporter or switch any crate to `aws-lc-rs` without revisiting this.
 - **Capture is shared between server and workers.** The worker redirects the

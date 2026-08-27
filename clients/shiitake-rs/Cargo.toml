@@ -5,11 +5,10 @@ version.workspace = true
 
 [dependencies]
 shiitake-server-api = { path = "../../shiitake-server-api" }
-# reqwest's `rustls` feature pulls in aws-lc-rs; this workspace is ring-only
-# (see AGENTS.md), so take the provider-less variant and install ring ourselves.
 reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "rustls-no-provider",
 ] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+webpki-roots = "1"
 thiserror = "2"
