@@ -62,6 +62,7 @@ async fn dispatch_with_one_fake_worker_marks_handle_completed() {
             timed_out: false,
             cancelled: false,
             usage: Default::default(),
+            error: None,
         };
         ws.send(Message::Text(
             serde_json::to_string(&Frame::Result(result))

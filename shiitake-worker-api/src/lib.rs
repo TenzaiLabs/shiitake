@@ -117,12 +117,15 @@ pub struct ResultFrame {
     pub cancelled: bool,
     #[serde(default)]
     pub usage: ResourceUsage,
+    /// Why the worker could not run the command, when it failed before the
+    /// command produced an exit status. `None` for a command that ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 impl ResultFrame {
     #[allow(dead_code)] // server doesn't construct these — worker does
     pub fn errored(request_id: ExecId, message: impl Into<String>) -> Self {
-        let _ = message.into();
         Self {
             request_id,
             exit_code: None,
@@ -130,6 +133,7 @@ impl ResultFrame {
             timed_out: false,
             cancelled: false,
             usage: ResourceUsage::default(),
+            error: Some(message.into()),
         }
     }
 }

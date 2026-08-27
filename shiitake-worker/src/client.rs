@@ -28,7 +28,7 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
     tungstenite::{Message, client::IntoClientRequest},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Sink = SplitSink<Ws, Message>;
@@ -231,11 +231,15 @@ async fn serve_session(
         // onto us in the re-advertise/close window is reconciled by the server's
         // worker-drop path, exactly like any other worker exit.
         if exiting {
-            sink.close().await.ok();
+            if let Err(e) = sink.close().await {
+                debug!("closing the dispatch socket before restart failed: {e}");
+            }
             return Ok(SessionEnd::RestartQuotaReached);
         }
         if reset_failed {
-            sink.close().await.ok();
+            if let Err(e) = sink.close().await {
+                debug!("closing the dispatch socket after a failed reset: {e}");
+            }
             return Ok(SessionEnd::ResetFailed);
         }
     }
@@ -252,7 +256,9 @@ async fn next_execute(sink: &mut Sink, stream: &mut Stream) -> Result<Option<Exe
                 Frame::Hello { .. } | Frame::Result(_) => warn!("unexpected frame; ignoring"),
             },
             Some(Ok(Message::Ping(p))) => {
-                sink.send(Message::Pong(p)).await.ok();
+                if let Err(e) = sink.send(Message::Pong(p)).await {
+                    warn!("failed to answer a keepalive ping; the server may evict us: {e}");
+                }
             }
             Some(Ok(Message::Close(_))) | None => return Ok(None),
             Some(Err(e)) => return Err(e).context("ws read"),
@@ -279,7 +285,9 @@ async fn run_command(
         if connection_lost {
             // Cancel already signalled; just let exec wind down so we don't
             // leak the child, then end the session.
-            let _ = (&mut exec_fut).await;
+            if let Err(e) = (&mut exec_fut).await {
+                warn!("exec failed while winding down after connection loss: {e:#}");
+            }
             return CmdOutcome::ConnectionLost;
         }
         tokio::select! {
@@ -299,13 +307,21 @@ async fn run_command(
                         && rid == request_id
                     {
                         info!(%request_id, "cancel received");
-                        let _ = cancel_tx.send(true);
+                        if cancel_tx.send(true).is_err() {
+                            debug!("command already finished; cancel had no receiver");
+                        }
                     }
                 }
-                Some(Ok(Message::Ping(p))) => { sink.send(Message::Pong(p)).await.ok(); }
+                Some(Ok(Message::Ping(p))) => {
+                    if let Err(e) = sink.send(Message::Pong(p)).await {
+                        warn!("failed to answer a keepalive ping mid-exec: {e}");
+                    }
+                }
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
                     warn!("connection lost during exec; cancelling command");
-                    let _ = cancel_tx.send(true);
+                    if cancel_tx.send(true).is_err() {
+                        debug!("command already finished; cancel had no receiver");
+                    }
                     connection_lost = true;
                 }
                 _ => {}
