@@ -9,6 +9,7 @@ directly. Embedding layers add their own auth/identity/env policy on top.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import random
 from collections.abc import Mapping
@@ -338,9 +339,17 @@ class AsyncShiitakeClient(_Base):
             drop_to=drop_to,
             wait_for_worker=wait_for_worker,
         )
-        status = await handle.wait()
-        stdout, _ = await handle.slurp("stdout", max_bytes=max_inline_bytes)
-        stderr, _ = await handle.slurp("stderr", max_bytes=max_inline_bytes)
+        try:
+            status = await handle.wait()
+            stdout, _ = await handle.slurp("stdout", max_bytes=max_inline_bytes)
+            stderr, _ = await handle.slurp("stderr", max_bytes=max_inline_bytes)
+        except asyncio.CancelledError:
+            # Cancelling the await only stops the polling here; the command keeps
+            # running on its worker and holds that slot until it exits or the
+            # server times it out. `run` owns this handle, so it kills it.
+            with contextlib.suppress(Exception):
+                await handle.kill()
+            raise
         return RunResult(
             stdout=stdout,
             stderr=stderr,

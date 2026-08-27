@@ -9,6 +9,7 @@ here.
 
 from __future__ import annotations
 
+import asyncio
 import os
 
 import pytest
@@ -55,3 +56,30 @@ async def test_nonzero_exit_is_completed_with_code() -> None:
         assert result.status == "completed"
         assert result.exit_code == 7
         assert result.stderr == "oops\n"
+
+
+async def test_cancelling_run_frees_the_worker() -> None:
+    """The point of killing the handle is the slot, so assert the slot.
+
+    A mocked transport can only show that the DELETE goes out; only a real
+    server shows the worker leaving inflight and returning to idle.
+    """
+    async with AsyncShiitakeClient(_BASE, auth_token=_TOKEN) as c:
+        idle_before = (await c.health()).workers_idle
+
+        task = asyncio.create_task(c.run("sleep 600", wait_for_worker=True))
+        # Wait until the command is actually occupying a worker.
+        async with asyncio.timeout(30):
+            while (await c.health()).workers_inflight == 0:
+                await asyncio.sleep(0.2)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # The kill is issued as the caller unwinds; the worker resets before it
+        # reports idle again, so poll rather than sampling once.
+        async with asyncio.timeout(30):
+            while (await c.health()).workers_idle < idle_before:
+                await asyncio.sleep(0.2)
+        assert (await c.health()).workers_inflight == 0

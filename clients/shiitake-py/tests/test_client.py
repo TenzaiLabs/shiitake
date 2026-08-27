@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable
 
@@ -115,4 +116,54 @@ async def test_health() -> None:
     h = await client.health()
     assert h.service == "shiitake"
     assert h.workers_idle == 7
+    await client.aclose()
+
+
+def _running_status() -> dict[str, object]:
+    return {"handle": "h", "worker_id": "w0", "status": "running", "started_at": 1.0}
+
+
+@pytest.mark.asyncio
+async def test_run_kills_the_handle_when_cancelled() -> None:
+    """Cancelling `run` must not leave the command holding its worker slot."""
+    seen: list[tuple[str, str]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append((req.method, req.url.path))
+        if req.url.path.endswith("/exec") and req.method == "POST":
+            return httpx.Response(202, json={"handle": "h", "started_at": 1.0})
+        if req.method == "DELETE":
+            return httpx.Response(204)
+        # Never leaves "running", so the caller is still waiting when cancelled.
+        return httpx.Response(200, json=_running_status())
+
+    client = await _with_mock(handler)
+    task = asyncio.create_task(client.run("sleep 600"))
+    while ("GET", "/api/v1/exec/h") not in seen:
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert ("DELETE", "/api/v1/exec/h") in seen
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_run_still_cancels_when_the_kill_fails() -> None:
+    """A failed best-effort kill must not mask the cancellation."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/exec") and req.method == "POST":
+            return httpx.Response(202, json={"handle": "h", "started_at": 1.0})
+        if req.method == "DELETE":
+            return httpx.Response(500, text="boom")
+        return httpx.Response(200, json=_running_status())
+
+    client = await _with_mock(handler, max_retries=1)
+    task = asyncio.create_task(client.run("sleep 600"))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
     await client.aclose()
