@@ -11,6 +11,7 @@
 use crate::cgroup::{CpuTimes, read_cpu_times, read_memory_limit, read_memory_peak};
 use anyhow::{Context, Result};
 use nix::{
+    errno::Errno,
     sys::signal::{Signal, killpg},
     unistd::{Pid, setsid},
 };
@@ -29,6 +30,7 @@ use tokio::{
     sync::watch,
     time::sleep,
 };
+use tracing::warn;
 
 pub struct Outcome {
     pub result: ResultFrame,
@@ -120,6 +122,7 @@ pub async fn run(
             timed_out,
             cancelled,
             usage: usage(cpu_before).await,
+            error: None,
         },
     })
 }
@@ -158,22 +161,25 @@ async fn wait_with_signals(
         biased;
         _ = cancel.changed() => {
             if *cancel.borrow() {
-                let _ = killpg(pid, Signal::SIGKILL);
-                let status = child.wait().await.ok();
-                return (true, false, status);
+                kill_group(pid, "cancel");
+                return (true, false, reap(child).await);
             }
             // false transition — fall through to wait again. In practice the
             // channel only flips to true once.
-            let status = child.wait().await.ok();
-            (false, false, status)
+            (false, false, reap(child).await)
         }
         _ = sleep(timeout) => {
-            let _ = killpg(pid, Signal::SIGKILL);
-            let status = child.wait().await.ok();
-            (false, true, status)
+            kill_group(pid, "timeout");
+            (false, true, reap(child).await)
         }
         res = child.wait() => {
-            (false, false, res.ok())
+            (false, false, match res {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn!("waiting on the command failed; exit status unavailable: {e}");
+                    None
+                }
+            })
         }
     }
 }
@@ -181,8 +187,39 @@ async fn wait_with_signals(
 /// Append a server-generated notice to the stderr capture file (timeout /
 /// cancel). Best-effort: the child has already exited and released its fd.
 fn append_marker(path: &PathBuf, marker: &str) {
-    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
-        let _ = f.write_all(marker.as_bytes());
+    match std::fs::OpenOptions::new().append(true).open(path) {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(marker.as_bytes()) {
+                warn!(
+                    ?path,
+                    "could not append the {marker:?} notice to stderr: {e}"
+                );
+            }
+        }
+        Err(e) => warn!(
+            ?path,
+            "could not open stderr to append the {marker:?} notice: {e}"
+        ),
+    }
+}
+
+/// SIGKILL the command's process group. `ESRCH` means it already exited, which
+/// is the common race; anything else means the kill genuinely failed.
+fn kill_group(pid: Pid, reason: &str) {
+    match killpg(pid, Signal::SIGKILL) {
+        Ok(()) | Err(Errno::ESRCH) => {}
+        Err(e) => warn!(pid = pid.as_raw(), "SIGKILL on {reason} failed: {e}"),
+    }
+}
+
+/// Wait for the killed child so it isn't left a zombie.
+async fn reap(child: &mut Child) -> Option<std::process::ExitStatus> {
+    match child.wait().await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!("waiting on the command failed; exit status unavailable: {e}");
+            None
+        }
     }
 }
 

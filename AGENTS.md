@@ -66,7 +66,7 @@ CI runs all of the above (`.github/workflows/{ci,test}.yml`). `ci.yml` runs
 format, clippy, test, and version as four parallel jobs; clippy and test share a
 `Swatinem/rust-cache` keyed on `rust-toolchain.toml` (a toolchain bump starts
 from a clean cache). The toolchain is pinned in `rust-toolchain.toml` (edition
-2024, Rust 1.96.0); the format check is its own job under nightly because
+2024, Rust 1.98.0); the format check is its own job under nightly because
 `rustfmt.toml` uses the unstable `imports_granularity` / `group_imports`
 options. Each crate declares its own dependencies (no `[workspace.dependencies]`),
 kept current with `cargo upgrade --incompatible`. Release Drafter maintains a draft release and autolabels PRs.
@@ -145,17 +145,17 @@ required check.
   (`Dockerfile.server`) is Alpine; the worker image (`Dockerfile.worker`) is the
   bare static binary on `scratch` for downstream `COPY --from`; the e2e worker
   (`tests/Dockerfile.worker`) bakes that binary into `python:3-alpine`.
-- **rustls on `ring` only — no aws-lc-rs / OpenSSL / native-tls.** `kube`
-  (`rustls-tls`) and `tokio-tungstenite` (`rustls-tls-webpki-roots`) use rustls;
-  `opentelemetry-otlp` enables all three transports (`http-proto`, `http-json`,
-  `grpc-tonic`) but **plaintext only** (`reqwest-client`, no `reqwest-rustls*` /
-  `tls-*` features) — those TLS features drag in `aws-lc-rs`, which breaks the
-  static musl link *and* leaves rustls unable to auto-pick a provider. Because
-  several crates pull rustls with differing provider features, `telemetry::init`
-  pins the ring provider via `CryptoProvider::install_default()`. Keep the graph
-  free of `aws-lc-rs`/`native-tls`/`openssl`/`security-framework`
-  (`cargo tree -i aws-lc-rs -e no-dev` must be empty); don't add a TLS feature to
-  the OTLP exporter or switch any crate to `aws-lc-rs` without revisiting this.
+- **rustls only — no OpenSSL / native-tls.** `kube` (`rustls-tls`),
+  `tokio-tungstenite` (`rustls-tls-webpki-roots`) and `reqwest` (`rustls`) all
+  pull rustls, so both provider features end up compiled: `ring` (the server's
+  own direct dep) and `aws-lc-rs` (via reqwest 0.13's `rustls`). With two
+  providers there is no auto-selectable default, so `telemetry::init` **must**
+  pin one — it installs ring via `CryptoProvider::install_default()`. aws-lc-rs
+  links into the static musl binaries fine (verified on
+  `aarch64-unknown-linux-musl`). `opentelemetry-otlp` enables all three
+  transports (`http-proto`, `http-json`, `grpc-tonic`) but **plaintext only** —
+  the standard ship-to-a-local-collector pattern. Keep `native-tls`/`openssl`
+  out of the graph.
 - **Capture is shared between server and workers.** The worker redirects the
   command's stdout/stderr fds straight into `SHIITAKE_CAPTURE_ROOT/<handle>/{stdout,stderr}`
   (plain files, no buffering in the worker), and the server reads them back with

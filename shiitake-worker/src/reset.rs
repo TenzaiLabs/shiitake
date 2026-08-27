@@ -28,7 +28,7 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// How long to keep reaping after the SIGKILL sweep before giving up and
 /// logging the stragglers. Processes die promptly under SIGKILL; this only
@@ -131,8 +131,13 @@ fn kill_all_except_self(proc_root: &Path, self_pid: Pid) -> Result<usize> {
             );
         }
         for pid in &remaining {
-            // ESRCH (already gone) is fine; anything else just retries next loop.
-            let _ = kill(*pid, Signal::SIGKILL);
+            // ESRCH (already gone) is the expected race. Anything else retries
+            // on the next pass and, if it never dies, the deadline above fails
+            // loudly with the survivor list.
+            match kill(*pid, Signal::SIGKILL) {
+                Ok(()) | Err(Errno::ESRCH) => {}
+                Err(e) => debug!(pid = pid.as_raw(), "SIGKILL failed, will retry: {e}"),
+            }
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -183,8 +188,12 @@ fn reap_zombies() {
         match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => break,
             Ok(_) => continue,
-            // ECHILD: no children left. Anything else: stop reaping this round.
-            Err(Errno::ECHILD) | Err(_) => break,
+            // ECHILD: no children left, the normal exit.
+            Err(Errno::ECHILD) => break,
+            Err(e) => {
+                debug!("stopped reaping zombies this round: {e}");
+                break;
+            }
         }
     }
 }

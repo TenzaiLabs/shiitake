@@ -98,6 +98,7 @@ async fn reads_full_and_range_and_suffix() {
             timed_out: false,
             cancelled: false,
             usage: Default::default(),
+            error: None,
         };
         ws.send(Message::Text(
             serde_json::to_string(&Frame::Result(result))

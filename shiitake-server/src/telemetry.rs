@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use opentelemetry::{global, trace::TracerProvider as _};
 use opentelemetry_otlp::{MetricExporter, Protocol, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider, trace::SdkTracerProvider};
+use tracing::{debug, warn};
 use tracing_subscriber::{EnvFilter, prelude::*};
 
 /// Held by `main` for the process lifetime; flushes the exporters on
@@ -26,11 +27,15 @@ pub struct Telemetry {
 
 impl Telemetry {
     pub fn shutdown(self) {
-        if let Some(tp) = self.tracer_provider {
-            let _ = tp.shutdown();
+        if let Some(tp) = self.tracer_provider
+            && let Err(e) = tp.shutdown()
+        {
+            warn!("tracer provider shutdown failed, spans may be lost: {e}");
         }
-        if let Some(mp) = self.meter_provider {
-            let _ = mp.shutdown();
+        if let Some(mp) = self.meter_provider
+            && let Err(e) = mp.shutdown()
+        {
+            warn!("meter provider shutdown failed, metrics may be lost: {e}");
         }
     }
 }
@@ -38,11 +43,14 @@ impl Telemetry {
 /// Initialise logging, tracing, and metrics. Call once at startup. Exporters
 /// are enabled only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 pub fn init(service_name: &str) -> Result<Telemetry> {
-    // Pin rustls to the ring provider. The OTLP HTTP/gRPC stacks and kube each
-    // pull rustls, and their feature mix leaves no single auto-selectable
-    // provider — so without this, building the exporter panics. Ring keeps the
-    // static-musl build clean (no aws-lc-rs). Idempotent; ignore "already set".
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    // Both `ring` and `aws-lc-rs` are compiled in, so rustls has no
+    // auto-selectable default and building the exporter panics without this.
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+    {
+        debug!("a rustls provider was already installed; leaving it in place");
+    }
 
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")));

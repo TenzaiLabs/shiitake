@@ -426,6 +426,9 @@ impl WorkerPool {
             s.handles.get(&result.request_id).cloned()
         };
         let Some(row) = row else { return };
+        if let Some(error) = &result.error {
+            warn!(request_id = %result.request_id, "worker could not run the command: {error}");
+        }
         let (status, cause) = classify(&result);
         let finished_at = SystemTime::now();
         {

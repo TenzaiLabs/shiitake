@@ -12,6 +12,7 @@
 //! the file isn't present (non-cgroup-v2 host, or dev macOS).
 
 use std::path::Path;
+use tracing::warn;
 
 const MEMORY_PEAK: &str = "/sys/fs/cgroup/memory.peak";
 const MEMORY_MAX_V2: &str = "/sys/fs/cgroup/memory.max";
@@ -28,12 +29,8 @@ pub struct CpuTimes {
 /// Read the cgroup's peak memory high-water mark (`memory.peak`), in bytes.
 /// Available on kernels >= 5.19; `None` elsewhere.
 pub async fn read_memory_peak() -> Option<u64> {
-    tokio::fs::read_to_string(MEMORY_PEAK)
-        .await
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+    let raw = tokio::fs::read_to_string(MEMORY_PEAK).await.ok()?;
+    parse_field(MEMORY_PEAK, raw.trim())
 }
 
 /// Read the container's memory limit (cgroup v2 `memory.max`, then v1), in
@@ -53,7 +50,7 @@ async fn read_limit_from(p: &Path) -> Option<u64> {
     if raw == "max" {
         return None;
     }
-    match raw.parse::<u64>().ok()? {
+    match parse_field(&p.display().to_string(), raw)? {
         0 => None,
         v => Some(v),
     }
@@ -78,10 +75,22 @@ fn field_from(content: &str, key: &str) -> Option<u64> {
         if let Some(rest) = line.strip_prefix(key)
             && let Some(v) = rest.strip_prefix(' ')
         {
-            return v.trim().parse().ok();
+            return parse_field(key, v.trim());
         }
     }
     None
+}
+
+/// Parse a cgroup field. The file being absent is normal (no cgroup v2, older
+/// kernel); a present-but-unparseable value is not, so say so.
+fn parse_field(what: &str, raw: &str) -> Option<u64> {
+    match raw.parse() {
+        Ok(v) => Some(v),
+        Err(e) => {
+            warn!("cgroup {what} holds an unparseable value {raw:?}: {e}");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
