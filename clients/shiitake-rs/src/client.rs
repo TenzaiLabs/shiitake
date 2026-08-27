@@ -52,6 +52,12 @@ impl Client {
     /// `base_url` is the server origin, e.g. `http://localhost:8080`. The
     /// `/api/v1` prefix is added by the client.
     pub fn new(base_url: impl Into<String>, auth_token: Option<String>) -> Self {
+        // reqwest is built with `rustls-no-provider` (the `rustls` feature would
+        // drag in aws-lc-rs, which this workspace excludes), so it panics unless
+        // a process-level provider is installed. Pin ring, ignoring the error
+        // when something else — the server's `telemetry::init`, another client —
+        // already installed one.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         Self {
             base: base_url.into().trim_end_matches('/').to_string(),
             http: reqwest::Client::new(),

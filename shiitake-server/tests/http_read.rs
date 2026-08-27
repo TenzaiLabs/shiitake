@@ -113,6 +113,10 @@ async fn reads_full_and_range_and_suffix() {
     sleep(Duration::from_millis(200)).await;
 
     let base = format!("http://127.0.0.1:{}/api/v1", api_addr.port());
+    // Workspace feature unification turns on reqwest's `rustls-no-provider`
+    // (shiitake-rs needs TLS without aws-lc-rs), and reqwest builds its TLS
+    // config eagerly — so pin ring even though this test only speaks plain HTTP.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::new();
 
     let spawn: serde_json::Value = client

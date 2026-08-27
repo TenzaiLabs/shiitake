@@ -66,7 +66,7 @@ CI runs all of the above (`.github/workflows/{ci,test}.yml`). `ci.yml` runs
 format, clippy, test, and version as four parallel jobs; clippy and test share a
 `Swatinem/rust-cache` keyed on `rust-toolchain.toml` (a toolchain bump starts
 from a clean cache). The toolchain is pinned in `rust-toolchain.toml` (edition
-2024, Rust 1.96.0); the format check is its own job under nightly because
+2024, Rust 1.98.0); the format check is its own job under nightly because
 `rustfmt.toml` uses the unstable `imports_granularity` / `group_imports`
 options. Each crate declares its own dependencies (no `[workspace.dependencies]`),
 kept current with `cargo upgrade --incompatible`. Release Drafter maintains a draft release and autolabels PRs.
@@ -152,7 +152,11 @@ required check.
   `tls-*` features) — those TLS features drag in `aws-lc-rs`, which breaks the
   static musl link *and* leaves rustls unable to auto-pick a provider. Because
   several crates pull rustls with differing provider features, `telemetry::init`
-  pins the ring provider via `CryptoProvider::install_default()`. Keep the graph
+  pins the ring provider via `CryptoProvider::install_default()`. `reqwest`
+  (the `shiitake-rs` transport) is on `rustls-no-provider`, **not** `rustls` —
+  since 0.13 the latter implies aws-lc-rs, and the provider-less variant panics
+  on `Client::new` unless a provider is installed, so `Client::new` pins ring
+  the same way. Keep the graph
   free of `aws-lc-rs`/`native-tls`/`openssl`/`security-framework`
   (`cargo tree -i aws-lc-rs -e no-dev` must be empty); don't add a TLS feature to
   the OTLP exporter or switch any crate to `aws-lc-rs` without revisiting this.
