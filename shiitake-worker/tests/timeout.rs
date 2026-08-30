@@ -37,7 +37,11 @@ async fn worker_kills_command_on_timeout() {
 
     let mut child = Command::new(&bin)
         .env("SHIITAKE_WORKER_ID", "timeout-worker")
-        .env("SHIITAKE_DISPATCH_PORT", addr.port().to_string())
+        .env(
+            "SHIITAKE_DISPATCH_URL",
+            format!("ws://127.0.0.1:{}/dispatch", addr.port()),
+        )
+        .env("SHIITAKE_DISPATCH_TOKEN", "test-dispatch-token")
         .env("SHIITAKE_CAPTURE_ROOT", capture_root.path())
         .env("PATH", std::env::var("PATH").unwrap())
         .spawn()

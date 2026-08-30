@@ -3,6 +3,11 @@
 # against the cluster that tests/setup.sh stood up. Re-runnable; creates and
 # deletes nothing but a port-forward.
 #
+# The whole suite must pass in either topology — the API contract doesn't change
+# when the server and the workers stop sharing a pod. A two-pod deployment
+# (SHIITAKE_E2E_TOPOLOGY=two-pod, matching what setup.sh deployed) additionally
+# runs test_two_pod.py for what the split makes newly true.
+#
 # Requires: kubectl, python3, curl, uv. Run tests/setup.sh first.
 set -euo pipefail
 
@@ -40,8 +45,21 @@ done
 if [ "${idle:-0}" -lt "$workers" ]; then
   kubectl --context "$CONTEXT" -n "$NAMESPACE" describe "deploy/$RELEASE" || true
   kubectl --context "$CONTEXT" -n "$NAMESPACE" logs "deploy/$RELEASE" -c server || true
+  if [ "$TOPOLOGY" = "two-pod" ]; then
+    kubectl --context "$CONTEXT" -n "$NAMESPACE" describe "deploy/$WORKER_DEPLOY" || true
+    kubectl --context "$CONTEXT" -n "$NAMESPACE" logs "deploy/$WORKER_DEPLOY" --tail=40 || true
+  fi
   echo "only ${idle}/${workers} workers connected to the dispatcher" >&2
   exit 1
+fi
+
+# Topology-specific checks first: if the split isn't actually in effect (workers
+# still co-located, capture volume not shared, NetworkPolicy not enforced), say
+# so before the broad suite muddies the output.
+if [ "$TOPOLOGY" = "two-pod" ]; then
+  log "Running test_two_pod.py against ${base}"
+  SHIITAKE_E2E_URL="$base" SHIITAKE_E2E_TOKEN="$TOKEN" SHIITAKE_E2E_RELEASE="$RELEASE" \
+    python3 "$ROOT/tests/test_two_pod.py"
 fi
 
 log "Running test_exec.py against ${base}"

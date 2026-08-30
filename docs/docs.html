@@ -198,6 +198,7 @@
     <ul>
       <li><a href="#installation">Installation</a></li>
       <li><a href="#kubernetes">Kubernetes</a></li>
+      <li><a href="#topologies">Topologies</a></li>
       <li><a href="#custom-image">Custom worker image</a></li>
       <li><a href="#configuration">Configuration</a></li>
     </ul>
@@ -250,10 +251,17 @@
     <h2 id="architecture">Architecture</h2>
     <p>
       One server process is the single entry point. It accepts <code>POST /api/v1/exec</code>,
-      picks an idle worker from the pool, and hands the command to it over an
-      in-pod WebSocket on the loopback dispatch port. The worker runs the command,
+      picks an idle worker from the pool, and hands the command to it over a
+      WebSocket on the dispatch listener. The worker runs the command,
       streams stdout/stderr straight to capture files on a shared volume, reports
       the result, and then resets its sandbox before serving the next command.
+    </p>
+    <p>
+      Workers never bind a port — they dial the dispatcher, at whatever
+      <code>SHIITAKE_DISPATCH_URL</code> says, presenting a bearer token on the
+      upgrade. That address is the only thing that changes between running the
+      server and the workers in one Pod and running them in
+      <a href="#topologies">two</a>.
     </p>
     <div class="diagram">
       <pre class="mermaid">
@@ -262,19 +270,19 @@ flowchart TB
 
   subgraph cluster["Kubernetes cluster"]
     api["Kubernetes API"]
-    subgraph pod["Shiitake Pod"]
+    subgraph pod["Shiitake Pod(s)"]
       server["server"]
       subgraph workers["worker pool"]
         w0["worker-0"]
         w1["worker-1"]
         wn["worker-N"]
       end
-      vol[("shared volume")]
+      vol[("shared capture volume")]
     end
   end
 
   client -->|"exec"| server
-  server -->|"dispatch"| w0
+  server -->|"dispatch (ws + bearer)"| w0
   server --> w1
   server --> wn
   server -.->|"get pods"| api
@@ -326,11 +334,14 @@ flowchart TB
     <h2 id="quickstart">Local quickstart</h2>
     <p>Run the server and a worker locally with Cargo, then dispatch a command:</p>
     <pre><code><span class="c"># Terminal 1 — the server (the only ingress)</span>
-SHIITAKE_AUTH_TOKEN=dev-token SHIITAKE_CAPTURE_ROOT=/tmp/capture \
+SHIITAKE_AUTH_TOKEN=dev-token SHIITAKE_DISPATCH_TOKEN=dev-dispatch \
+  SHIITAKE_CAPTURE_ROOT=/tmp/capture \
   cargo run --bin shiitake-server
 
 <span class="c"># Terminal 2 — one worker, joining the pool</span>
-SHIITAKE_WORKER_ID=worker-0 SHIITAKE_CAPTURE_ROOT=/tmp/capture \
+<span class="c"># (SHIITAKE_DISPATCH_URL defaults to ws://127.0.0.1:8090/dispatch)</span>
+SHIITAKE_WORKER_ID=worker-0 SHIITAKE_DISPATCH_TOKEN=dev-dispatch \
+  SHIITAKE_CAPTURE_ROOT=/tmp/capture \
   cargo run --bin shiitake-worker
 
 <span class="c"># Terminal 3 — wait for the pool, then dispatch a command</span>
@@ -362,15 +373,19 @@ curl -s <span class="p">-H</span> <span class="s">"Authorization: Bearer dev-tok
 
     <h2 id="kubernetes">Deploying on Kubernetes</h2>
     <p>
-      The unit of deployment is a single <strong>Pod</strong> running one server
+      The simplest deployment is a single <strong>Pod</strong> running one server
       container and <code>N</code> worker containers. Two things must be shared
       across them:
     </p>
     <ul>
-      <li><strong>The pod network namespace</strong> — so workers reach the dispatcher on <code>127.0.0.1</code>. Within a Pod this is automatic.</li>
+      <li><strong>The pod network namespace</strong> — so workers reach the dispatcher on <code>127.0.0.1</code>, the default <code>SHIITAKE_DISPATCH_URL</code>. Within a Pod this is automatic.</li>
       <li><strong>A capture volume</strong> — mounted into the server and every worker at the same path (<code>SHIITAKE_CAPTURE_ROOT</code>). Use an <code>emptyDir</code>, or a persistent volume if you want output to survive the Pod.</li>
     </ul>
-    <p>A minimal pod spec looks like this:</p>
+    <p>
+      Server and workers can also run as <a href="#topologies">separate Pods</a>,
+      which is what lets pod-scoped controls differ between them.
+    </p>
+    <p>A minimal single-Pod spec looks like this:</p>
     <pre><code><span class="c"># one server + workers in one Pod, sharing netns + a capture volume</span>
 spec:
   serviceAccountName: shiitake        <span class="c"># bound to the pod-reader Role below</span>
@@ -380,6 +395,8 @@ spec:
       env:
         - name: SHIITAKE_AUTH_TOKEN
           valueFrom: { secretKeyRef: { name: shiitake, key: token } }
+        - name: SHIITAKE_DISPATCH_TOKEN
+          valueFrom: { secretKeyRef: { name: shiitake, key: dispatch-token } }
         - name: SHIITAKE_CAPTURE_ROOT
           value: /capture
         - name: POD_NAME
@@ -397,6 +414,8 @@ spec:
       restartPolicy: Always                       <span class="c"># recycle this container on its own</span>
       env:
         - { name: SHIITAKE_WORKER_ID,   value: worker-0 }
+        - name: SHIITAKE_DISPATCH_TOKEN
+          valueFrom: { secretKeyRef: { name: shiitake, key: dispatch-token } }
         - { name: SHIITAKE_CAPTURE_ROOT, value: /capture }
         - { name: SHIITAKE_RESET_PATHS,  value: "/tmp,/var/tmp,/dev/shm" }
       volumeMounts:
@@ -423,11 +442,100 @@ rules:
     <p>
       The repository ships a reference chart under
       <a href="https://github.com/TenzaiLabs/shiitake/tree/main/tests/chart"><code>tests/chart</code></a>
-      that deploys exactly this topology — server + a configurable worker count,
-      the pod-reader RBAC, an optional OpenTelemetry Collector, and tunable
-      <code>resources.limits</code>. It is built for the end-to-end suite, so treat
-      it as a worked example rather than a production-hardened chart.
+      that deploys <em>either</em> topology (a <code>topology</code> value picks
+      one) — server + a configurable worker count, the pod-reader RBAC, the
+      dispatch Service and worker NetworkPolicy for the split shape, an optional
+      OpenTelemetry Collector, and tunable <code>resources.limits</code>. It is
+      built for the end-to-end suite, so treat it as a worked example rather than
+      a production-hardened chart.
     </p>
+
+    <h2 id="topologies">Topologies</h2>
+    <p>
+      Two supported shapes. The binaries, the wire protocol and the HTTP API are
+      identical in both — what changes is where the containers sit and how the
+      worker addresses the dispatcher.
+    </p>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th></th><th>Single Pod</th><th>Two Pods</th></tr></thead>
+      <tbody>
+        <tr><td>Layout</td><td>server + <code>N</code> worker containers in one Pod</td><td>a server Pod, plus worker Pods of their own</td></tr>
+        <tr><td>Dispatch</td><td><code>ws://127.0.0.1:8090/dispatch</code></td><td><code>ws://&lt;service&gt;:8090/dispatch</code>, through a cluster-internal Service</td></tr>
+        <tr><td>Capture</td><td>a shared <code>emptyDir</code></td><td>a <strong>ReadWriteMany</strong> volume both Pods mount</td></tr>
+        <tr><td>Worker recycle</td><td>per-container <code>restartPolicy</code> (k8s ≥ 1.35)</td><td>the ordinary Pod <code>restartPolicy</code></td></tr>
+        <tr><td>Pod-scoped controls</td><td>one setting for server and workers alike</td><td>set independently for each</td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <h3>Why split them</h3>
+    <p>
+      A <code>NetworkPolicy</code> selects a <strong>Pod</strong>, not a
+      container. While the server and the workers share one, every egress the
+      server legitimately needs — the Kubernetes API to classify an OOM-killed
+      worker, a collector to export telemetry to — is necessarily also granted to
+      the worker containers, which are the ones running arbitrary commands.
+      Per-container controls such as the service-account token mount can be kept
+      narrow, but network reach cannot. Hardening the workers and giving the
+      server what it needs pull in opposite directions, and the operator has to
+      choose one.
+    </p>
+    <p>
+      Split apart, the workers get a policy of their own — no ingress, egress
+      only to DNS and the dispatcher — while the server pod keeps its reach.
+      Neither side gives anything up.
+    </p>
+
+    <h3>What changes</h3>
+    <ul>
+      <li><strong>Dispatch is addressed by URL.</strong> Bind the server's dispatch listener with <code>SHIITAKE_DISPATCH_HOST=0.0.0.0</code>, put a cluster-internal Service in front of it, and point the workers at it with <code>SHIITAKE_DISPATCH_URL</code>.</li>
+      <li><strong>Dispatch is authenticated.</strong> <code>SHIITAKE_DISPATCH_TOKEN</code> is required on both sides and checked on the HTTP upgrade, before a WebSocket exists — being loopback-bound is no longer what protects that path. It is a separate secret from <code>SHIITAKE_AUTH_TOKEN</code>: a worker never needs the API's token.</li>
+      <li><strong>Capture must span both Pods.</strong> The worker writes the capture files and the server reads them back, so <code>SHIITAKE_CAPTURE_ROOT</code> has to name the same storage in both. An <code>emptyDir</code> cannot do this.</li>
+      <li><strong>Worker ids must stay unique.</strong> A Deployment of worker Pods shares one Pod template, so take the id from the downward API (<code>metadata.name</code>) rather than a literal.</li>
+      <li><strong>Workers report their own Pod.</strong> Wire <code>POD_NAME</code>, <code>POD_NAMESPACE</code> and <code>SHIITAKE_CONTAINER_NAME</code> into the worker; it puts them on its <code>Hello</code> so the server's OOM probe queries the worker's Pod rather than its own.</li>
+    </ul>
+    <pre><code><span class="c"># worker Pods: their own id, the dispatch Service, and no API-server reach</span>
+spec:
+  automountServiceAccountToken: false
+  containers:
+    - name: worker
+      image: your-registry/your-worker:latest
+      env:
+        - name: SHIITAKE_WORKER_ID          <span class="c"># unique per replica</span>
+          valueFrom: { fieldRef: { fieldPath: metadata.name } }
+        - { name: SHIITAKE_DISPATCH_URL,   value: "ws://shiitake-dispatch:8090/dispatch" }
+        - name: SHIITAKE_DISPATCH_TOKEN
+          valueFrom: { secretKeyRef: { name: shiitake, key: dispatch-token } }
+        - { name: SHIITAKE_CONTAINER_NAME, value: worker }
+        - name: POD_NAME
+          valueFrom: { fieldRef: { fieldPath: metadata.name } }
+        - name: POD_NAMESPACE
+          valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+---
+<span class="c"># and the policy that is now expressible: workers reach DNS and the dispatcher, nothing else</span>
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: shiitake-worker }
+spec:
+  podSelector:
+    matchLabels: { app: shiitake-worker }
+  policyTypes: ["Ingress", "Egress"]
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - podSelector:
+            matchLabels: { app: shiitake }
+      ports:
+        - { protocol: TCP, port: 8090 }</code></pre>
+    <div class="note"><p>The dispatch Service is cluster-internal by design. Keep it that way — no <code>NodePort</code>, no <code>LoadBalancer</code>. The bearer token guards the endpoint, but the dispatcher is not a public API.</p></div>
 
     <h2 id="custom-image">Building a custom worker image</h2>
     <p>
@@ -468,7 +576,8 @@ ENTRYPOINT [<span class="s">"/usr/local/bin/shiitake-worker"</span>]</code></pre
         <tr><td><code>SHIITAKE_AUTH_TOKEN</code></td><td>(empty)</td><td><strong>Required.</strong> Bearer token guarding every <code>/exec</code> route. The server refuses to start if unset.</td></tr>
         <tr><td><code>SHIITAKE_HOST</code></td><td><code>0.0.0.0</code></td><td>HTTP API listen address.</td></tr>
         <tr><td><code>SHIITAKE_PORT</code></td><td><code>8080</code></td><td>HTTP API listen port.</td></tr>
-        <tr><td><code>SHIITAKE_DISPATCH_HOST</code></td><td><code>127.0.0.1</code></td><td>Worker dispatch listen address. Keep on loopback.</td></tr>
+        <tr><td><code>SHIITAKE_DISPATCH_TOKEN</code></td><td>(empty)</td><td><strong>Required.</strong> Bearer token workers present on the dispatch upgrade. A separate secret from <code>SHIITAKE_AUTH_TOKEN</code> — dispatch and the public API are different trust boundaries.</td></tr>
+        <tr><td><code>SHIITAKE_DISPATCH_HOST</code></td><td><code>127.0.0.1</code></td><td>Worker dispatch listen address. Loopback is all a single-Pod deployment needs; set <code>0.0.0.0</code> for workers in <a href="#topologies">their own Pods</a>.</td></tr>
         <tr><td><code>SHIITAKE_DISPATCH_PORT</code></td><td><code>8090</code></td><td>Worker dispatch listen port.</td></tr>
         <tr><td><code>SHIITAKE_DEFAULT_WORKDIR</code></td><td><code>/</code></td><td>Working directory when a request omits <code>workdir</code>.</td></tr>
         <tr><td><code>SHIITAKE_MAX_BODY_BYTES</code></td><td><code>268435456</code></td><td>Maximum accepted request body size (256 MiB).</td></tr>
@@ -476,7 +585,7 @@ ENTRYPOINT [<span class="s">"/usr/local/bin/shiitake-worker"</span>]</code></pre
         <tr><td><code>SHIITAKE_MIN_READY_WORKERS</code></td><td><code>1</code></td><td>Registered workers (idle + in-flight) the pool needs before <code>/ready</code> reports ready.</td></tr>
         <tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td>(unset)</td><td>OTLP endpoint. When set, the server exports traces + metrics; otherwise it logs to stdout only.</td></tr>
         <tr><td><code>OTEL_EXPORTER_OTLP_PROTOCOL</code></td><td><code>http/protobuf</code></td><td>OTLP transport: <code>grpc</code>, <code>http/protobuf</code>, or <code>http/json</code> (all plaintext).</td></tr>
-        <tr><td><code>POD_NAME</code> / <code>POD_NAMESPACE</code></td><td>(downward API)</td><td>Used by the Kubernetes container-OOM probe.</td></tr>
+        <tr><td><code>POD_NAME</code> / <code>POD_NAMESPACE</code></td><td>(downward API)</td><td>The server's own Pod, used by the container-OOM probe for workers that don't report a Pod of their own.</td></tr>
       </tbody>
     </table>
     </div>
@@ -486,9 +595,12 @@ ENTRYPOINT [<span class="s">"/usr/local/bin/shiitake-worker"</span>]</code></pre
     <table>
       <thead><tr><th>Variable</th><th>Default</th><th>Purpose</th></tr></thead>
       <tbody>
-        <tr><td><code>SHIITAKE_WORKER_ID</code></td><td><code>worker-unknown</code></td><td>Identifier advertised to the dispatcher.</td></tr>
-        <tr><td><code>SHIITAKE_DISPATCH_PORT</code></td><td><code>8090</code></td><td>Dispatcher port. The host is always loopback (<code>127.0.0.1</code>) — server and workers share the pod network namespace.</td></tr>
+        <tr><td><code>SHIITAKE_WORKER_ID</code></td><td><code>worker-unknown</code></td><td>Identifier advertised to the dispatcher. Must be unique across the pool — take it from the Pod name when each worker is its own Pod.</td></tr>
+        <tr><td><code>SHIITAKE_DISPATCH_URL</code></td><td><code>ws://127.0.0.1:8090/dispatch</code></td><td>Full URL of the server's dispatch endpoint. The default is the same-Pod case; point it at a Service to run the workers in <a href="#topologies">their own Pods</a>.</td></tr>
+        <tr><td><code>SHIITAKE_DISPATCH_TOKEN</code></td><td>(empty)</td><td><strong>Required.</strong> Bearer token presented on the dispatch upgrade. Must match the server's.</td></tr>
         <tr><td><code>SHIITAKE_CAPTURE_ROOT</code></td><td><code>/capture</code></td><td>Must match the server's capture root (shared volume).</td></tr>
+        <tr><td><code>POD_NAME</code> / <code>POD_NAMESPACE</code></td><td>(downward API)</td><td>This worker's own Pod, reported to the server so its container-OOM probe queries the right one. Omit outside Kubernetes.</td></tr>
+        <tr><td><code>SHIITAKE_CONTAINER_NAME</code></td><td>(the worker id)</td><td>This worker's container name within its Pod, for the same probe.</td></tr>
         <tr><td><code>SHIITAKE_RESET_PATHS</code></td><td>(empty)</td><td>Comma-separated scratch directories to empty between commands. Empty means "clear nothing".</td></tr>
         <tr><td><code>SHIITAKE_RESTART_AFTER</code></td><td><code>0</code></td><td>Exit (recycle the container) after this many commands. <code>0</code> = stay resident; <code>N</code> = a full container teardown every <code>N</code> commands.</td></tr>
       </tbody>
@@ -499,8 +611,10 @@ ENTRYPOINT [<span class="s">"/usr/local/bin/shiitake-worker"</span>]</code></pre
     <p>
       The public API is versioned under <code>/api/v1</code>. Every <code>/exec</code>
       route requires <code>Authorization: Bearer &lt;token&gt;</code>; only
-      <code>/health</code> and <code>/ready</code> are unauthenticated. The worker dispatch endpoint
-      (<code>/dispatch</code>) is a separate internal router on the loopback port
+      <code>/health</code> and <code>/ready</code> are unauthenticated. The worker
+      dispatch endpoint (<code>/dispatch</code>) is a separate internal router on
+      its own listener, with its own bearer token
+      (<code>SHIITAKE_DISPATCH_TOKEN</code>)
       and is never publicly reachable.
     </p>
 
@@ -596,7 +710,8 @@ let status = client.status(&handle.handle).await?;</code></pre>
     <h3>What Shiitake provides</h3>
     <ul>
       <li><strong>Single ingress, authenticated.</strong> Every <code>/exec</code> route requires the bearer token (<code>SHIITAKE_AUTH_TOKEN</code>); the server refuses to start without one. Treat the token as a secret — mount it from a Kubernetes <code>Secret</code>, not a plaintext env literal.</li>
-      <li><strong>Workers never face the network.</strong> The dispatch endpoint binds loopback only and is reachable solely from within the shared pod network namespace. Workers bind no public port.</li>
+      <li><strong>Workers never face the network.</strong> Workers bind no port at all — they dial out to the dispatcher. The dispatch endpoint is a separate listener behind its own bearer token (<code>SHIITAKE_DISPATCH_TOKEN</code>, required), bound to loopback when server and workers share a Pod and to a cluster-internal Service when they do not. Never expose it beyond the cluster.</li>
+      <li><strong>Pod-scoped controls, where you want them.</strong> Running the server and the workers as <a href="#topologies">separate Pods</a> lets a <code>NetworkPolicy</code>, a service-account mount, a RuntimeClass or a seccomp profile apply to the containers running arbitrary commands without also applying to the server — which needs egress to the Kubernetes API and to a telemetry collector that the workers have no business having.</li>
       <li><strong>Per-command isolation.</strong> Each command runs in its own resource-bounded worker container; it cannot see or touch another command's processes, files, or output. Between commands the worker resets to a clean slate (process sweep, scratch clear, IPC removal), and if that reset can't be trusted the worker recycles into a fresh container instead of serving dirty.</li>
       <li><strong>Resource bounds.</strong> Memory and CPU are enforced at the container level via the Pod's <code>resources.limits</code>. An allocation bomb kills only its own worker — the server and every other worker keep running. The kill is surfaced as <code>oom_container</code>, never silently lost.</li>
       <li><strong>Identity-agnostic privilege drop.</strong> An <code>/exec</code> request may carry a <code>drop_to</code> directive (<code>uid</code>, <code>gid</code>, supplementary gids, <code>umask</code>); the worker applies it in the post-fork <code>pre_exec</code> hook before <code>exec</code>. Shiitake never decides identities — your embedding layer maps its own auth to <code>drop_to</code>.</li>

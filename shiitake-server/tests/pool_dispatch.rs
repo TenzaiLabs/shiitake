@@ -14,7 +14,32 @@ use tokio::{
     net::TcpListener,
     time::{sleep, timeout},
 };
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{
+    Message,
+    client::IntoClientRequest,
+    http::header::{AUTHORIZATION, HeaderValue},
+};
+
+/// Bearer token the dispatch listener is built with in these tests. The
+/// dispatcher is authenticated now that it may face the network rather than
+/// only loopback, so every fake worker must present it.
+const DISPATCH_TOKEN: &str = "test-dispatch-token";
+
+/// Connect to the dispatch listener the way a real worker does: a WS upgrade
+/// carrying the dispatch bearer token.
+async fn connect_worker(
+    port: u16,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let mut req = format!("ws://127.0.0.1:{port}/dispatch")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut().insert(
+        AUTHORIZATION,
+        HeaderValue::try_from(format!("Bearer {DISPATCH_TOKEN}")).unwrap(),
+    );
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    ws
+}
 
 #[tokio::test]
 async fn dispatch_with_one_fake_worker_marks_handle_completed() {
@@ -29,7 +54,7 @@ async fn dispatch_with_one_fake_worker_marks_handle_completed() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = build_dispatch_router(pool.clone());
+    let app = build_dispatch_router(pool.clone(), DISPATCH_TOKEN);
     tokio::spawn(async move {
         axum::serve(listener, app.into_make_service())
             .await
@@ -37,9 +62,9 @@ async fn dispatch_with_one_fake_worker_marks_handle_completed() {
     });
 
     let worker_task = tokio::spawn(async move {
-        let url = format!("ws://127.0.0.1:{}/dispatch", addr.port());
-        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        let mut ws = connect_worker(addr.port()).await;
         let hello = serde_json::to_string(&Frame::Hello {
+            location: None,
             worker_id: WorkerId::new("fake-0"),
         })
         .unwrap();
@@ -119,7 +144,7 @@ async fn worker_drop_marks_handle_worker_died() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = build_dispatch_router(pool.clone());
+    let app = build_dispatch_router(pool.clone(), DISPATCH_TOKEN);
     tokio::spawn(async move {
         axum::serve(listener, app.into_make_service())
             .await
@@ -127,9 +152,9 @@ async fn worker_drop_marks_handle_worker_died() {
     });
 
     let worker_task = tokio::spawn(async move {
-        let url = format!("ws://127.0.0.1:{}/dispatch", addr.port());
-        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        let mut ws = connect_worker(addr.port()).await;
         let hello = serde_json::to_string(&Frame::Hello {
+            location: None,
             worker_id: WorkerId::new("doomed"),
         })
         .unwrap();
@@ -211,7 +236,7 @@ async fn serial_dispatch_rotates_through_idle_workers() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = build_dispatch_router(pool.clone());
+    let app = build_dispatch_router(pool.clone(), DISPATCH_TOKEN);
     tokio::spawn(async move {
         axum::serve(listener, app.into_make_service())
             .await
@@ -219,13 +244,13 @@ async fn serial_dispatch_rotates_through_idle_workers() {
     });
 
     let worker_ids = ["rot-0", "rot-1", "rot-2"];
-    let url = format!("ws://127.0.0.1:{}/dispatch", addr.port());
     for (i, id) in worker_ids.iter().enumerate() {
         // Connect and Hello one at a time, waiting for the pool to register
         // each before starting the next, so the idle order is deterministic.
-        let (mut ws, _) = tokio_tungstenite::connect_async(url.clone()).await.unwrap();
+        let mut ws = connect_worker(addr.port()).await;
         let hello = serde_json::to_string(&Frame::Hello {
             worker_id: WorkerId::new(*id),
+            location: None,
         })
         .unwrap();
         ws.send(Message::Text(hello.into())).await.unwrap();

@@ -15,8 +15,17 @@ permissions:
 
 jobs:
   e2e:
-    name: 🚀 End-to-end (k3d)
+    # Both supported topologies run the same suite: the API contract does not
+    # change when the server and the workers stop sharing a pod. two-pod adds
+    # test_two_pod.py on top, for what the split makes newly true.
+    name: 🚀 End-to-end (k3d, ${{ matrix.topology }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        topology:
+          - single-pod
+          - two-pod
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -53,7 +62,11 @@ jobs:
           cache-to: type=gha,mode=max,scope=shiitake-worker
 
       - name: 🏗️ Set up the e2e cluster
+        env:
+          SHIITAKE_E2E_TOPOLOGY: ${{ matrix.topology }}
         run: bash tests/setup.sh
 
       - name: 🧫 Run end-to-end suite
+        env:
+          SHIITAKE_E2E_TOPOLOGY: ${{ matrix.topology }}
         run: bash tests/run.sh

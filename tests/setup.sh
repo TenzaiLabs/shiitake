@@ -12,6 +12,10 @@
 # Deploy a different profile by passing extra helm args, e.g.
 #   bash tests/setup.sh --set worker.count=2 --set worker.resources.limits.memory=64Mi
 #
+# Pick the topology with SHIITAKE_E2E_TOPOLOGY (single-pod, the default, or
+# two-pod — server and workers in separate pods):
+#   SHIITAKE_E2E_TOPOLOGY=two-pod bash tests/setup.sh
+#
 # Tear down manually when done: k3d cluster delete shiitake-e2e
 #
 # Requires: k3d, kubectl, helm, and the images already built (tests/build.sh).
@@ -38,13 +42,17 @@ log "Importing images into k3d"
 k3d image import "$SERVER_IMAGE" "$WORKER_IMAGE" -c "$CLUSTER"
 
 # On a re-run the same `:e2e` tag won't roll on its own, so trigger a restart to
-# pick up the freshly-imported images (no-op on a first install). `helm --wait`
-# then blocks until the deployment is ready; `--debug` streams what it's waiting on.
-kubectl --context "$CONTEXT" -n "$NAMESPACE" rollout restart "deploy/$RELEASE" 2>/dev/null || true
+# pick up the freshly-imported images (no-op on a first install). Both
+# deployments, since in the two-pod topology the workers are their own. `helm
+# --wait` then blocks until they're ready; `--debug` streams what it's waiting on.
+for d in "$RELEASE" "$WORKER_DEPLOY"; do
+  kubectl --context "$CONTEXT" -n "$NAMESPACE" rollout restart "deploy/$d" 2>/dev/null || true
+done
 
-log "Deploying release '${RELEASE}' into namespace '${NAMESPACE}'"
+log "Deploying release '${RELEASE}' (${TOPOLOGY}) into namespace '${NAMESPACE}'"
 helm --kube-context "$CONTEXT" upgrade --install "$RELEASE" "$ROOT/tests/chart" \
   --namespace "$NAMESPACE" --create-namespace \
+  --set topology="$TOPOLOGY" \
   --set server.image="$SERVER_IMAGE" \
   --set worker.image="$WORKER_IMAGE" \
   --set otel.enabled=true \

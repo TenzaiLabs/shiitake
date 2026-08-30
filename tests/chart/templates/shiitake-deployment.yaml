@@ -1,9 +1,15 @@
+{{/*
+The server Deployment, named after the release in both topologies so the test
+scripts port-forward and tail logs the same way either way. In single-pod the
+workers ride along as extra containers; in two-pod they get their own Deployment.
+*/}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ .Release.Name }}
   labels:
     app: shiitake
+    release: {{ .Release.Name }}
 spec:
   replicas: 1
   selector:
@@ -13,92 +19,22 @@ spec:
     metadata:
       labels:
         app: shiitake
+        release: {{ .Release.Name }}
     spec:
       serviceAccountName: {{ .Release.Name }}
       containers:
-        - name: server
-          image: {{ .Values.server.image }}
-          imagePullPolicy: IfNotPresent
-          ports:
-            - containerPort: {{ .Values.server.port }}
-          env:
-            - name: SHIITAKE_HOST
-              value: "0.0.0.0"
-            - name: SHIITAKE_PORT
-              value: {{ .Values.server.port | quote }}
-            - name: SHIITAKE_DISPATCH_HOST
-              value: "127.0.0.1"
-            - name: SHIITAKE_DISPATCH_PORT
-              value: {{ .Values.server.dispatchPort | quote }}
-            - name: SHIITAKE_DEFAULT_WORKDIR
-              value: {{ .Values.defaultWorkdir | quote }}
-            - name: SHIITAKE_AUTH_TOKEN
-              value: {{ .Values.authToken | quote }}
-            - name: SHIITAKE_CAPTURE_ROOT
-              value: {{ .Values.captureRoot | quote }}
-            - name: SHIITAKE_MIN_READY_WORKERS
-              value: {{ .Values.server.minReadyWorkers | quote }}
-            {{- if .Values.otel.enabled }}
-            - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: "http://{{ .Release.Name }}-otel:4318"
-            - name: OTEL_METRIC_EXPORT_INTERVAL
-              value: {{ .Values.otel.metricExportIntervalMs | quote }}
-            {{- end }}
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
-          # Readiness gates traffic on the pool (/ready is 503 until
-          # minReadyWorkers workers have registered); liveness only asks
-          # whether the process is up, so an empty pool never restarts it.
-          readinessProbe:
-            httpGet:
-              path: /api/v1/ready
-              port: {{ .Values.server.port }}
-            # No initialDelaySeconds: the server binds in milliseconds and
-            # /ready is 503 until the pool fills, so probing immediately and
-            # often is what makes the pod ready the instant it can serve.
-            periodSeconds: 1
-          livenessProbe:
-            httpGet:
-              path: /api/v1/health
-              port: {{ .Values.server.port }}
-            periodSeconds: 10
-          resources:
-            {{- toYaml .Values.server.resources | nindent 12 }}
-          volumeMounts:
-            - name: capture
-              mountPath: {{ .Values.captureRoot }}
+        {{- if eq .Values.topology "two-pod" }}
+        {{- include "shiitake.serverContainer" (dict "root" . "dispatchHost" "0.0.0.0") | nindent 8 }}
+        {{- else }}
+        {{- include "shiitake.serverContainer" (dict "root" . "dispatchHost" "127.0.0.1") | nindent 8 }}
         {{- range $i := until (int .Values.worker.count) }}
-        - name: worker-{{ $i }}
-          image: {{ $.Values.worker.image }}
-          imagePullPolicy: IfNotPresent
-          # Per-container restartPolicy so each worker recycles independently
-          # when it hits its SHIITAKE_RESTART_AFTER quota (ContainerRestartRules;
-          # requires k8s >= 1.35). The worker always exits 0, so a recycle reads
-          # as Completed, not CrashLoopBackOff.
-          restartPolicy: Always
-          env:
-            - name: SHIITAKE_WORKER_ID
-              value: "worker-{{ $i }}"
-            - name: SHIITAKE_DISPATCH_PORT
-              value: {{ $.Values.server.dispatchPort | quote }}
-            - name: SHIITAKE_CAPTURE_ROOT
-              value: {{ $.Values.captureRoot | quote }}
-            - name: SHIITAKE_RESET_PATHS
-              value: {{ $.Values.worker.resetPaths | quote }}
-            - name: SHIITAKE_RESTART_AFTER
-              value: {{ $.Values.worker.restartAfter | quote }}
-          resources:
-            {{- toYaml $.Values.worker.resources | nindent 12 }}
-          volumeMounts:
-            - name: capture
-              mountPath: {{ $.Values.captureRoot }}
+        {{- include "shiitake.workerContainer" (dict
+              "root" $
+              "name" (printf "worker-%d" $i)
+              "workerId" (printf "worker-%d" $i)
+              "dispatchUrl" (printf "ws://127.0.0.1:%v/dispatch" $.Values.server.dispatchPort)
+              "perContainerRestart" true) | nindent 8 }}
+        {{- end }}
         {{- end }}
       volumes:
-        - name: capture
-          emptyDir: {}
+        {{- include "shiitake.captureVolume" (dict "root" .) | nindent 8 }}

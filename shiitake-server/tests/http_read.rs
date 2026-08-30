@@ -15,9 +15,34 @@ use shiitake_worker_api::{
 use std::{sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tokio::{net::TcpListener, time::sleep};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{
+    Message,
+    client::IntoClientRequest,
+    http::header::{AUTHORIZATION, HeaderValue},
+};
 
 const TOKEN: &str = "test-token";
+
+/// Bearer token the dispatch listener is built with in these tests. The
+/// dispatcher is authenticated now that it may face the network rather than
+/// only loopback, so every fake worker must present it.
+const DISPATCH_TOKEN: &str = "test-dispatch-token";
+
+/// Connect to the dispatch listener the way a real worker does: a WS upgrade
+/// carrying the dispatch bearer token.
+async fn connect_worker(
+    port: u16,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let mut req = format!("ws://127.0.0.1:{port}/dispatch")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut().insert(
+        AUTHORIZATION,
+        HeaderValue::try_from(format!("Bearer {DISPATCH_TOKEN}")).unwrap(),
+    );
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    ws
+}
 
 fn payload() -> Vec<u8> {
     // 0,1,…,250,0,1,… — a u8 cycle, so no integer conversion is needed.
@@ -37,7 +62,7 @@ async fn reads_full_and_range_and_suffix() {
 
     let dispatch_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dispatch_addr = dispatch_listener.local_addr().unwrap();
-    let dispatch_router = build_dispatch_router(pool.clone());
+    let dispatch_router = build_dispatch_router(pool.clone(), DISPATCH_TOKEN);
     tokio::spawn(async move {
         axum::serve(dispatch_listener, dispatch_router.into_make_service())
             .await
@@ -65,11 +90,11 @@ async fn reads_full_and_range_and_suffix() {
     // report success.
     let capture_for_worker = capture_path.clone();
     let worker = tokio::spawn(async move {
-        let url = format!("ws://127.0.0.1:{}/dispatch", dispatch_addr.port());
-        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        let mut ws = connect_worker(dispatch_addr.port()).await;
         ws.send(Message::Text(
             serde_json::to_string(&Frame::Hello {
                 worker_id: WorkerId::new("fake"),
+                location: None,
             })
             .unwrap()
             .into(),

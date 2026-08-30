@@ -39,7 +39,11 @@ async fn worker_exits_after_restart_after_quota() {
 
     let mut child = Command::new(&bin)
         .env("SHIITAKE_WORKER_ID", "test-worker")
-        .env("SHIITAKE_DISPATCH_PORT", addr.port().to_string())
+        .env(
+            "SHIITAKE_DISPATCH_URL",
+            format!("ws://127.0.0.1:{}/dispatch", addr.port()),
+        )
+        .env("SHIITAKE_DISPATCH_TOKEN", "test-dispatch-token")
         .env("SHIITAKE_CAPTURE_ROOT", capture_root.path())
         .env("SHIITAKE_RESTART_AFTER", "2")
         .env("PATH", std::env::var("PATH").unwrap())

@@ -3,6 +3,11 @@
 //! reset the sandbox, await the next. The worker stays resident; `reset`
 //! reproduces the clean slate a fresh container used to give (see `reset`).
 //!
+//! The dispatcher is addressed by a full URL (`SHIITAKE_DISPATCH_URL`), so the
+//! server may sit in the same pod or behind a Service in another. That path is
+//! no longer protected by being loopback-bound, so every connection carries a
+//! bearer token the server validates on the upgrade.
+//!
 //! If the connection drops the worker reconnects rather than exiting, so a
 //! server restart or network blip doesn't churn the container.
 //!
@@ -18,7 +23,7 @@ use futures_util::{
     SinkExt, StreamExt,
     stream::{SplitSink, SplitStream},
 };
-use shiitake_worker_api::{ExecuteFrame, Frame, ResultFrame, WorkerId};
+use shiitake_worker_api::{ExecuteFrame, Frame, ResultFrame, WorkerId, WorkerLocation};
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -26,7 +31,11 @@ use std::{
 use tokio::{net::TcpStream, sync::watch, time::sleep};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
-    tungstenite::{Message, client::IntoClientRequest},
+    tungstenite::{
+        Message,
+        client::IntoClientRequest,
+        http::header::{AUTHORIZATION, HeaderValue},
+    },
 };
 use tracing::{debug, info, warn};
 
@@ -69,10 +78,34 @@ enum SessionEnd {
 pub struct ClientConfig {
     #[arg(long, env = "SHIITAKE_WORKER_ID", default_value = "worker-unknown")]
     pub worker_id: String,
-    /// Dispatch port on the server. The host is always loopback — the worker
-    /// and server share the pod's network namespace.
-    #[arg(long, env = "SHIITAKE_DISPATCH_PORT", default_value_t = 8090)]
-    pub dispatch_port: u16,
+    /// Full WebSocket URL of the server's dispatch endpoint. Defaults to the
+    /// single-pod case; point it at a Service to split the two apart.
+    #[arg(
+        long,
+        env = "SHIITAKE_DISPATCH_URL",
+        default_value = "ws://127.0.0.1:8090/dispatch"
+    )]
+    pub dispatch_url: String,
+    /// Bearer token presented on the dispatch upgrade. Must match the server's.
+    /// Required: the dispatch path may cross pods.
+    #[arg(
+        long,
+        env = "SHIITAKE_DISPATCH_TOKEN",
+        hide_env_values = true,
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    pub dispatch_token: String,
+    /// This worker pod's name, from the downward API, so the server's OOM probe
+    /// queries the right pod. Empty outside k8s.
+    #[arg(long, env = "POD_NAME", default_value = "")]
+    pub pod_name: String,
+    /// This worker pod's namespace, from the downward API. See `pod_name`.
+    #[arg(long, env = "POD_NAMESPACE", default_value = "")]
+    pub pod_namespace: String,
+    /// Container name within that pod, for the same probe. Defaults to the
+    /// worker id, which is how single-pod names its worker containers.
+    #[arg(long, env = "SHIITAKE_CONTAINER_NAME", default_value = "")]
+    pub container_name: String,
     #[arg(long, env = "SHIITAKE_CAPTURE_ROOT", default_value = "/capture")]
     pub capture_root: PathBuf,
     /// Writable scratch paths emptied between commands (comma-separated, e.g.
@@ -102,6 +135,25 @@ impl ClientConfig {
             .map(PathBuf::from)
             .collect()
     }
+
+    /// Where this worker's container lives, for the server's OOM probe. `None`
+    /// when the pod identity isn't wired in (a local run) — the server then
+    /// looks in its own pod for a container named after the worker id.
+    fn location(&self) -> Option<WorkerLocation> {
+        if self.pod_name.is_empty() || self.pod_namespace.is_empty() {
+            return None;
+        }
+        let container = if self.container_name.is_empty() {
+            self.worker_id.clone()
+        } else {
+            self.container_name.clone()
+        };
+        Some(WorkerLocation {
+            pod: self.pod_name.clone(),
+            namespace: self.pod_namespace.clone(),
+            container,
+        })
+    }
 }
 
 /// Serve commands for the lifetime of the worker process. Reconnects across
@@ -109,18 +161,10 @@ impl ClientConfig {
 /// `restart_after` quota is reached. `restart_after == 0` never returns.
 pub async fn run(cfg: &ClientConfig) -> Result<()> {
     let reset_paths = cfg.scratch_paths();
+    let location = cfg.location();
     let mut served: u64 = 0;
     loop {
-        match serve_session(
-            &cfg.worker_id,
-            cfg.dispatch_port,
-            &cfg.capture_root,
-            &reset_paths,
-            cfg.restart_after,
-            &mut served,
-        )
-        .await
-        {
+        match serve_session(cfg, location.clone(), &reset_paths, &mut served).await {
             Ok(SessionEnd::RestartQuotaReached) => {
                 info!(
                     served,
@@ -142,21 +186,31 @@ pub async fn run(cfg: &ClientConfig) -> Result<()> {
 
 /// Connect, Hello, then serve commands on this one connection until it closes.
 async fn serve_session(
-    worker_id: &str,
-    dispatch_port: u16,
-    capture_root: &Path,
+    cfg: &ClientConfig,
+    location: Option<WorkerLocation>,
     reset_paths: &[PathBuf],
-    restart_after: u64,
     served: &mut u64,
 ) -> Result<SessionEnd> {
-    // The dispatcher is always on loopback — the worker shares the pod's network
-    // namespace with the server — so only the port is configurable.
-    let dispatch_url = format!("ws://127.0.0.1:{dispatch_port}/dispatch");
+    let ClientConfig {
+        worker_id,
+        dispatch_url,
+        dispatch_token,
+        capture_root,
+        restart_after,
+        ..
+    } = cfg;
+    let capture_root: &Path = capture_root;
     info!(%worker_id, dispatch = %dispatch_url, "connecting");
-    let req = dispatch_url
+    let mut req = dispatch_url
         .as_str()
         .into_client_request()
-        .context("invalid WS url")?;
+        .context("invalid SHIITAKE_DISPATCH_URL")?;
+    // On the upgrade itself, so the server rejects the handshake before any
+    // frame is exchanged.
+    let mut bearer = HeaderValue::try_from(format!("Bearer {dispatch_token}"))
+        .context("SHIITAKE_DISPATCH_TOKEN is not a valid header value")?;
+    bearer.set_sensitive(true);
+    req.headers_mut().insert(AUTHORIZATION, bearer);
 
     let (ws, _resp) = tokio::time::timeout(
         Duration::from_secs(30),
@@ -169,7 +223,8 @@ async fn serve_session(
     let (mut sink, mut stream) = ws.split();
 
     let hello = serde_json::to_string(&Frame::Hello {
-        worker_id: WorkerId::new(worker_id),
+        worker_id: WorkerId::new(worker_id.as_str()),
+        location,
     })?;
     sink.send(Message::Text(hello.into()))
         .await
@@ -190,7 +245,7 @@ async fn serve_session(
         };
 
         *served += 1;
-        let exiting = restart_after != 0 && *served >= restart_after;
+        let exiting = *restart_after != 0 && *served >= *restart_after;
 
         // Phase 3: reset to give the NEXT command a clean slate — skipped when
         // we're about to exit, because the fresh container the orchestrator

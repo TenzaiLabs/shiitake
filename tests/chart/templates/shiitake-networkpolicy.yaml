@@ -1,0 +1,45 @@
+{{- if and (eq .Values.topology "two-pod") .Values.networkPolicy.enabled }}
+{{/*
+The reason the split topology exists. A NetworkPolicy selects a *pod*, so while
+the server and the workers shared one, every egress the server needs (API server,
+collector) was also granted to the containers running arbitrary commands. Split
+apart, the workers get their own policy and the server keeps its reach.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-worker
+  labels:
+    app: shiitake-worker
+    release: {{ .Release.Name }}
+spec:
+  podSelector:
+    matchLabels:
+      app: shiitake-worker
+  policyTypes:
+    - Ingress
+    - Egress
+  # Nothing connects *to* a worker; it dials the dispatcher and that's all.
+  ingress: []
+  egress:
+    # DNS, to resolve the dispatch Service name.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # The dispatcher, and nothing else — notably not the API server or the
+    # collector, both of which the server pod can still reach.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: shiitake
+      ports:
+        - protocol: TCP
+          port: {{ .Values.server.dispatchPort }}
+{{- end }}

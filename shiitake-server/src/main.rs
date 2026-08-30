@@ -2,6 +2,9 @@
 //! `SHIITAKE_*` / `POD_*` env fallbacks, exposes the default API + dispatch
 //! routers, and serves until SIGINT.
 //!
+//! The two listeners are independent — each with its own bind address and bearer
+//! token — which is what lets the server and workers deploy as one pod or two.
+//!
 //! Embedding crates compose the same library pieces (`AppState`,
 //! `build_api_router`, `build_dispatch_router`, `WorkerPool`) with their own
 //! routes and middleware.
@@ -22,10 +25,21 @@ struct Config {
     host: String,
     #[arg(long, env = "SHIITAKE_PORT", default_value_t = 8080)]
     port: u16,
+    /// Worker dispatch listen address. Loopback is all single-pod needs; set
+    /// `0.0.0.0` for workers in another pod. Bearer-authenticated either way.
     #[arg(long, env = "SHIITAKE_DISPATCH_HOST", default_value = "127.0.0.1")]
     dispatch_host: String,
     #[arg(long, env = "SHIITAKE_DISPATCH_PORT", default_value_t = 8090)]
     dispatch_port: u16,
+    /// Bearer token workers present on the dispatch upgrade. Required, and
+    /// distinct from `auth_token` — a worker never needs the API's token.
+    #[arg(
+        long,
+        env = "SHIITAKE_DISPATCH_TOKEN",
+        hide_env_values = true,
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    dispatch_token: String,
     #[arg(long, env = "SHIITAKE_DEFAULT_WORKDIR", default_value = "/")]
     default_workdir: PathBuf,
     #[arg(
@@ -86,7 +100,7 @@ async fn main() -> Result<()> {
         min_ready_workers: cfg.min_ready_workers,
     };
     let api = build_api_router(state);
-    let dispatch = build_dispatch_router(pool.clone());
+    let dispatch = build_dispatch_router(pool.clone(), &cfg.dispatch_token);
 
     let addrs = ListenAddrs {
         api: format!("{}:{}", cfg.host, cfg.port)

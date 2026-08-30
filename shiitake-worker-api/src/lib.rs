@@ -62,11 +62,31 @@ pub struct DropTo {
     pub umask: Option<u32>,
 }
 
+/// Where a worker's container lives, reported on `Hello` so the server can ask
+/// the kubelet whether it was OOM-killed. Only the worker knows this once the
+/// two can sit in different pods. `None` means "the server's own pod, container
+/// named after the worker id" — the single-pod case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerLocation {
+    /// The worker pod's name (`metadata.name`).
+    pub pod: String,
+    /// The worker pod's namespace (`metadata.namespace`).
+    pub namespace: String,
+    /// The worker's container name within that pod.
+    pub container: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Frame {
     /// Worker → server: first frame after connect, advertises availability.
-    Hello { worker_id: WorkerId },
+    Hello {
+        worker_id: WorkerId,
+        /// For the server's OOM probe. Omitted when the worker has no pod
+        /// identity (local runs); the server then falls back to its own pod.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        location: Option<WorkerLocation>,
+    },
     /// Server → worker: a command to run.
     Execute(ExecuteFrame),
     /// Server → worker: cancel the in-flight command. Worker SIGKILLs the
@@ -150,6 +170,7 @@ mod tests {
     fn worker_id_is_wire_transparent() {
         let frame = Frame::Hello {
             worker_id: WorkerId::new("worker-0"),
+            location: None,
         };
         let json = serde_json::to_string(&frame).unwrap();
         assert_eq!(json, r#"{"kind":"hello","worker_id":"worker-0"}"#);
@@ -158,7 +179,47 @@ mod tests {
         let parsed: Frame =
             serde_json::from_str(r#"{"kind":"hello","worker_id":"worker-7"}"#).unwrap();
         match parsed {
-            Frame::Hello { worker_id } => assert_eq!(worker_id.as_str(), "worker-7"),
+            Frame::Hello { worker_id, .. } => assert_eq!(worker_id.as_str(), "worker-7"),
+            _ => panic!("expected Hello"),
+        }
+    }
+
+    // A worker that knows where it runs (the two-pod topology) puts that on the
+    // Hello; a worker that doesn't omits the field entirely, so the frame stays
+    // byte-identical to what a pre-location worker sends. Both directions are
+    // pinned here because the server's OOM probe reads this field and must keep
+    // accepting either shape.
+    #[test]
+    fn hello_carries_an_optional_worker_location() {
+        let frame = Frame::Hello {
+            worker_id: WorkerId::new("worker-0"),
+            location: Some(WorkerLocation {
+                pod: "shiitake-workers-abc".into(),
+                namespace: "shiitake".into(),
+                container: "worker".into(),
+            }),
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"hello","worker_id":"worker-0","location":{"pod":"shiitake-workers-abc","namespace":"shiitake","container":"worker"}}"#
+        );
+
+        let parsed: Frame = serde_json::from_str(&json).unwrap();
+        match parsed {
+            Frame::Hello { location, .. } => {
+                let loc = location.expect("location round-trips");
+                assert_eq!(loc.pod, "shiitake-workers-abc");
+                assert_eq!(loc.container, "worker");
+            }
+            _ => panic!("expected Hello"),
+        }
+
+        // A Hello with no location at all still parses (single-pod worker).
+        let parsed: Frame =
+            serde_json::from_str(r#"{"kind":"hello","worker_id":"worker-7"}"#).unwrap();
+        match parsed {
+            Frame::Hello { location, .. } => assert_eq!(location, None),
             _ => panic!("expected Hello"),
         }
     }

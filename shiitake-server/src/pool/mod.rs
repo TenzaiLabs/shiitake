@@ -24,7 +24,7 @@ use futures_util::{
     stream::{SplitSink, SplitStream},
 };
 use shiitake_worker_api::{
-    ExecId, ExecuteFrame, Frame, ResourceUsage, ResultFrame, WorkerId, capture,
+    ExecId, ExecuteFrame, Frame, ResourceUsage, ResultFrame, WorkerId, WorkerLocation, capture,
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -74,6 +74,9 @@ struct PoolState {
 struct WorkerLiveness {
     last_seen: Instant,
     shutdown: Arc<Notify>,
+    /// Where this worker's container runs, as reported on `Hello`. Read on
+    /// disconnect to aim the OOM probe; see [`WorkerPool::worker_location`].
+    location: Option<WorkerLocation>,
 }
 
 struct WorkerEntry {
@@ -356,9 +359,13 @@ impl WorkerPool {
 
     /// Register a freshly-Hello'd worker as available for dispatch and
     /// drive its read loop. Returns when the WS closes.
+    ///
+    /// `location` is kept for the connection's lifetime so a disconnect can be
+    /// classified against the right pod, even when it isn't the server's.
     pub async fn register_and_run(
         &self,
         worker_id: WorkerId,
+        location: Option<WorkerLocation>,
         sink: WorkerSink,
         mut stream: WorkerStream,
     ) -> Result<()> {
@@ -374,6 +381,7 @@ impl WorkerPool {
                 WorkerLiveness {
                     last_seen: Instant::now(),
                     shutdown: shutdown.clone(),
+                    location,
                 },
             );
             info!(%worker_id, idle = s.idle.len(), "worker registered");
@@ -504,6 +512,20 @@ impl WorkerPool {
         metrics().set_pool_workers(count(idle), count(inflight));
     }
 
+    /// The `(pod, namespace, container)` the OOM probe should query. A reported
+    /// location is authoritative — the only way to find a worker in its own pod.
+    /// Without one, assume a container of the server's pod named after the id.
+    fn worker_location<'a>(
+        &'a self,
+        worker_id: &'a WorkerId,
+        location: &'a Option<WorkerLocation>,
+    ) -> (&'a str, &'a str, &'a str) {
+        match location {
+            Some(l) => (&l.pod, &l.namespace, &l.container),
+            None => (&self.pod_name, &self.namespace, worker_id.as_str()),
+        }
+    }
+
     async fn handle_worker_drop(&self, worker_id: &WorkerId) {
         // Find any inflight requests on this worker. The worker may have
         // disconnected mid-command; we use the K8s probe to disambiguate
@@ -523,12 +545,13 @@ impl WorkerPool {
         };
         // Also drop any stale idle entry. A resident worker only reaches this
         // path on a real disconnect (crash/eviction); on reconnect it Hellos
-        // and registers afresh.
-        {
+        // and registers afresh. Take the location on the way out — the OOM probe
+        // needs it and the liveness entry is about to go.
+        let location = {
             let mut s = self.state.lock().await;
             s.idle.retain(|w| w.worker_id != *worker_id);
-            s.liveness.remove(worker_id);
-        }
+            s.liveness.remove(worker_id).and_then(|l| l.location)
+        };
         self.report_occupancy().await;
         if pending.is_empty() {
             return;
@@ -536,9 +559,8 @@ impl WorkerPool {
 
         let oom_killed = match &self.probe {
             Some(probe) => {
-                probe
-                    .was_oom_killed(&self.pod_name, &self.namespace, worker_id.as_str())
-                    .await
+                let (pod, namespace, container) = self.worker_location(worker_id, &location);
+                probe.was_oom_killed(pod, namespace, container).await
             }
             None => false,
         };
@@ -738,4 +760,47 @@ fn classify(r: &ResultFrame) -> (HandleStatus, ExitCause) {
         return (HandleStatus::Error, ExitCause::Signal);
     }
     (HandleStatus::Completed, ExitCause::Normal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pool() -> WorkerPool {
+        WorkerPool::new(
+            None,
+            "shiitake-server-abc".into(),
+            "shiitake".into(),
+            PathBuf::from("/capture"),
+        )
+    }
+
+    // Split topology: probing the server's pod would find nothing and report
+    // every OOM as a plain `worker_died`, so the reported location wins.
+    #[test]
+    fn reported_location_aims_the_oom_probe_at_the_worker_pod() {
+        let pool = pool();
+        let id = WorkerId::new("shiitake-workers-xyz");
+        let location = Some(WorkerLocation {
+            pod: "shiitake-workers-xyz".into(),
+            namespace: "shiitake".into(),
+            container: "worker".into(),
+        });
+        assert_eq!(
+            pool.worker_location(&id, &location),
+            ("shiitake-workers-xyz", "shiitake", "worker")
+        );
+    }
+
+    // Single-pod (and any worker predating the field): the server's own pod,
+    // container named after the worker id.
+    #[test]
+    fn missing_location_falls_back_to_the_servers_own_pod() {
+        let pool = pool();
+        let id = WorkerId::new("worker-3");
+        assert_eq!(
+            pool.worker_location(&id, &None),
+            ("shiitake-server-abc", "shiitake", "worker-3")
+        );
+    }
 }
