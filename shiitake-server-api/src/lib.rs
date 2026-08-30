@@ -111,3 +111,24 @@ pub struct HealthResponse {
     #[serde(default)]
     pub workers_inflight: usize,
 }
+
+/// `GET /api/v1/ready` response — readiness, as distinct from liveness. The
+/// HTTP status carries the same verdict as `ready` (`200` when ready, `503`
+/// when not), so an orchestrator probe can gate on the status code alone.
+///
+/// A worker is *registered* whether it is idle or serving a command
+/// (`workers_idle + workers_inflight`); readiness is that count against
+/// `workers_required`, so a fully-busy pool stays ready.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadyResponse {
+    pub ready: bool,
+    pub service: String,
+    #[serde(default)]
+    pub workers_idle: usize,
+    #[serde(default)]
+    pub workers_inflight: usize,
+    /// Registered workers the pool must have to report ready
+    /// (`SHIITAKE_MIN_READY_WORKERS`).
+    #[serde(default)]
+    pub workers_required: usize,
+}

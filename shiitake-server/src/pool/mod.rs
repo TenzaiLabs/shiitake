@@ -161,7 +161,7 @@ impl WorkerPool {
         &self.capture_root
     }
 
-    /// Snapshot for the /health endpoint.
+    /// Snapshot for the /health and /ready endpoints: (idle, in-flight).
     pub async fn snapshot(&self) -> (usize, usize) {
         let s = self.state.lock().await;
         (s.idle.len(), s.inflight.len())

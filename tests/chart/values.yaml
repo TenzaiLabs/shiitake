@@ -8,6 +8,10 @@ server:
   image: shiitake-server:e2e
   port: 8080
   dispatchPort: 8090
+  # Registered workers (idle + in-flight) needed before /ready reports ready.
+  # The readiness probe gates the pod on this, so the e2e never talks to a
+  # server whose pool is still empty.
+  minReadyWorkers: 1
   resources:
     requests:
       cpu: 100m

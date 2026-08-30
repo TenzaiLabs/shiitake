@@ -39,6 +39,9 @@ struct Config {
     max_body_bytes: usize,
     #[arg(long, env = "SHIITAKE_CAPTURE_ROOT", default_value = "/capture")]
     capture_root: PathBuf,
+    /// Registered workers the pool needs before `/ready` reports ready.
+    #[arg(long, env = "SHIITAKE_MIN_READY_WORKERS", default_value_t = 1)]
+    min_ready_workers: usize,
     #[arg(long, env = "POD_NAME", default_value = "shiitake")]
     pod_name: String,
     #[arg(long, env = "POD_NAMESPACE", default_value = "")]
@@ -80,6 +83,7 @@ async fn main() -> Result<()> {
         auth_token: Arc::new(cfg.auth_token),
         default_workdir: cfg.default_workdir,
         max_body_bytes: cfg.max_body_bytes,
+        min_ready_workers: cfg.min_ready_workers,
     };
     let api = build_api_router(state);
     let dispatch = build_dispatch_router(pool.clone());

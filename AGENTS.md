@@ -45,9 +45,10 @@ the clients (`clients/shiitake-rs`, `clients/shiitake-py`) to call it. Clients
 add only their transport on top of those shared types.
 
 The public HTTP API is served under `/api/v1` (`build_api_router` nests the
-routes); the worker dispatch endpoint (`/dispatch`) is a separate internal
-router on the loopback dispatch port. Both binaries take their config via clap,
-with `SHIITAKE_*` env fallbacks — no ad-hoc `env::var` reads.
+routes); `/health` and `/ready` are the two unauthenticated probes. The worker
+dispatch endpoint (`/dispatch`) is a separate internal router on the loopback
+dispatch port. Both binaries take their config via clap, with `SHIITAKE_*` env
+fallbacks — no ad-hoc `env::var` reads.
 
 ## Build & test
 
@@ -135,6 +136,14 @@ required check.
   through the whole pool instead of pinning the worker that just returned, so
   per-worker limits and `SHIITAKE_RESTART_AFTER` recycling spread evenly and
   every worker's `reset` gets exercised. Don't switch it back to a stack.
+- **Liveness and readiness are separate endpoints, on purpose.** `/health` is
+  liveness: it succeeds whenever the server is serving, because an empty pool is
+  not a reason to restart the process. `/ready` is readiness: it answers `503`
+  until `min_ready_workers` (`SHIITAKE_MIN_READY_WORKERS`, default 1) workers are
+  registered, so an orchestrator keeps traffic off a pod that would only reject
+  it. Registered means idle *or* in-flight — a busy pool is still able to serve,
+  and gating on idle alone would flap a pod out of rotation under load. Don't
+  make `/health` pool-aware; k8s restarts on a failing liveness probe.
 - **Dispatch is loopback-only.** The worker takes only `SHIITAKE_DISPATCH_PORT`
   and always dials `ws://127.0.0.1:<port>/dispatch`; server and workers must
   share a network namespace.

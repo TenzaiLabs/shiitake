@@ -34,7 +34,8 @@ SHIITAKE_E2E_RELEASE=tight SHIITAKE_E2E_PORT=18081 bash tests/setup.sh -f my-pro
 
 ## Coverage (`test_exec.py`)
 
-- health + pool snapshot; bearer-auth required / rejected; unknown handle → 404
+- health + pool snapshot; `/ready` reports ready with the pool up (both probes
+  unauthenticated); bearer-auth required / rejected; unknown handle → 404
 - `echo`, stderr capture + non-zero exit code, multi-line bash loops
 - `python3` one-liners and a small stdlib program
 - explicit `workdir` and `env` passthrough
@@ -66,9 +67,11 @@ After the assertions, the run prints two summaries:
   `python:3-alpine` as the entrypoint, standing in for a real downstream
   toolchain image. Build context is the repo root.
 - `chart/` — Helm chart for the topology: one server + `worker.count` workers in
-  a pod sharing a capture `emptyDir`, plus a `pods get` Role for the server's
-  container-OOM probe and (when `otel.enabled`) an OpenTelemetry Collector that
-  receives the server's OTLP and re-exposes it on a Prometheus endpoint.
+  a pod sharing a capture `emptyDir`, with readiness probing `/api/v1/ready` (so
+  the rollout only completes once workers have registered) and liveness probing
+  `/api/v1/health`, plus a `pods get` Role for the server's container-OOM probe
+  and (when `otel.enabled`) an OpenTelemetry Collector that receives the
+  server's OTLP and re-exposes it on a Prometheus endpoint.
   Parametrised via `values.yaml` (image, worker count, per-container resources,
   auth token, otel).
 - `build.sh` — build the server + test-worker images (local; CI uses a cached

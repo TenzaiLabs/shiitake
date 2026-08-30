@@ -173,7 +173,35 @@ class HealthAndAuth(unittest.TestCase):
         self.assertIn("workers_idle", payload)
         self.assertIn("workers_inflight", payload)
 
-    def test_02_auth_required(self):
+    def test_02_ready(self):
+        """The deployment has workers, so readiness must succeed. The status
+        code is the part an orchestrator probe sees, so assert it directly —
+        and, like health, it must answer without (and despite a wrong) token."""
+        status, payload = _request("GET", "/ready", token=None)
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(payload["ready"], payload)
+        self.assertEqual(payload["service"], "shiitake")
+        self.assertGreaterEqual(payload["workers_required"], 1)
+        self.assertGreaterEqual(
+            payload["workers_idle"] + payload["workers_inflight"],
+            payload["workers_required"],
+        )
+        # The probe endpoints sit outside the bearer-auth layer: an
+        # orchestrator has no token, and a bogus one must not lock it out.
+        status, _ = _request("GET", "/ready", token="wrong-token")
+        self.assertEqual(status, 200)
+
+    def test_03_ready_and_health_report_the_same_pool(self):
+        """Both probes read one pool snapshot; only their verdict differs."""
+        _, health = _request("GET", "/health", token=None)
+        status, ready = _request("GET", "/ready", token=None)
+        self.assertEqual(status, 200, ready)
+        self.assertEqual(health["service"], ready["service"])
+        for key in ("workers_idle", "workers_inflight"):
+            self.assertIn(key, ready)
+            self.assertIsInstance(ready[key], int)
+
+    def test_04_auth_required(self):
         if not TOKEN:
             self.skipTest("auth disabled")
         status, _ = _request("GET", "/exec/does-not-exist", token=None)
@@ -181,7 +209,7 @@ class HealthAndAuth(unittest.TestCase):
         status, _ = _request("GET", "/exec/does-not-exist", token="wrong-token")
         self.assertEqual(status, 401)
 
-    def test_03_unknown_handle_404(self):
+    def test_05_unknown_handle_404(self):
         status, _ = _request("GET", "/exec/00000000000000000000000000000000")
         self.assertEqual(status, 404)
 
@@ -308,6 +336,36 @@ class Concurrency(unittest.TestCase):
         for h in handles:
             snap = wait(h, deadline=30.0)
             self.assertEqual(snap["exit_code"], 0)
+
+
+class Readiness(unittest.TestCase):
+    def test_50_stays_ready_while_every_worker_is_busy(self):
+        """Readiness counts *registered* workers, idle or in-flight. Occupying
+        the whole pool must therefore keep the pod ready — gating on idle
+        workers would pull it out of rotation exactly under load, which is the
+        failure this endpoint exists to avoid."""
+        idle = wait_for_idle(2)
+        handles = [spawn("sleep 3", env=PATH_ENV, timeout=30.0) for _ in range(idle)]
+        try:
+            # Poll across the busy window: every sample must be ready, and at
+            # least one must catch the pool with no idle worker left.
+            saw_no_idle = False
+            for _ in range(40):
+                status, payload = _request("GET", "/ready", token=None)
+                self.assertEqual(status, 200, msg=payload)
+                self.assertTrue(payload["ready"], msg=payload)
+                if payload["workers_idle"] == 0 and payload["workers_inflight"] > 0:
+                    saw_no_idle = True
+                    break
+                time.sleep(0.1)
+            self.assertTrue(
+                saw_no_idle,
+                f"pool never ran out of idle workers after dispatching {idle} commands; "
+                "readiness was not exercised under load",
+            )
+        finally:
+            for h in handles:
+                wait(h, deadline=30.0)
 
 
 def print_summary():

@@ -28,6 +28,29 @@ async def test_health_reports_pool() -> None:
         assert health.service == "shiitake"
 
 
+async def test_ready_reflects_the_pool() -> None:
+    async with AsyncShiitakeClient(_BASE, auth_token=_TOKEN) as c:
+        ready = await c.ready()
+        # The deployment under test runs workers, so it must report ready.
+        assert ready.ready is True, ready
+        assert ready.service == "shiitake"
+        assert ready.workers_required >= 1
+        assert ready.workers_idle + ready.workers_inflight >= ready.workers_required
+
+
+async def test_ready_holds_while_a_command_occupies_a_worker() -> None:
+    """Registered, not idle, is what readiness counts — a worker running a
+    command still keeps its pod in rotation."""
+    async with AsyncShiitakeClient(_BASE, auth_token=_TOKEN) as c:
+        handle = await c.spawn("sleep 2", env={"PATH": "/bin:/usr/bin"}, wait_for_worker=True)
+        try:
+            ready = await c.ready()
+            assert ready.ready is True, ready
+            assert ready.workers_inflight >= 1, ready
+        finally:
+            await handle.wait()
+
+
 async def test_run_echo_against_real_server() -> None:
     async with AsyncShiitakeClient(_BASE, auth_token=_TOKEN) as c:
         # `echo` is a bash builtin, so it runs without a PATH in the cleared env.
