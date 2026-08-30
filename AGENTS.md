@@ -129,6 +129,12 @@ required check.
   so a recycle reads as `Completed`, never CrashLoopBackOff. The command's own
   exit status rides the Result frame, never the worker process exit code. The
   per-container `restartPolicy` needs k8s ≥ 1.35 (ContainerRestartRules).
+- **Worker selection is least-recently-used.** The pool's idle set is a FIFO
+  queue (`pool/mod.rs`): dispatch pops the front, a worker returning from a
+  command is pushed to the back. A serial stream of commands therefore rotates
+  through the whole pool instead of pinning the worker that just returned, so
+  per-worker limits and `SHIITAKE_RESTART_AFTER` recycling spread evenly and
+  every worker's `reset` gets exercised. Don't switch it back to a stack.
 - **Dispatch is loopback-only.** The worker takes only `SHIITAKE_DISPATCH_PORT`
   and always dials `ws://127.0.0.1:<port>/dispatch`; server and workers must
   share a network namespace.
