@@ -5,6 +5,14 @@
 //! the pool is exhausted) — clients poll the handle for completion via
 //! the HTTP API. The worker's sink is held in the inflight slot so the
 //! server can later send a `Cancel` frame.
+//!
+//! The idle set is a FIFO queue: dispatch takes from the front and a worker
+//! returning from a command goes to the back, so selection is
+//! least-recently-used. A serial stream of commands therefore rotates through
+//! the whole pool instead of pinning one worker — which spreads per-worker
+//! resource limits and `SHIITAKE_RESTART_AFTER` recycling evenly, and exercises
+//! every worker's sandbox reset rather than letting untried workers sit idle
+//! until load finally reaches them.
 
 pub mod k8s_status;
 
@@ -19,7 +27,7 @@ use shiitake_worker_api::{
     ExecId, ExecuteFrame, Frame, ResourceUsage, ResultFrame, WorkerId, capture,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
@@ -55,7 +63,7 @@ struct PendingEntry {
 }
 
 struct PoolState {
-    idle: Vec<WorkerEntry>,
+    idle: VecDeque<WorkerEntry>,
     inflight: HashMap<ExecId, PendingEntry>,
     handles: HashMap<ExecId, HandleRow>,
     liveness: HashMap<WorkerId, WorkerLiveness>,
@@ -137,7 +145,7 @@ impl WorkerPool {
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(PoolState {
-                idle: Vec::new(),
+                idle: VecDeque::new(),
                 inflight: HashMap::new(),
                 handles: HashMap::new(),
                 liveness: HashMap::new(),
@@ -159,18 +167,18 @@ impl WorkerPool {
         (s.idle.len(), s.inflight.len())
     }
 
-    /// Send the Execute frame to an idle worker, register the handle as
-    /// Running, and return immediately. The worker's sink is parked in
-    /// the inflight slot so a later Cancel can reach it. The handle's
-    /// terminal state is filled in when the worker sends a Result frame
-    /// (or its connection drops).
+    /// Send the Execute frame to the least-recently-used idle worker,
+    /// register the handle as Running, and return immediately. The worker's
+    /// sink is parked in the inflight slot so a later Cancel can reach it.
+    /// The handle's terminal state is filled in when the worker sends a
+    /// Result frame (or its connection drops).
     pub async fn dispatch(&self, execute: ExecuteFrame) -> Result<HandleSnapshot, DispatchError> {
         let handle_id = execute.request_id.clone();
         let started_at = SystemTime::now();
 
         let worker = {
             let mut s = self.state.lock().await;
-            match s.idle.pop() {
+            match s.idle.pop_front() {
                 Some(w) => w,
                 None => {
                     metrics().record_pool_rejected();
@@ -357,7 +365,7 @@ impl WorkerPool {
         let shutdown = Arc::new(Notify::new());
         {
             let mut s = self.state.lock().await;
-            s.idle.push(WorkerEntry {
+            s.idle.push_back(WorkerEntry {
                 worker_id: worker_id.clone(),
                 sink: Arc::new(Mutex::new(sink)),
             });
@@ -412,13 +420,13 @@ impl WorkerPool {
         // Re-advertise the worker. A resident worker has, by the time it sends
         // Result, already run the command and reset its sandbox to a clean
         // slate, so it's ready for the next one: recover its sink from the
-        // inflight slot and return it to the idle set. (Done regardless of the
-        // handle's state below, so a worker whose handle was already finalized
-        // by cancel is still reused rather than stranded.)
+        // inflight slot and return it to the back of the idle queue. (Done
+        // regardless of the handle's state below, so a worker whose handle was
+        // already finalized by cancel is still reused rather than stranded.)
         let row = {
             let mut s = self.state.lock().await;
             if let Some(p) = s.inflight.remove(&result.request_id) {
-                s.idle.push(WorkerEntry {
+                s.idle.push_back(WorkerEntry {
                     worker_id: p.worker_id,
                     sink: p.sink,
                 });
