@@ -59,13 +59,14 @@ spec:
             httpGet:
               path: /api/v1/ready
               port: {{ .Values.server.port }}
-            initialDelaySeconds: 1
-            periodSeconds: 2
+            # No initialDelaySeconds: the server binds in milliseconds and
+            # /ready is 503 until the pool fills, so probing immediately and
+            # often is what makes the pod ready the instant it can serve.
+            periodSeconds: 1
           livenessProbe:
             httpGet:
               path: /api/v1/health
               port: {{ .Values.server.port }}
-            initialDelaySeconds: 5
             periodSeconds: 10
           resources:
             {{- toYaml .Values.server.resources | nindent 12 }}
