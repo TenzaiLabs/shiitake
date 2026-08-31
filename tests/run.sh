@@ -104,4 +104,15 @@ if [ -z "$metrics" ]; then
 fi
 printf '%s\n' "$metrics"
 
+# Last: deleting the server pod kills the port-forward above, and kubectl does
+# not re-establish one. test_pod_failures.py manages its own for that reason,
+# but nothing after it could use this one.
+if [ "$TOPOLOGY" = "two-pod" ]; then
+  log "Running test_pod_failures.py"
+  SHIITAKE_E2E_TOKEN="$TOKEN" SHIITAKE_E2E_WORKERS="$workers" \
+    SHIITAKE_E2E_CONTEXT="$CONTEXT" SHIITAKE_E2E_NAMESPACE="$NAMESPACE" \
+    SHIITAKE_E2E_RELEASE="$RELEASE" \
+    python3 "$ROOT/tests/test_pod_failures.py"
+fi
+
 log "PASS"

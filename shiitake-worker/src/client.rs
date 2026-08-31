@@ -52,9 +52,9 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 enum CmdOutcome {
     /// Command finished (normally, timed out, or cancelled); its Result is ready.
     Done(ResultFrame),
-    /// The connection dropped mid-command. The session must end; the server
-    /// reconciles the in-flight handle when it sees the socket close.
-    ConnectionLost,
+    /// The session died mid-command (socket closed, or the lease lapsed). The
+    /// command has been SIGKILLed; the worker must recycle, not reconnect.
+    SessionLost,
 }
 
 /// Why a dispatch session ended.
@@ -67,8 +67,16 @@ enum SessionEnd {
     /// as clean. The process exits to be replaced by a fresh container (itself a
     /// clean slate); a worker is only safe to reuse once it has reset cleanly.
     ResetFailed,
-    /// The connection closed (clean close or mid-command loss); reconnect.
+    /// The connection closed between commands, or the lease lapsed while idle.
+    /// Nothing ran, so the sandbox is still clean: reconnect.
     Closed,
+    /// The session died with a command in flight — the socket closed, or the
+    /// lease lapsed with the server silent. The command was SIGKILLed, so the
+    /// sandbox holds a half-run command's leftovers and no reset has been done.
+    /// The process exits for a fresh container rather than serving the next
+    /// command on a dirty sandbox, which also fences the worker: it cannot come
+    /// back and pick up work while the old command's debris is still around.
+    LostMidCommand,
 }
 
 /// CLI/env configuration for the resident worker. `main` flattens this into the
@@ -121,6 +129,15 @@ pub struct ClientConfig {
     /// can't scrub. Pair with a container `restartPolicy: Always`.
     #[arg(long, env = "SHIITAKE_RESTART_AFTER", default_value_t = 0)]
     pub restart_after: u64,
+    /// Give up on a session after this many seconds with nothing heard from the
+    /// server. The server pings every 10s, so silence this long means the
+    /// connection is dead in a way TCP hasn't reported — a partition, or a
+    /// server pod that vanished without the FIN reaching us. Idle, the worker
+    /// reconnects; mid-command it kills the command and recycles, so a command
+    /// nobody is waiting for can't outlive the server that ordered it. `0`
+    /// disables the lease and waits forever.
+    #[arg(long, env = "SHIITAKE_LEASE_TIMEOUT", default_value_t = 45)]
+    pub lease_timeout_secs: u64,
 }
 
 impl ClientConfig {
@@ -177,6 +194,10 @@ pub async fn run(cfg: &ClientConfig) -> Result<()> {
                 warn!("sandbox reset failed; exiting for a fresh container");
                 return Ok(());
             }
+            Ok(SessionEnd::LostMidCommand) => {
+                warn!("session lost mid-command; exiting for a fresh container");
+                return Ok(());
+            }
             Ok(SessionEnd::Closed) => info!("dispatch session ended; reconnecting"),
             Err(e) => warn!("dispatch session error: {e:#}; reconnecting"),
         }
@@ -197,8 +218,14 @@ async fn serve_session(
         dispatch_token,
         capture_root,
         restart_after,
+        lease_timeout_secs,
         ..
     } = cfg;
+    // `0` disables the lease: wait forever, the pre-lease behaviour.
+    let lease = match lease_timeout_secs {
+        0 => Duration::MAX,
+        secs => Duration::from_secs(*secs),
+    };
     let capture_root: &Path = capture_root;
     info!(%worker_id, dispatch = %dispatch_url, "connecting");
     let mut req = dispatch_url
@@ -232,16 +259,19 @@ async fn serve_session(
 
     loop {
         // Phase 1: wait for the next command (or session end).
-        let Some(execute) = next_execute(&mut sink, &mut stream).await? else {
-            return Ok(SessionEnd::Closed); // dispatcher closed cleanly between commands
+        // Idle: a lapsed lease just means this connection is dead. Nothing has
+        // run, so the sandbox is clean — drop it and reconnect (which re-resolves
+        // the dispatch URL, picking up a replacement server pod).
+        let Some(execute) = next_execute(&mut sink, &mut stream, lease).await? else {
+            return Ok(SessionEnd::Closed);
         };
 
         // Phase 2: run it, watching for a Cancel on the same socket.
         info!(request_id = %execute.request_id, "executing");
-        let outcome = run_command(execute, &mut sink, &mut stream, capture_root).await;
+        let outcome = run_command(execute, &mut sink, &mut stream, capture_root, lease).await;
         let result = match outcome {
             CmdOutcome::Done(r) => r,
-            CmdOutcome::ConnectionLost => return Ok(SessionEnd::Closed),
+            CmdOutcome::SessionLost => return Ok(SessionEnd::LostMidCommand),
         };
 
         *served += 1;
@@ -257,7 +287,37 @@ async fn serve_session(
         let mut reset_failed = false;
         if !exiting {
             let paths = reset_paths.to_vec();
-            match tokio::task::spawn_blocking(move || reset::reset(&paths)).await {
+            let mut reset_task = tokio::task::spawn_blocking(move || reset::reset(&paths));
+            // Keep answering keepalive pings while the reset runs. The worker is
+            // still in-flight to the pool, and the pool pings in-flight workers,
+            // so a reset long enough to outlast the eviction window would
+            // otherwise read as a wedged worker and kill a command that in fact
+            // finished. A reset is never abandoned part-done, though: if the
+            // socket dies we stop reading and wait it out, because a half-reset
+            // sandbox is exactly what must not be reconnected on.
+            let mut lost_during_reset = false;
+            let outcome = loop {
+                if lost_during_reset {
+                    break (&mut reset_task).await;
+                }
+                tokio::select! {
+                    biased;
+                    done = &mut reset_task => break done,
+                    msg = stream.next() => match msg {
+                        Some(Ok(Message::Ping(p))) => {
+                            if let Err(e) = sink.send(Message::Pong(p)).await {
+                                warn!("failed to answer a keepalive ping during reset: {e}");
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
+                            warn!("connection lost during reset; finishing the reset anyway");
+                            lost_during_reset = true;
+                        }
+                        _ => {}
+                    },
+                }
+            };
+            match outcome {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     warn!("sandbox reset failed: {e:#}; recycling worker");
@@ -302,9 +362,20 @@ async fn serve_session(
 
 /// Read frames until an Execute arrives. Answers Pings, ignores stray Cancels
 /// (nothing is in flight between commands). `Ok(None)` on a clean close.
-async fn next_execute(sink: &mut Sink, stream: &mut Stream) -> Result<Option<ExecuteFrame>> {
+async fn next_execute(
+    sink: &mut Sink,
+    stream: &mut Stream,
+    lease: Duration,
+) -> Result<Option<ExecuteFrame>> {
     loop {
-        match stream.next().await {
+        let Ok(msg) = tokio::time::timeout(lease, stream.next()).await else {
+            warn!(
+                lease_s = lease.as_secs(),
+                "nothing heard from the server within the lease; reconnecting"
+            );
+            return Ok(None);
+        };
+        match msg {
             Some(Ok(Message::Text(t))) => match serde_json::from_str::<Frame>(&t)? {
                 Frame::Execute(e) => return Ok(Some(e)),
                 Frame::Cancel { .. } => warn!("Cancel with no command in flight; ignoring"),
@@ -330,20 +401,25 @@ async fn run_command(
     sink: &mut Sink,
     stream: &mut Stream,
     capture_root: &Path,
+    lease: Duration,
 ) -> CmdOutcome {
     let request_id = execute.request_id.clone();
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let mut exec_fut = std::pin::pin!(exec::run(&execute, cancel_rx, capture_root));
-    let mut connection_lost = false;
+    let mut session_lost = false;
+    // The server pings in-flight workers, so a whole lease of silence means
+    // nobody is waiting for this command any more. Reset on every inbound
+    // message, so a merely slow command never trips it.
+    let mut deadline = std::pin::pin!(tokio::time::sleep(lease));
 
     let result = loop {
-        if connection_lost {
+        if session_lost {
             // Cancel already signalled; just let exec wind down so we don't
             // leak the child, then end the session.
             if let Err(e) = (&mut exec_fut).await {
-                warn!("exec failed while winding down after connection loss: {e:#}");
+                warn!("exec failed while winding down after session loss: {e:#}");
             }
-            return CmdOutcome::ConnectionLost;
+            return CmdOutcome::SessionLost;
         }
         tokio::select! {
             biased;
@@ -356,30 +432,47 @@ async fn run_command(
                     }
                 };
             }
-            msg = stream.next() => match msg {
-                Some(Ok(Message::Text(t))) => {
-                    if let Ok(Frame::Cancel { request_id: rid }) = serde_json::from_str::<Frame>(&t)
-                        && rid == request_id
-                    {
-                        info!(%request_id, "cancel received");
+            () = &mut deadline => {
+                warn!(
+                    %request_id,
+                    lease_s = lease.as_secs(),
+                    "lease lapsed with the server silent; cancelling the command"
+                );
+                if cancel_tx.send(true).is_err() {
+                    debug!("command already finished; cancel had no receiver");
+                }
+                session_lost = true;
+            }
+            msg = stream.next() => {
+                // Any inbound frame proves the server is still there, so the
+                // lease starts over.
+                deadline.as_mut().reset(tokio::time::Instant::now() + lease);
+                match msg {
+                    Some(Ok(Message::Text(t))) => {
+                        if let Ok(Frame::Cancel { request_id: rid }) =
+                            serde_json::from_str::<Frame>(&t)
+                            && rid == request_id
+                        {
+                            info!(%request_id, "cancel received");
+                            if cancel_tx.send(true).is_err() {
+                                debug!("command already finished; cancel had no receiver");
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        if let Err(e) = sink.send(Message::Pong(p)).await {
+                            warn!("failed to answer a keepalive ping mid-exec: {e}");
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
+                        warn!("connection lost during exec; cancelling command");
                         if cancel_tx.send(true).is_err() {
                             debug!("command already finished; cancel had no receiver");
                         }
+                        session_lost = true;
                     }
+                    _ => {}
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    if let Err(e) = sink.send(Message::Pong(p)).await {
-                        warn!("failed to answer a keepalive ping mid-exec: {e}");
-                    }
-                }
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
-                    warn!("connection lost during exec; cancelling command");
-                    if cancel_tx.send(true).is_err() {
-                        debug!("command already finished; cancel had no receiver");
-                    }
-                    connection_lost = true;
-                }
-                _ => {}
             }
         }
     };

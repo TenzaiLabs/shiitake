@@ -601,6 +601,7 @@ ENTRYPOINT [<span class="s">"/usr/local/bin/shiitake-worker"</span>]</code></pre
         <tr><td><code>SHIITAKE_CAPTURE_ROOT</code></td><td><code>/capture</code></td><td>Must match the server's capture root (shared volume).</td></tr>
         <tr><td><code>POD_NAME</code> / <code>POD_NAMESPACE</code></td><td>(downward API)</td><td>This worker's own Pod, reported to the server so its container-OOM probe queries the right one. Omit outside Kubernetes.</td></tr>
         <tr><td><code>SHIITAKE_CONTAINER_NAME</code></td><td>(the worker id)</td><td>This worker's container name within its Pod, for the same probe.</td></tr>
+        <tr><td><code>SHIITAKE_LEASE_TIMEOUT</code></td><td><code>45</code></td><td>Seconds of silence from the server before the worker gives up on the session. Idle it reconnects; mid-command it kills the command and exits for a fresh container. <code>0</code> waits forever.</td></tr>
         <tr><td><code>SHIITAKE_RESET_PATHS</code></td><td>(empty)</td><td>Comma-separated scratch directories to empty between commands. Empty means "clear nothing".</td></tr>
         <tr><td><code>SHIITAKE_RESTART_AFTER</code></td><td><code>0</code></td><td>Exit (recycle the container) after this many commands. <code>0</code> = stay resident; <code>N</code> = a full container teardown every <code>N</code> commands.</td></tr>
       </tbody>

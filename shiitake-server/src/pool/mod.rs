@@ -704,15 +704,21 @@ impl WorkerPool {
         loop {
             ticker.tick().await;
             let now = Instant::now();
+            // Idle *and* in-flight. A busy worker sends nothing between its
+            // Execute and its Result, so without pinging it a command that
+            // outlives its server would never be noticed from either end: the
+            // pool would hold the handle open, and the worker's own lease
+            // (SHIITAKE_LEASE_TIMEOUT) would have no traffic to measure.
             let workers: Vec<(WorkerId, SharedSink, Instant, Arc<Notify>)> = {
                 let s = self.state.lock().await;
-                s.idle
-                    .iter()
-                    .filter_map(|w| {
-                        s.liveness.get(&w.worker_id).map(|l| {
+                let idle = s.idle.iter().map(|w| (&w.worker_id, &w.sink));
+                let inflight = s.inflight.values().map(|p| (&p.worker_id, &p.sink));
+                idle.chain(inflight)
+                    .filter_map(|(worker_id, sink)| {
+                        s.liveness.get(worker_id).map(|l| {
                             (
-                                w.worker_id.clone(),
-                                w.sink.clone(),
+                                worker_id.clone(),
+                                sink.clone(),
                                 l.last_seen,
                                 l.shutdown.clone(),
                             )

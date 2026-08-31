@@ -181,12 +181,26 @@ required check.
   worker id, so duplicates break eviction and drop reconciliation. A Deployment
   of worker pods shares one pod template, so take the id from the downward API
   (`metadata.name`) rather than a literal.
+- **Losing the server is handled asymmetrically, and that matters.** Idle, the
+  worker reconnects — nothing ran, so the sandbox is clean. Mid-command it
+  SIGKILLs the command and **exits** (`SessionEnd::LostMidCommand`) for a fresh
+  container: no reset has happened, so reconnecting would serve the next command
+  on a sandbox holding a half-run command's debris. That exit also fences the
+  worker — it can't come back and take work while the leftovers are around.
+  Reached both by the socket closing and by `SHIITAKE_LEASE_TIMEOUT` lapsing (a
+  partition, where TCP reports nothing). The split topology is what made this
+  reachable: co-located, a dead server pod took its workers with it.
 - **Worker liveness has two layers.** Each worker's read loop runs for its whole
   connection (idle and in-flight), so a clean disconnect is detected *immediately*
   (the `select!` on `stream.next()` breaks → `handle_worker_drop`). On top of that,
   `run_keepalive` pings idle workers every 10s and evicts any silent for >30s — a
   hung worker that never sends a FIN won't be caught by the read loop, so the
-  ping/pong (workers pong in their idle-wait loop) is the backstop. Eviction fires
+  ping/pong is the backstop. In-flight workers are pinged too, not just idle
+  ones: a busy worker sends nothing between Execute and Result, so without it a
+  command outliving its server is invisible from both ends — the pool holds the
+  handle open and the worker's lease has no traffic to measure. The worker
+  answers pings from its exec loop *and* across the between-command reset, so a
+  slow reset isn't mistaken for a wedge. Eviction fires
   a per-worker `shutdown` `Notify` that ends the read loop. Sinks are
   `Arc<Mutex<WsSink>>` so the pinger never holds the pool lock across a send.
 - **Everything is a static musl binary.** Both the server and the worker build

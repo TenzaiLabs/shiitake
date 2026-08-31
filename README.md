@@ -139,6 +139,7 @@ kubelet's container status, never self-reported by the worker.
 | `SHIITAKE_CAPTURE_ROOT` | `/capture`                      | Must match the server's capture root (shared volume). |
 | `POD_NAME` / `POD_NAMESPACE` | (downward API)             | This worker's own pod, reported to the server so its container-OOM probe queries the right one. Omit outside Kubernetes. |
 | `SHIITAKE_CONTAINER_NAME` | (the worker id)               | This worker's container name within its pod, for the same probe. |
+| `SHIITAKE_LEASE_TIMEOUT`| `45`                            | Seconds of silence from the server before the worker gives up on the session. Idle it reconnects; mid-command it kills the command and exits for a fresh container. `0` waits forever. |
 
 ## Distribution & deployment
 
