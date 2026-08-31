@@ -10,6 +10,8 @@ dispatcher + worker pool) hands commands to `shiitake-worker` processes that
 serve commands resident, resetting their sandbox between each. It has no
 application-specific code — privilege and
 identity are expressed only as the generic `drop_to` directive on the wire.
+The server and the workers deploy as one pod or as two (see the topology gotcha
+below); the binaries and the wire protocol are the same either way.
 
 ## Layout
 
@@ -33,9 +35,10 @@ shiitake-worker/  shiitake-worker — bin only. client.rs (connect/Hello/serve-l
           cgroup.rs (memory.peak/cpu.stat/limit reads for resource metrics)
 clients/shiitake-rs/  shiitake-rs — lib. Async reqwest client over the HTTP API.
 clients/shiitake-py/  Python client for the HTTP API (httpx, policy-free).
-tests/    k3d-based suite: a Helm chart (chart/) deploying server + N workers,
-          driven by build.sh + setup.sh + run.sh; HTTP-level checks in
-          test_exec.py and the shiitake-py client e2e in test_e2e.py
+tests/    k3d-based suite: a Helm chart (chart/) deploying server + N workers in
+          either topology, driven by build.sh + setup.sh + run.sh; HTTP-level
+          checks in test_exec.py (both topologies), split-topology checks in
+          test_two_pod.py, and the shiitake-py client e2e in test_e2e.py
 ```
 
 The server↔worker wire frames + capture layout live in `shiitake-worker-api`
@@ -46,9 +49,11 @@ add only their transport on top of those shared types.
 
 The public HTTP API is served under `/api/v1` (`build_api_router` nests the
 routes); `/health` and `/ready` are the two unauthenticated probes. The worker
-dispatch endpoint (`/dispatch`) is a separate internal router on the loopback
-dispatch port. Both binaries take their config via clap, with `SHIITAKE_*` env
-fallbacks — no ad-hoc `env::var` reads.
+dispatch endpoint (`/dispatch`) is a separate internal router on its own
+listener, bearer-guarded by `SHIITAKE_DISPATCH_TOKEN` — a different secret from
+the API's `SHIITAKE_AUTH_TOKEN`, since the two guard different trust boundaries.
+Both binaries take their config via clap, with `SHIITAKE_*` env fallbacks — no
+ad-hoc `env::var` reads.
 
 ## Build & test
 
@@ -57,13 +62,15 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace               # unit + in-process integration tests
 bash tests/build.sh && bash tests/setup.sh && bash tests/run.sh  # full cluster e2e (docker, k3d, kubectl, helm, python3, uv)
+SHIITAKE_E2E_TOPOLOGY=two-pod bash tests/setup.sh && SHIITAKE_E2E_TOPOLOGY=two-pod bash tests/run.sh  # same suite, split topology
 ```
 
 Local + CI e2e tooling (k3d, kubectl, python) is managed by `mise` (`mise.toml`)
 — run `mise install`; the test workflow uses `jdx/mise-action`. The Rust
 toolchain is the one exception, pinned in `rust-toolchain.toml`.
 
-CI runs all of the above (`.github/workflows/{ci,test}.yml`). `ci.yml` runs
+CI runs all of the above (`.github/workflows/{ci,test}.yml`); `test.yml`
+matrixes the e2e over both topologies. `ci.yml` runs
 format, clippy, test, and version as four parallel jobs; clippy and test share a
 `Swatinem/rust-cache` keyed on `rust-toolchain.toml` (a toolchain bump starts
 from a clean cache). The toolchain is pinned in `rust-toolchain.toml` (edition
@@ -143,16 +150,57 @@ required check.
   registered, so an orchestrator keeps traffic off a pod that would only reject
   it. Registered means idle *or* in-flight — a busy pool is still able to serve,
   and gating on idle alone would flap a pod out of rotation under load. Don't
-  make `/health` pool-aware; k8s restarts on a failing liveness probe.
-- **Dispatch is loopback-only.** The worker takes only `SHIITAKE_DISPATCH_PORT`
-  and always dials `ws://127.0.0.1:<port>/dispatch`; server and workers must
-  share a network namespace.
+  make `/health` pool-aware; k8s restarts on a failing liveness probe. In the
+  two-pod topology the dispatch Service must set `publishNotReadyAddresses` —
+  workers register *through* it, so gating it on readiness would deadlock the
+  two on each other.
+- **Dispatch is addressed by URL and authenticated.** The worker dials
+  `SHIITAKE_DISPATCH_URL` (default `ws://127.0.0.1:8090/dispatch`, the same-pod
+  case) and presents `SHIITAKE_DISPATCH_TOKEN` as a bearer on the *upgrade
+  request*, which the server's dispatch router validates before the WebSocket
+  exists. The token is mandatory on both sides: the dispatch path may cross
+  pods, so being loopback-bound is no longer what protects it. Don't reintroduce
+  a port-only knob — the URL is what makes the split topology expressible.
+- **Two supported topologies, one wire protocol.** Single-pod (server + worker
+  containers in one pod, loopback dispatch, `emptyDir` capture) and two-pod
+  (server and workers in their own pods, dispatch through a Service, capture on
+  a ReadWriteMany volume). The point of the split is that a NetworkPolicy
+  selects a *pod*: co-located, every egress the server needs — API server for
+  the OOM probe, collector for telemetry — is necessarily also granted to the
+  containers running arbitrary commands. Anything you add to one topology's
+  chart templates belongs in `tests/chart/templates/_helpers.tpl`, which both
+  compose from, so they can't drift.
+- **The worker tells the server where it lives.** `Hello` carries an optional
+  `WorkerLocation { pod, namespace, container }`, built from
+  `POD_NAME`/`POD_NAMESPACE`/`SHIITAKE_CONTAINER_NAME`. The pool keeps it for
+  the connection's lifetime and aims the OOM probe at it; `None` falls back to
+  the server's own pod with the worker id as the container name (the single-pod
+  assumption, and what a pre-split worker implies). The server cannot infer
+  this — with the pods split, the worker container is not one of its own.
+- **Worker ids must be unique across the pool.** The pool keys liveness by
+  worker id, so duplicates break eviction and drop reconciliation. A Deployment
+  of worker pods shares one pod template, so take the id from the downward API
+  (`metadata.name`) rather than a literal.
+- **Losing the server is handled asymmetrically, and that matters.** Idle, the
+  worker reconnects — nothing ran, so the sandbox is clean. Mid-command it
+  SIGKILLs the command and **exits** (`SessionEnd::LostMidCommand`) for a fresh
+  container: no reset has happened, so reconnecting would serve the next command
+  on a sandbox holding a half-run command's debris. That exit also fences the
+  worker — it can't come back and take work while the leftovers are around.
+  Reached both by the socket closing and by `SHIITAKE_LEASE_TIMEOUT` lapsing (a
+  partition, where TCP reports nothing). The split topology is what made this
+  reachable: co-located, a dead server pod took its workers with it.
 - **Worker liveness has two layers.** Each worker's read loop runs for its whole
   connection (idle and in-flight), so a clean disconnect is detected *immediately*
   (the `select!` on `stream.next()` breaks → `handle_worker_drop`). On top of that,
   `run_keepalive` pings idle workers every 10s and evicts any silent for >30s — a
   hung worker that never sends a FIN won't be caught by the read loop, so the
-  ping/pong (workers pong in their idle-wait loop) is the backstop. Eviction fires
+  ping/pong is the backstop. In-flight workers are pinged too, not just idle
+  ones: a busy worker sends nothing between Execute and Result, so without it a
+  command outliving its server is invisible from both ends — the pool holds the
+  handle open and the worker's lease has no traffic to measure. The worker
+  answers pings from its exec loop *and* across the between-command reset, so a
+  slow reset isn't mistaken for a wedge. Eviction fires
   a per-worker `shutdown` `Notify` that ends the read loop. Sinks are
   `Arc<Mutex<WsSink>>` so the pinger never holds the pool lock across a send.
 - **Everything is a static musl binary.** Both the server and the worker build
@@ -175,7 +223,12 @@ required check.
   command's stdout/stderr fds straight into `SHIITAKE_CAPTURE_ROOT/<handle>/{stdout,stderr}`
   (plain files, no buffering in the worker), and the server reads them back with
   HTTP range support and `stat`s them for byte counts. Both must mount the same
-  volume at the same path. Storage is unbounded (capped only by the volume);
+  volume at the same path — an `emptyDir` in one pod, a ReadWriteMany volume
+  across two (the e2e uses a hostPath, which is enough for single-node k3d).
+  Handles live in memory, so a restart orphans everything on the volume:
+  `WorkerPool::reconcile_capture` clears it once at startup. `run_sweeper`
+  purges by walking the registry and can never reach those, and the two-pod
+  volume outlives the server pod rather than dying with it. Storage is unbounded (capped only by the volume);
   output size and capture-volume free space are exported as metrics rather than
   enforced as a cap.
 - **Telemetry lives only in the server.** Workers report per-command resource
@@ -192,6 +245,7 @@ required check.
 - **OOM is detected externally, never in the worker.** A command shares the
   worker container's cgroup, so a container OOM can kill the worker itself; the
   reliable signal is the kubelet's container `OOMKilled` status, read by the
-  server's `k8s_status` probe when the worker connection drops (→ `oom_container`).
+  server's `k8s_status` probe when the worker connection drops (→ `oom_container`)
+  — in whichever pod the worker reported on `Hello`.
   Don't reintroduce in-worker OOM counters. Likewise there are no per-command
   rlimits: the container's k8s `resources.limits` bound it.

@@ -60,9 +60,18 @@ pub fn build_api_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Worker-facing dispatch router — WS upgrade only.
-pub fn build_dispatch_router(pool: Arc<WorkerPool>) -> Router {
+/// Worker-facing dispatch router — WS upgrade only, bearer-authenticated.
+///
+/// The token is checked on the upgrade request, before the WebSocket exists, so
+/// an unauthenticated peer never reaches the frame loop. Separate from the API's
+/// `auth_token`: the dispatch path may cross pods, where being loopback-bound is
+/// no longer what protects it.
+pub fn build_dispatch_router(pool: Arc<WorkerPool>, dispatch_token: &str) -> Router {
+    // Same reasoning as `build_api_router`: a static shared secret is exactly
+    // what tower-http's deprecated-as-"too basic" `bearer` does well.
+    #[allow(deprecated)]
     Router::new()
         .route("/dispatch", get(dispatch::connect))
+        .layer(ValidateRequestHeaderLayer::bearer(dispatch_token))
         .with_state(pool)
 }

@@ -223,9 +223,10 @@ curl -s <span class="p">-H</span> <span class="p">"Authorization: Bearer dev-tok
   <div class="wrap">
     <h2>How it works</h2>
     <p class="section-sub">
-      One server is the only ingress. It hands each command to a worker over an in-pod
-      WebSocket; the worker runs it, streams output to disk, reports the result, then
-      resets its sandbox before the next command.
+      One server is the only ingress. It hands each command to a worker over an
+      authenticated WebSocket — in the same pod or another one; the worker runs it,
+      streams output to disk, reports the result, then resets its sandbox before the
+      next command.
     </p>
     <div class="flow">
       <div class="node"><div class="k">POST /exec</div><div class="d">your request</div></div>

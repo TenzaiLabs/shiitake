@@ -1,5 +1,5 @@
 apiVersion: v2
 name: shiitake-e2e
-description: E2E test deployment — one shiitake-server plus N workers sharing a capture volume in a single pod.
+description: E2E test deployment — one shiitake-server plus N workers, in a single pod or split across two (see the `topology` value).
 type: application
 version: 0.1.0

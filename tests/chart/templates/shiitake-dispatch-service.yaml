@@ -1,0 +1,24 @@
+{{- if eq .Values.topology "two-pod" }}
+{{/*
+How the worker pods find the dispatcher. Cluster-internal only and
+bearer-authenticated server-side. Single-pod needs no Service — loopback is the
+address.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-dispatch
+  labels:
+    app: shiitake
+    release: {{ .Release.Name }}
+spec:
+  # The server isn't ready until workers register, and they register through this
+  # Service — routing to ready endpoints only would deadlock the two.
+  publishNotReadyAddresses: true
+  selector:
+    app: shiitake
+  ports:
+    - name: dispatch
+      port: {{ .Values.server.dispatchPort }}
+      targetPort: dispatch
+{{- end }}

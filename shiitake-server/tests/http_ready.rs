@@ -16,9 +16,19 @@ use tokio::{
     net::{TcpListener, TcpStream},
     time::sleep,
 };
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async,
+    tungstenite::{
+        Message,
+        client::IntoClientRequest,
+        http::header::{AUTHORIZATION, HeaderValue},
+    },
+};
 
 const TOKEN: &str = "test-token";
+/// The dispatch listener's own bearer token — separate from the API's, and
+/// required, since the dispatch path may cross pods.
+const DISPATCH_TOKEN: &str = "test-dispatch-token";
 
 /// A fake worker's end of the dispatch socket. Held by the test so the
 /// worker stays registered; dropping it deregisters the worker.
@@ -58,7 +68,7 @@ async fn serve(min_ready_workers: usize) -> (String, u16, TempDir) {
 
     let dispatch_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dispatch_port = dispatch_listener.local_addr().unwrap().port();
-    let dispatch_router = build_dispatch_router(pool.clone());
+    let dispatch_router = build_dispatch_router(pool.clone(), DISPATCH_TOKEN);
     tokio::spawn(async move {
         axum::serve(dispatch_listener, dispatch_router.into_make_service())
             .await
@@ -88,10 +98,17 @@ async fn serve(min_ready_workers: usize) -> (String, u16, TempDir) {
 }
 
 async fn connect_worker(dispatch_port: u16, id: &str) -> WorkerConn {
-    let url = format!("ws://127.0.0.1:{dispatch_port}/dispatch");
-    let (mut ws, _) = connect_async(url).await.unwrap();
+    let mut req = format!("ws://127.0.0.1:{dispatch_port}/dispatch")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut().insert(
+        AUTHORIZATION,
+        HeaderValue::try_from(format!("Bearer {DISPATCH_TOKEN}")).unwrap(),
+    );
+    let (mut ws, _) = connect_async(req).await.unwrap();
     let hello = serde_json::to_string(&Frame::Hello {
         worker_id: WorkerId::new(id),
+        location: None,
     })
     .unwrap();
     ws.send(Message::Text(hello.into())).await.unwrap();

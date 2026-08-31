@@ -1,8 +1,29 @@
 # Default e2e profile. Override with `-f` or `--set` to deploy different
 # server flavours (e.g. a tighter-memory pool to exercise OOM handling).
+
+# Where the server and the workers run relative to each other.
+#   single-pod — one pod, loopback dispatch, capture on a shared emptyDir.
+#   two-pod    — a pod each, dispatch through a Service, capture on a volume
+#                both mount. Lets pod-scoped controls differ between them.
+topology: single-pod
+
 authToken: e2e-secret-token
+# Bearer token workers present on the dispatch upgrade. Separate from authToken:
+# a worker never needs the API's token.
+dispatchToken: e2e-dispatch-token
 captureRoot: /capture
 defaultWorkdir: /tmp
+
+capture:
+  # Backs the two-pod capture volume, where an emptyDir can't be shared. Fine on
+  # single-node k3d; a multi-node deployment wants a ReadWriteMany PV.
+  hostPath: /var/lib/shiitake-e2e/capture
+
+# Confine the worker pods: no ingress, egress only to DNS and the dispatcher.
+# Two-pod only — a NetworkPolicy selects a pod, so co-located there is no way to
+# treat the server and the workers differently.
+networkPolicy:
+  enabled: true
 
 server:
   image: shiitake-server:e2e
@@ -22,6 +43,7 @@ server:
 
 worker:
   image: shiitake-test-worker:e2e
+  # Worker containers in the single pod, or worker pods in the two-pod topology.
   count: 8
   # Comma-separated scratch paths the worker empties between commands. Exercises
   # the resident-worker reset path end-to-end in k8s. /dev/mqueue holds POSIX

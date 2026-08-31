@@ -1,0 +1,34 @@
+{{- if eq .Values.topology "two-pod" }}
+{{/*
+The worker pods: one worker per pod, `worker.count` replicas. A pod each is what
+makes pod-scoped controls settable for the workers alone. Each takes its id from
+its own pod name — the pool keys workers by id, so a shared literal would collide.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-workers
+  labels:
+    app: shiitake-worker
+    release: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.worker.count }}
+  selector:
+    matchLabels:
+      app: shiitake-worker
+  template:
+    metadata:
+      labels:
+        app: shiitake-worker
+        release: {{ .Release.Name }}
+    spec:
+      # The workers run arbitrary commands; only the server needs API access.
+      automountServiceAccountToken: false
+      containers:
+        {{- include "shiitake.workerContainer" (dict
+              "root" .
+              "name" "worker"
+              "dispatchUrl" (printf "ws://%s-dispatch:%v/dispatch" .Release.Name (.Values.server.dispatchPort | toString))) | nindent 8 }}
+      volumes:
+        {{- include "shiitake.captureVolume" (dict "root" .) | nindent 8 }}
+{{- end }}

@@ -45,7 +45,11 @@ async fn worker_serves_two_commands_and_resets_scratch_between_them() {
 
     let mut child = Command::new(&bin)
         .env("SHIITAKE_WORKER_ID", "test-worker")
-        .env("SHIITAKE_DISPATCH_PORT", addr.port().to_string())
+        .env(
+            "SHIITAKE_DISPATCH_URL",
+            format!("ws://127.0.0.1:{}/dispatch", addr.port()),
+        )
+        .env("SHIITAKE_DISPATCH_TOKEN", "test-dispatch-token")
         .env("SHIITAKE_CAPTURE_ROOT", capture_root.path())
         .env("SHIITAKE_RESET_PATHS", &scratch_path)
         .env("PATH", std::env::var("PATH").unwrap())
