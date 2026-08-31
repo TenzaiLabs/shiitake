@@ -105,9 +105,15 @@ of rotation exactly when it is doing the most work. Operators running a large
 pool can raise `SHIITAKE_MIN_READY_WORKERS` to stay unready below some fraction
 of it rather than only at zero.
 
+`status` is one of `running`, `completed`, `timeout`, `oomkilled`, `error`.
 `exit_cause` on a finished handle is one of `normal`, `signal`, `oom_container`,
 `timeout`, `worker_died`, `cancelled`. OOM is detected externally from the
 kubelet's container status, never self-reported by the worker.
+
+The server↔worker WebSocket contract — the frames, their JSON shapes, and the
+capture-file layout both sides agree on — is documented under
+[the dispatch protocol](https://tenzailabs.github.io/shiitake/docs.html#dispatch-protocol).
+You only need it to write your own worker; the shipped binary speaks it for you.
 
 ## Configuration
 
@@ -137,6 +143,8 @@ kubelet's container status, never self-reported by the worker.
 | `SHIITAKE_DISPATCH_URL` | `ws://127.0.0.1:8090/dispatch`  | Full URL of the server's dispatch endpoint. The default is the same-pod case; point it at a Service (`ws://shiitake-dispatch:8090/dispatch`) to run the workers in their own pods. |
 | `SHIITAKE_DISPATCH_TOKEN` | (empty)                       | Bearer token presented on the dispatch upgrade, **required**. Must match the server's. |
 | `SHIITAKE_CAPTURE_ROOT` | `/capture`                      | Must match the server's capture root (shared volume). |
+| `SHIITAKE_RESET_PATHS`  | (empty)                         | Comma-separated scratch directories emptied between commands (e.g. `/tmp,/var/tmp,/dev/shm`). Empty means "clear nothing" — list only per-command scratch, never anything that must persist. |
+| `SHIITAKE_RESTART_AFTER`| `0`                             | Exit (for a fresh container) after this many commands. `0` = stay resident; `1` = a fresh container per command; `N` = every N. |
 | `POD_NAME` / `POD_NAMESPACE` | (downward API)             | This worker's own pod, reported to the server so its container-OOM probe queries the right one. Omit outside Kubernetes. |
 | `SHIITAKE_CONTAINER_NAME` | (the worker id)               | This worker's container name within its pod, for the same probe. |
 | `SHIITAKE_LEASE_TIMEOUT`| `45`                            | Seconds of silence from the server before the worker gives up on the session. Idle it reconnects; mid-command it kills the command and exits for a fresh container. `0` waits forever. |

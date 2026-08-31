@@ -205,6 +205,7 @@
     <h4>Use</h4>
     <ul>
       <li><a href="#http-api">HTTP API</a></li>
+      <li><a href="#dispatch-protocol">Dispatch protocol</a></li>
       <li><a href="#clients">Clients</a></li>
       <li><a href="#observability">Observability</a></li>
     </ul>
@@ -787,6 +788,105 @@ ENTRYPOINT [<span class="s">"/usr/local/bin/shiitake-worker"</span>]</code></pre
       </tbody>
     </table>
     </div>
+
+    <h2 id="dispatch-protocol">The dispatch protocol</h2>
+    <p>
+      The contract between the server and a worker. You do not need this to
+      <em>run</em> shiitake — drop in the shipped worker binary and it speaks it
+      for you. You need it to write your own worker, or to reason about what
+      crosses the wire when the two are in different Pods.
+    </p>
+
+    <h3>Connecting</h3>
+    <p>
+      The worker dials <code>SHIITAKE_DISPATCH_URL</code> and presents its bearer
+      token on the <strong>HTTP upgrade request</strong>, not as a frame:
+    </p>
+    <pre><code>GET /dispatch HTTP/1.1
+Upgrade: websocket
+Authorization: Bearer &lt;SHIITAKE_DISPATCH_TOKEN&gt;</code></pre>
+    <p>
+      A wrong or missing token fails the handshake with <code>401</code>, so an
+      unauthenticated peer never gets to send a frame. After the upgrade every
+      message is a JSON text frame with a <code>kind</code> discriminator. The
+      worker sends <code>Hello</code> first and the server dispatches only after
+      it arrives.
+    </p>
+
+    <h3>Frames</h3>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>Frame</th><th>Direction</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>hello</code></td><td>worker → server</td><td>First frame. Advertises the worker and where it runs.</td></tr>
+        <tr><td><code>execute</code></td><td>server → worker</td><td>Run this command. One at a time per worker.</td></tr>
+        <tr><td><code>cancel</code></td><td>server → worker</td><td>SIGKILL the in-flight command's process group.</td></tr>
+        <tr><td><code>result</code></td><td>worker → server</td><td>How the command ended, plus cgroup resource usage.</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <pre><code><span class="c">// worker → server, immediately after the upgrade.</span>
+<span class="c">// `location` is optional: omit it and the server assumes the worker is a</span>
+<span class="c">// container of its OWN Pod named after worker_id (the single-Pod case).</span>
+<span class="c">// In the two-Pod topology it is required for OOM detection to work.</span>
+{"kind": "hello",
+ "worker_id": "shiitake-workers-6d4b8f9c7-x2k9p",
+ "location": {"pod": "shiitake-workers-6d4b8f9c7-x2k9p",
+              "namespace": "shiitake",
+              "container": "worker"}}
+
+<span class="c">// server → worker. drop_to is optional; absent means run as the worker's uid.</span>
+{"kind": "execute",
+ "request_id": "0f3c…",
+ "command": "echo hi",
+ "working_dir": "/tmp",
+ "env": {"PATH": "/usr/bin:/bin"},
+ "timeout_secs": 300.0,
+ "drop_to": {"uid": 1000, "gid": 1000, "supplementary_gids": [], "umask": 7}}
+
+<span class="c">// server → worker</span>
+{"kind": "cancel", "request_id": "0f3c…"}
+
+<span class="c">// worker → server. Output is NOT here — it is already on the capture volume.</span>
+<span class="c">// `error` is set only when the worker could not run the command at all.</span>
+{"kind": "result",
+ "request_id": "0f3c…",
+ "exit_code": 0,
+ "exit_signal": null,
+ "timed_out": false,
+ "cancelled": false,
+ "usage": {"memory_peak_bytes": 1048576, "memory_limit_bytes": 536870912,
+           "cpu_user_seconds": 0.01, "cpu_system_seconds": 0.00},
+ "error": null}</code></pre>
+
+    <h3>Capture, not streaming</h3>
+    <p>
+      Command output never crosses this socket. The worker redirects the child's
+      stdout/stderr file descriptors straight into files, and the server reads
+      those back over HTTP. Both sides mount the same volume at the same path
+      (<code>SHIITAKE_CAPTURE_ROOT</code>) and agree on this layout:
+    </p>
+    <pre><code>&lt;capture root&gt;/&lt;request_id&gt;/stdout
+&lt;capture root&gt;/&lt;request_id&gt;/stderr</code></pre>
+    <p>
+      The worker creates both files at exec start, so a known handle with no file
+      means the command produced nothing on that stream — not an error. The
+      server <code>stat</code>s them for the byte counters it reports and serves
+      them with HTTP range support. This is why the split topology needs a
+      <strong>ReadWriteMany</strong> volume: the reader and the writer are in
+      different Pods.
+    </p>
+
+    <h3>Liveness</h3>
+    <p>
+      The server sends WebSocket pings to every registered worker — idle
+      <em>and</em> in-flight — and evicts one that goes silent, reconciling its
+      handles. A worker answers pings while waiting, while running a command, and
+      across its between-command reset. In the other direction the worker gives
+      up on a session after <code>SHIITAKE_LEASE_TIMEOUT</code> of silence; see
+      the <a href="#topologies">failure model</a> for what it does next, which
+      depends on whether a command was running.
+    </p>
 
     <h2 id="clients">Clients</h2>
     <p>Two first-party clients wrap the HTTP API so you don't hand-roll requests.</p>
