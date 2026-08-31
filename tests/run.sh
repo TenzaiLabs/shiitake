@@ -43,13 +43,8 @@ for _ in $(seq 1 90); do
   sleep 2
 done
 if [ "${idle:-0}" -lt "$workers" ]; then
-  kubectl --context "$CONTEXT" -n "$NAMESPACE" describe "deploy/$RELEASE" || true
-  kubectl --context "$CONTEXT" -n "$NAMESPACE" logs "deploy/$RELEASE" -c server || true
-  if [ "$TOPOLOGY" = "two-pod" ]; then
-    kubectl --context "$CONTEXT" -n "$NAMESPACE" describe "deploy/$WORKER_DEPLOY" || true
-    kubectl --context "$CONTEXT" -n "$NAMESPACE" logs "deploy/$WORKER_DEPLOY" --tail=40 || true
-  fi
   echo "only ${idle}/${workers} workers connected to the dispatcher" >&2
+  diagnostics
   exit 1
 fi
 

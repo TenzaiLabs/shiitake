@@ -50,12 +50,16 @@ for d in "$RELEASE" "$WORKER_DEPLOY"; do
 done
 
 log "Deploying release '${RELEASE}' (${TOPOLOGY}) into namespace '${NAMESPACE}'"
-helm --kube-context "$CONTEXT" upgrade --install "$RELEASE" "$ROOT/tests/chart" \
+if ! helm --kube-context "$CONTEXT" upgrade --install "$RELEASE" "$ROOT/tests/chart" \
   --namespace "$NAMESPACE" --create-namespace \
   --set topology="$TOPOLOGY" \
   --set server.image="$SERVER_IMAGE" \
   --set worker.image="$WORKER_IMAGE" \
   --set otel.enabled=true \
-  --wait --timeout 300s --debug "$@"
+  --wait --timeout 300s --debug "$@"; then
+  echo "helm upgrade --install failed or timed out" >&2
+  diagnostics
+  exit 1
+fi
 
 log "Ready — run tests with tests/run.sh"
