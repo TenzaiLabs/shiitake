@@ -107,6 +107,34 @@ pub async fn purge(root: &Path, request_id: &ExecId) -> std::io::Result<()> {
     }
 }
 
+/// Remove every handle directory under `root`, returning `(removed, failures)`.
+///
+/// The server calls this at startup: its registry is in memory, so anything
+/// already on the volume belongs to a dead process and can never be served
+/// again. Only directories are touched, and one failure doesn't stop the sweep,
+/// so a stray `lost+found` can't block boot. Assumes one server per root.
+pub async fn purge_orphans(
+    root: &Path,
+) -> std::io::Result<(usize, Vec<(PathBuf, std::io::Error)>)> {
+    let mut dir = match tokio::fs::read_dir(root).await {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, Vec::new())),
+        Err(e) => return Err(e),
+    };
+    let (mut removed, mut failed) = (0, Vec::new());
+    while let Some(entry) = dir.next_entry().await? {
+        match entry.file_type().await {
+            Ok(t) if t.is_dir() => match tokio::fs::remove_dir_all(entry.path()).await {
+                Ok(()) => removed += 1,
+                Err(e) => failed.push((entry.path(), e)),
+            },
+            Ok(_) => {}
+            Err(e) => failed.push((entry.path(), e)),
+        }
+    }
+    Ok((removed, failed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +158,54 @@ mod tests {
             stream_path(root, &id, Stream::Stderr),
             Path::new("/capture/abc-123/stderr")
         );
+    }
+
+    fn handle_with_output(root: &Path, id: &str) {
+        let dir = handle_dir(root, &ExecId::new(id));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stdout"), b"out").unwrap();
+        std::fs::write(dir.join("stderr"), b"err").unwrap();
+    }
+
+    #[tokio::test]
+    async fn purge_orphans_clears_handle_dirs_and_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        for id in ["a", "b", "c"] {
+            handle_with_output(root.path(), id);
+        }
+
+        let (removed, failed) = purge_orphans(root.path()).await.unwrap();
+        assert_eq!(removed, 3);
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+
+        // Nothing left to do on a second pass — the server may restart twice.
+        let (removed, _) = purge_orphans(root.path()).await.unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    // Only handle directories are ours to remove. A file sitting in the capture
+    // root (a mount marker, an operator's note) is left alone.
+    #[tokio::test]
+    async fn purge_orphans_leaves_stray_files() {
+        let root = tempfile::tempdir().unwrap();
+        handle_with_output(root.path(), "a");
+        std::fs::write(root.path().join("README"), b"not a handle").unwrap();
+
+        let (removed, failed) = purge_orphans(root.path()).await.unwrap();
+        assert_eq!(removed, 1);
+        assert!(failed.is_empty(), "{failed:?}");
+        assert!(root.path().join("README").exists());
+    }
+
+    // A capture root that doesn't exist yet is not an error: the server creates
+    // it moments later, and a missing root has nothing to reconcile.
+    #[tokio::test]
+    async fn purge_orphans_tolerates_a_missing_root() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("not-created-yet");
+        let (removed, failed) = purge_orphans(&missing).await.unwrap();
+        assert_eq!(removed, 0);
+        assert!(failed.is_empty());
     }
 }

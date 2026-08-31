@@ -91,6 +91,8 @@ async fn main() -> Result<()> {
         cfg.pod_namespace,
         cfg.capture_root,
     ));
+    // Anything on the volume predates this process, so no handle can name it.
+    pool.reconcile_capture().await;
 
     let state = AppState {
         pool: pool.clone(),

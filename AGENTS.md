@@ -210,7 +210,11 @@ required check.
   (plain files, no buffering in the worker), and the server reads them back with
   HTTP range support and `stat`s them for byte counts. Both must mount the same
   volume at the same path — an `emptyDir` in one pod, a ReadWriteMany volume
-  across two (the e2e uses a hostPath, which is enough for single-node k3d). Storage is unbounded (capped only by the volume);
+  across two (the e2e uses a hostPath, which is enough for single-node k3d).
+  Handles live in memory, so a restart orphans everything on the volume:
+  `WorkerPool::reconcile_capture` clears it once at startup. `run_sweeper`
+  purges by walking the registry and can never reach those, and the two-pod
+  volume outlives the server pod rather than dying with it. Storage is unbounded (capped only by the volume);
   output size and capture-volume free space are exported as metrics rather than
   enforced as a cap.
 - **Telemetry lives only in the server.** Workers report per-command resource

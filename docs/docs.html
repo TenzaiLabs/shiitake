@@ -379,7 +379,7 @@ curl -s <span class="p">-H</span> <span class="s">"Authorization: Bearer dev-tok
     </p>
     <ul>
       <li><strong>The pod network namespace</strong> — so workers reach the dispatcher on <code>127.0.0.1</code>, the default <code>SHIITAKE_DISPATCH_URL</code>. Within a Pod this is automatic.</li>
-      <li><strong>A capture volume</strong> — mounted into the server and every worker at the same path (<code>SHIITAKE_CAPTURE_ROOT</code>). Use an <code>emptyDir</code>, or a persistent volume if you want output to survive the Pod.</li>
+      <li><strong>A capture volume</strong> — mounted into the server and every worker at the same path (<code>SHIITAKE_CAPTURE_ROOT</code>). Use an <code>emptyDir</code>, or a persistent volume if the capture files need to outlive the Pod for reasons of your own — the server itself purges the volume at startup, since handles live in memory and nothing on it can be served after a restart.</li>
     </ul>
     <p>
       Server and workers can also run as <a href="#topologies">separate Pods</a>,

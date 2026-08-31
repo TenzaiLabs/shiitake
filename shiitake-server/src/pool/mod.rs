@@ -164,6 +164,30 @@ impl WorkerPool {
         &self.capture_root
     }
 
+    /// Drop capture files left by a previous server process.
+    ///
+    /// Handles live only in memory, so a restart orphans every capture
+    /// directory on the volume: no handle can name them, `run_sweeper` walks
+    /// the registry and so never reaches them, and they accumulate for the life
+    /// of the volume. Call once at startup, before serving. Failures are logged
+    /// and skipped — a capture root we can't fully clean is no reason to refuse
+    /// to boot.
+    pub async fn reconcile_capture(&self) {
+        match capture::purge_orphans(&self.capture_root).await {
+            Ok((0, failed)) if failed.is_empty() => {}
+            Ok((removed, failed)) => {
+                info!(removed, "purged orphaned capture directories at startup");
+                for (path, e) in failed {
+                    warn!(path = %path.display(), "could not purge capture entry: {e}");
+                }
+            }
+            Err(e) => warn!(
+                root = %self.capture_root.display(),
+                "could not read the capture root to reconcile it: {e}"
+            ),
+        }
+    }
+
     /// Snapshot for the /health and /ready endpoints: (idle, in-flight).
     pub async fn snapshot(&self) -> (usize, usize) {
         let s = self.state.lock().await;
