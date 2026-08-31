@@ -494,26 +494,97 @@ rules:
       <li><strong>Capture must span both Pods.</strong> The worker writes the capture files and the server reads them back, so <code>SHIITAKE_CAPTURE_ROOT</code> has to name the same storage in both. An <code>emptyDir</code> cannot do this.</li>
       <li><strong>Worker ids must stay unique.</strong> A Deployment of worker Pods shares one Pod template, so take the id from the downward API (<code>metadata.name</code>) rather than a literal.</li>
       <li><strong>Workers report their own Pod.</strong> Wire <code>POD_NAME</code>, <code>POD_NAMESPACE</code> and <code>SHIITAKE_CONTAINER_NAME</code> into the worker; it puts them on its <code>Hello</code> so the server's OOM probe queries the worker's Pod rather than its own.</li>
+      <li><strong>The dispatch Service must publish not-ready addresses.</strong> The server is not ready until <code>SHIITAKE_MIN_READY_WORKERS</code> workers have registered, and they register <em>through</em> this Service. A Service that routed only to ready endpoints would deadlock the two on each other — the server waiting for workers, the workers unable to reach it. Set <code>publishNotReadyAddresses: true</code>.</li>
     </ul>
-    <pre><code><span class="c"># worker Pods: their own id, the dispatch Service, and no API-server reach</span>
+    <div class="note"><p>Get that last one wrong and nothing errors: the workers retry, the server stays <code>0/1 Ready</code>, and the rollout simply never completes.</p></div>
+    <h3>The manifests</h3>
+    <p>
+      Four objects, plus the <a href="#kubernetes">pod-reader RBAC</a> the server
+      already needs. A working chart for both topologies lives in
+      <a href="https://github.com/TenzaiLabs/shiitake/tree/main/tests/chart"><code>tests/chart</code></a>.
+    </p>
+    <pre><code><span class="c"># 1. the server — dispatch bound wide, and its own Pod</span>
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: shiitake, labels: { app: shiitake } }
 spec:
-  automountServiceAccountToken: false
-  containers:
-    - name: worker
-      image: your-registry/your-worker:latest
-      env:
-        - name: SHIITAKE_WORKER_ID          <span class="c"># unique per replica</span>
-          valueFrom: { fieldRef: { fieldPath: metadata.name } }
-        - { name: SHIITAKE_DISPATCH_URL,   value: "ws://shiitake-dispatch:8090/dispatch" }
-        - name: SHIITAKE_DISPATCH_TOKEN
-          valueFrom: { secretKeyRef: { name: shiitake, key: dispatch-token } }
-        - { name: SHIITAKE_CONTAINER_NAME, value: worker }
-        - name: POD_NAME
-          valueFrom: { fieldRef: { fieldPath: metadata.name } }
-        - name: POD_NAMESPACE
-          valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+  replicas: 1
+  selector: { matchLabels: { app: shiitake } }
+  template:
+    metadata: { labels: { app: shiitake } }
+    spec:
+      serviceAccountName: shiitake          <span class="c"># bound to the pod-reader Role</span>
+      containers:
+        - name: server
+          image: ghcr.io/tenzailabs/shiitake-server
+          ports:
+            - { name: api,      containerPort: 8080 }
+            - { name: dispatch, containerPort: 8090 }
+          env:
+            - { name: SHIITAKE_DISPATCH_HOST, value: "0.0.0.0" }   <span class="c"># not loopback any more</span>
+            - name: SHIITAKE_AUTH_TOKEN
+              valueFrom: { secretKeyRef: { name: shiitake, key: token } }
+            - name: SHIITAKE_DISPATCH_TOKEN
+              valueFrom: { secretKeyRef: { name: shiitake, key: dispatch-token } }
+            - { name: SHIITAKE_CAPTURE_ROOT, value: /capture }
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+          readinessProbe:
+            httpGet: { path: /api/v1/ready, port: 8080 }
+          livenessProbe:
+            httpGet: { path: /api/v1/health, port: 8080 }
+          volumeMounts:
+            - { name: capture, mountPath: /capture }
+      volumes:
+        - name: capture
+          persistentVolumeClaim: { claimName: shiitake-capture }   <span class="c"># ReadWriteMany</span>
 ---
-<span class="c"># and the policy that is now expressible: workers reach DNS and the dispatcher, nothing else</span>
+<span class="c"># 2. how the workers find it. publishNotReadyAddresses is required:</span>
+<span class="c">#    the server is not ready until workers register, and they register here.</span>
+apiVersion: v1
+kind: Service
+metadata: { name: shiitake-dispatch }
+spec:
+  publishNotReadyAddresses: true
+  selector: { app: shiitake }
+  ports:
+    - { name: dispatch, port: 8090, targetPort: dispatch }</code></pre>
+    <pre><code><span class="c"># 3. worker Pods: their own id, the dispatch Service, and no API-server reach</span>
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: shiitake-workers, labels: { app: shiitake-worker } }
+spec:
+  replicas: 8                               <span class="c"># pool size — one worker per Pod</span>
+  selector: { matchLabels: { app: shiitake-worker } }
+  template:
+    metadata: { labels: { app: shiitake-worker } }
+    spec:
+      automountServiceAccountToken: false    <span class="c"># workers never talk to the API server</span>
+      containers:
+        - name: worker
+          image: your-registry/your-worker:latest
+          env:
+            - name: SHIITAKE_WORKER_ID          <span class="c"># unique per replica</span>
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - { name: SHIITAKE_DISPATCH_URL,   value: "ws://shiitake-dispatch:8090/dispatch" }
+            - name: SHIITAKE_DISPATCH_TOKEN
+              valueFrom: { secretKeyRef: { name: shiitake, key: dispatch-token } }
+            - { name: SHIITAKE_CONTAINER_NAME, value: worker }
+            - { name: SHIITAKE_CAPTURE_ROOT,   value: /capture }
+            - { name: SHIITAKE_RESET_PATHS,    value: "/tmp,/var/tmp,/dev/shm" }
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+          volumeMounts:
+            - { name: capture, mountPath: /capture }   <span class="c"># same path as the server</span>
+      volumes:
+        - name: capture
+          persistentVolumeClaim: { claimName: shiitake-capture }
+---
+<span class="c"># 4. the policy that is now expressible: DNS and the dispatcher, nothing else</span>
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata: { name: shiitake-worker }
@@ -536,6 +607,47 @@ spec:
       ports:
         - { protocol: TCP, port: 8090 }</code></pre>
     <div class="note"><p>The dispatch Service is cluster-internal by design. Keep it that way — no <code>NodePort</code>, no <code>LoadBalancer</code>. The bearer token guards the endpoint, but the dispatcher is not a public API.</p></div>
+
+    <h3>Failure model</h3>
+    <p>
+      Once the server and the workers are separate Pods, either can die without
+      the other. What each side does about it:
+    </p>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>What happens</th><th>What follows</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>A <strong>worker</strong> dies mid-command</td>
+          <td>The socket drops; the server reconciles the handle to <code>worker_died</code> — or <code>oom_container</code> if the kubelet reports the container was OOM-killed. The Deployment replaces the Pod.</td>
+        </tr>
+        <tr>
+          <td>The <strong>server</strong> dies while workers are idle</td>
+          <td>Workers reconnect on a 1s retry, re-resolving <code>SHIITAKE_DISPATCH_URL</code> so they find the replacement Pod. Nothing ran, so their sandboxes are still clean and no container is recycled.</td>
+        </tr>
+        <tr>
+          <td>The <strong>server</strong> dies with commands running</td>
+          <td>Each affected worker SIGKILLs its command and <strong>exits 0 for a fresh container</strong>. It cannot reconnect: no reset ran, so its sandbox holds the killed command's leftovers. Exiting restores the clean slate and fences the worker out of the pool until it does.</td>
+        </tr>
+        <tr>
+          <td>A <strong>partition</strong> — neither side sees a close</td>
+          <td>The server pings every worker, idle and in-flight, and evicts one silent past its window. The worker independently gives up after <code>SHIITAKE_LEASE_TIMEOUT</code> (45s) of silence, reaching the same two outcomes above. Without this a command would outlive the server that ordered it.</td>
+        </tr>
+        <tr>
+          <td>The server <strong>restarts</strong></td>
+          <td>Handles do not survive: the registry is in memory, so <code>GET /api/v1/exec/{handle}</code> for anything issued before the restart returns <code>404</code>. The replacement never re-issues old work.</td>
+        </tr>
+      </tbody>
+    </table>
+    </div>
+    <div class="note"><p><strong>Capture is purged at startup.</strong> Because handles die with the process, every capture directory on the volume is unreachable after a restart — nothing can name it, and the sweeper only walks the registry. The server therefore clears <code>SHIITAKE_CAPTURE_ROOT</code> once at boot, before serving. Copy anything you need to keep out of the volume; do not treat it as an archive.</p></div>
+    <p>
+      Two consequences worth designing around. A command killed by a server
+      restart is <strong>not</strong> retried for you — the caller sees a handle
+      that 404s and decides what to do. And if that caller retries, it runs the
+      command a second time; shiitake guarantees a request is dispatched once,
+      not that your command is idempotent.
+    </p>
 
     <h2 id="custom-image">Building a custom worker image</h2>
     <p>

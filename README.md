@@ -178,7 +178,11 @@ The server in its own Pod, the workers in theirs. Three things change:
 - **Dispatch is addressed by URL.** Bind the server's dispatch listener with
   `SHIITAKE_DISPATCH_HOST=0.0.0.0`, put a cluster-internal Service in front of
   it, and point the workers at it with
-  `SHIITAKE_DISPATCH_URL=ws://<service>:8090/dispatch`.
+  `SHIITAKE_DISPATCH_URL=ws://<service>:8090/dispatch`. That Service **must** set
+  `publishNotReadyAddresses: true` — the server isn't ready until workers
+  register and they register through it, so routing only to ready endpoints
+  deadlocks the two. Nothing errors if you miss this; the rollout just never
+  completes.
 - **Dispatch is authenticated.** `SHIITAKE_DISPATCH_TOKEN` is required on both
   sides and checked on the upgrade request — being loopback-bound is no longer
   what protects that path. It is a separate secret from `SHIITAKE_AUTH_TOKEN`; a
@@ -191,6 +195,33 @@ Give each worker a unique `SHIITAKE_WORKER_ID` (the pod name, via the downward
 API, is the natural choice for a Deployment of worker pods), and wire
 `POD_NAME` / `POD_NAMESPACE` / `SHIITAKE_CONTAINER_NAME` into the worker so the
 server's OOM probe queries the worker's own pod rather than its own.
+
+Complete manifests for all four objects — server, dispatch Service, worker
+Deployment, NetworkPolicy — are in the
+[docs](https://tenzailabs.github.io/shiitake/docs.html#topologies); `tests/chart`
+deploys both topologies.
+
+### Failure model
+
+Either pod can now die without the other:
+
+- **A worker dies mid-command** — the handle is reconciled to `worker_died`
+  (or `oom_container` when the kubelet reports an OOM kill).
+- **The server dies, workers idle** — they reconnect on a 1s retry, re-resolving
+  the dispatch URL to find the replacement. Nothing ran, so nothing recycles.
+- **The server dies mid-command** — each affected worker SIGKILLs its command and
+  exits 0 for a fresh container. It must not reconnect: no reset ran, so its
+  sandbox holds the killed command's leftovers.
+- **A partition** — nobody sees a close, so the server pings every worker (idle
+  and in-flight) and evicts the silent, while the worker gives up after
+  `SHIITAKE_LEASE_TIMEOUT`. Without it a command would outlive its server.
+- **The server restarts** — handles are in memory, so pre-restart handles `404`.
+  Capture files are unreachable once their handles are gone, so the server
+  **clears the capture volume at startup**; copy out anything you need to keep.
+
+A command killed by a server restart is not retried for you, and a caller that
+retries runs it twice — shiitake dispatches a request once, it does not make
+your command idempotent.
 
 **Why bother.** A NetworkPolicy selects a Pod, not a container. While the server
 and the workers share one, every egress the server legitimately needs — the API
