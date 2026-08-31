@@ -23,16 +23,20 @@ use tower_http::validate_request::ValidateRequestHeaderLayer;
 pub struct AppState {
     pub pool: Arc<WorkerPool>,
     /// Bearer token guarding the `/exec` routes (the binary refuses to start
-    /// if it is empty). `/health` stays unauthenticated.
+    /// if it is empty). `/health` and `/ready` stay unauthenticated.
     pub auth_token: Arc<String>,
     /// Used when the request body omits `workdir`.
     pub default_workdir: PathBuf,
     /// Maximum accepted request body size, in bytes.
     pub max_body_bytes: usize,
+    /// Registered workers (idle + in-flight) the pool needs before `/ready`
+    /// reports ready. `1` is the useful minimum; raise it to keep a large
+    /// deployment out of rotation until some fraction of its pool is back.
+    pub min_ready_workers: usize,
 }
 
 /// Default public-facing router. All routes are nested under `/api/v1`:
-/// `/api/v1/health`, `/api/v1/exec`, `/api/v1/exec/{handle}*`.
+/// `/api/v1/health`, `/api/v1/ready`, `/api/v1/exec`, `/api/v1/exec/{handle}*`.
 pub fn build_api_router(state: AppState) -> Router {
     // tower-http's `bearer` is marked deprecated ("too basic"), but a static
     // shared secret is exactly our case, so we use it rather than hand-rolling.
@@ -47,6 +51,7 @@ pub fn build_api_router(state: AppState) -> Router {
         ));
     let v1 = Router::new()
         .route("/health", get(health::health))
+        .route("/ready", get(health::ready))
         .merge(exec);
     let max_body_bytes = state.max_body_bytes;
     Router::new()

@@ -2,7 +2,8 @@
 //! (de)serializes the `shiitake-server-api` types.
 
 use shiitake_server_api::{
-    DropTo, ExecRequest, HandleSnapshotJson, HealthResponse, SpawnResponse, StatusResponse,
+    DropTo, ExecRequest, HandleSnapshotJson, HealthResponse, ReadyResponse, SpawnResponse,
+    StatusResponse,
 };
 use std::collections::BTreeMap;
 
@@ -114,6 +115,18 @@ impl Client {
 
     pub async fn health(&self) -> Result<HealthResponse, ClientError> {
         let resp = self.http.get(self.url("/health")).send().await?;
+        Ok(error_for_status(resp).await?.json().await?)
+    }
+
+    /// Readiness: whether the pool has enough registered workers to serve.
+    /// The server answers `503` when it is not ready, which is a valid answer
+    /// rather than a transport failure — the verdict is returned on
+    /// [`ReadyResponse::ready`] either way.
+    pub async fn ready(&self) -> Result<ReadyResponse, ClientError> {
+        let resp = self.http.get(self.url("/ready")).send().await?;
+        if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            return Ok(resp.json().await?);
+        }
         Ok(error_for_status(resp).await?.json().await?)
     }
 

@@ -52,6 +52,7 @@ async fn reads_full_and_range_and_suffix() {
         auth_token: Arc::new(TOKEN.into()),
         default_workdir: std::env::temp_dir(),
         max_body_bytes: 256 * 1024 * 1024,
+        min_ready_workers: 1,
     };
     let api_router = build_api_router(state);
     tokio::spawn(async move {

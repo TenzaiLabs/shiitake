@@ -13,6 +13,10 @@ from shiitake.client import AsyncShiitakeClient, DropTo
 
 async def main():
     async with AsyncShiitakeClient("http://localhost:8080", auth_token="…") as c:
+        # Readiness: True once the server's pool has enough registered workers
+        # to serve. A 503 is a verdict, not an error — it lands on `.ready`.
+        assert (await c.ready()).ready
+
         # Spawn-and-wait: RunResult with stdout/stderr slurped inline.
         result = await c.run("echo hi")
         print(result.stdout, result.exit_cause)

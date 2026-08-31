@@ -119,6 +119,40 @@ async def test_health() -> None:
     await client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_ready_when_the_pool_has_workers() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/api/v1/ready"
+        return httpx.Response(
+            200,
+            json={"ready": True, "service": "shiitake", "workers_idle": 3, "workers_inflight": 1, "workers_required": 1},
+        )
+
+    client = await _with_mock(handler)
+    r = await client.ready()
+    assert r.ready is True
+    assert r.workers_idle == 3
+    assert r.workers_required == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_ready_returns_the_verdict_on_503() -> None:
+    """An unready server answers 503 — a verdict, not a failed call."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            503,
+            json={"ready": False, "service": "shiitake", "workers_idle": 0, "workers_inflight": 0, "workers_required": 1},
+        )
+
+    client = await _with_mock(handler, max_retries=1)
+    r = await client.ready()
+    assert r.ready is False
+    assert r.workers_idle == 0
+    await client.aclose()
+
+
 def _running_status() -> dict[str, object]:
     return {"handle": "h", "worker_id": "w0", "status": "running", "started_at": 1.0}
 

@@ -105,6 +105,19 @@ class HealthResponse:
 
 
 @dataclass
+class ReadyResponse:
+    """Readiness verdict. ``ready`` mirrors the HTTP status (200 / 503):
+    the pool has at least ``workers_required`` registered workers, counting
+    both idle and in-flight ones."""
+
+    ready: bool
+    service: str
+    workers_idle: int = 0
+    workers_inflight: int = 0
+    workers_required: int = 0
+
+
+@dataclass
 class ReadChunk:
     content: str
     next_offset: int
@@ -251,6 +264,21 @@ class AsyncShiitakeClient(_Base):
             service=d["service"],
             workers_idle=d.get("workers_idle", 0),
             workers_inflight=d.get("workers_inflight", 0),
+        )
+
+    async def ready(self) -> ReadyResponse:
+        """Readiness, as opposed to ``health``'s liveness. A ``503`` means
+        "not ready", not a failed call — the verdict is on ``.ready``."""
+        resp = await self._request("GET", self._url("/ready"))
+        if resp.status_code != httpx.codes.SERVICE_UNAVAILABLE:
+            _raise_for_status(resp)
+        d = resp.json()
+        return ReadyResponse(
+            ready=d["ready"],
+            service=d["service"],
+            workers_idle=d.get("workers_idle", 0),
+            workers_inflight=d.get("workers_inflight", 0),
+            workers_required=d.get("workers_required", 0),
         )
 
     async def spawn(

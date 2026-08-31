@@ -7,5 +7,5 @@ mod client;
 pub use client::{Client, ClientError, ReadChunk, Stream};
 pub use shiitake_server_api::{
     DropTo, ExecRequest, ExitCause, HandleSnapshotJson, HandleStatus, HealthResponse,
-    SpawnResponse, StatusResponse,
+    ReadyResponse, SpawnResponse, StatusResponse,
 };

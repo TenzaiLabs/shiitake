@@ -48,6 +48,7 @@ The HTTP API is versioned under `/api/v1`. The worker dispatch endpoint
 | Method | Path                           | Purpose                                                                     |
 | ------ | ------------------------------ | --------------------------------------------------------------------------- |
 | GET    | `/api/v1/health`               | Liveness + pool snapshot (`workers_idle`, `workers_inflight`). No auth.      |
+| GET    | `/api/v1/ready`                | Readiness: `200` once `SHIITAKE_MIN_READY_WORKERS` workers are registered, `503` otherwise. No auth. |
 | POST   | `/api/v1/exec`                 | Spawn a command. Returns `{handle, started_at}` (202). 429 if the pool is full. |
 | GET    | `/api/v1/exec/{handle}`        | Status: state, exit code/signal/cause, per-stream byte counters.             |
 | GET    | `/api/v1/exec/{handle}/stdout` | Read stdout. Serves the capture file with HTTP `Range` support (`206`/`416`); tail with `Range: bytes=-N`. |
@@ -72,6 +73,29 @@ shell syntax for pipes, redirects, and multi-statement scripts. The command runs
 with **only** the `env` you pass (the worker clears its own environment first),
 so include `PATH` for any command that calls an external binary.
 
+### Liveness vs readiness
+
+`/health` answers "is the process up" and always succeeds while the server is
+serving — an empty pool is not a reason to restart it, so it is the
+**liveness** probe. `/ready` answers "can this pod serve a command": its status
+code is `200` only once at least `SHIITAKE_MIN_READY_WORKERS` workers are
+registered, and `503` otherwise, so an orchestrator keeps traffic off a pod
+whose workers haven't connected (or have all died) instead of letting commands
+be accepted and then fail. Point the **readiness** probe at it:
+
+```yaml
+readinessProbe:
+  httpGet: { path: /api/v1/ready, port: 8080 }
+livenessProbe:
+  httpGet: { path: /api/v1/health, port: 8080 }
+```
+
+A worker counts as registered whether it is idle or running a command, so a
+fully-busy pool stays ready — gating on idle workers alone would pull a pod out
+of rotation exactly when it is doing the most work. Operators running a large
+pool can raise `SHIITAKE_MIN_READY_WORKERS` to stay unready below some fraction
+of it rather than only at zero.
+
 `exit_cause` on a finished handle is one of `normal`, `signal`, `oom_container`,
 `timeout`, `worker_died`, `cancelled`. OOM is detected externally from the
 kubelet's container status, never self-reported by the worker.
@@ -90,6 +114,7 @@ kubelet's container status, never self-reported by the worker.
 | `SHIITAKE_AUTH_TOKEN`     | (empty)                          | Bearer token guarding `/exec`, **required** — the server refuses to start if unset. |
 | `SHIITAKE_MAX_BODY_BYTES` | `268435456`                      | Maximum accepted request body size (256 MiB).      |
 | `SHIITAKE_CAPTURE_ROOT`   | `/capture`                       | Root for the stdout/stderr capture files.          |
+| `SHIITAKE_MIN_READY_WORKERS` | `1`                           | Registered workers (idle + in-flight) the pool needs before `/ready` reports ready. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | (unset)                      | OTLP endpoint. When set, the server exports traces + metrics; otherwise logs to stdout only. |
 | `OTEL_EXPORTER_OTLP_PROTOCOL`  | `http/protobuf`             | OTLP transport: `grpc`, `http/protobuf`, or `http/json` (all plaintext). |
 | `POD_NAME` / `POD_NAMESPACE` | (downward API)                | Used by the Kubernetes container-OOM probe.        |
@@ -135,11 +160,16 @@ SHIITAKE_AUTH_TOKEN=dev-token SHIITAKE_CAPTURE_ROOT=/tmp/capture cargo run --bin
 # Terminal 2 — one worker
 SHIITAKE_WORKER_ID=worker-0 SHIITAKE_CAPTURE_ROOT=/tmp/capture cargo run --bin shiitake-worker
 
-# Terminal 3 — drive it
+# Terminal 3 — wait until a worker has registered, then drive it
+until curl -sf localhost:8080/api/v1/ready >/dev/null; do sleep 1; done
 curl -sX POST localhost:8080/api/v1/exec \
   -H "Authorization: Bearer dev-token" \
   -d '{"command": "echo hi"}'
 ```
+
+`curl -f` fails on the `503` that `/ready` returns while the pool is empty, so
+that one-liner is the same gate a readiness probe applies. Drop the `-f` to see
+the body: `{"ready":false,"service":"shiitake","workers_idle":0,"workers_inflight":0,"workers_required":1}`.
 
 (The worker exits after one command; re-run it for the next.)
 

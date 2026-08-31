@@ -333,7 +333,9 @@ SHIITAKE_AUTH_TOKEN=dev-token SHIITAKE_CAPTURE_ROOT=/tmp/capture \
 SHIITAKE_WORKER_ID=worker-0 SHIITAKE_CAPTURE_ROOT=/tmp/capture \
   cargo run --bin shiitake-worker
 
-<span class="c"># Terminal 3 — dispatch a command, get a handle back</span>
+<span class="c"># Terminal 3 — wait for the pool, then dispatch a command</span>
+<span class="c"># (-f fails on the 503 /ready returns while no worker has registered)</span>
+until curl -sf localhost:8080/api/v1/ready &gt;/dev/null; do sleep 1; done
 curl -s <span class="p">-H</span> <span class="s">"Authorization: Bearer dev-token"</span> \
   <span class="p">-X</span> POST localhost:8080/api/v1/exec \
   <span class="p">-d</span> <span class="s">'{"command": "echo hello from a sandboxed worker"}'</span></code></pre>
@@ -384,7 +386,9 @@ spec:
           valueFrom: { fieldRef: { fieldPath: metadata.name } }
         - name: POD_NAMESPACE
           valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
-      readinessProbe:
+      readinessProbe:                             <span class="c"># gated on the pool: 503 until a worker registers</span>
+        httpGet: { path: /api/v1/ready, port: 8080 }
+      livenessProbe:                              <span class="c"># process-level only; an empty pool is not a restart</span>
         httpGet: { path: /api/v1/health, port: 8080 }
       volumeMounts:
         - { name: capture, mountPath: /capture }
@@ -469,6 +473,7 @@ ENTRYPOINT [<span class="s">"/usr/local/bin/shiitake-worker"</span>]</code></pre
         <tr><td><code>SHIITAKE_DEFAULT_WORKDIR</code></td><td><code>/</code></td><td>Working directory when a request omits <code>workdir</code>.</td></tr>
         <tr><td><code>SHIITAKE_MAX_BODY_BYTES</code></td><td><code>268435456</code></td><td>Maximum accepted request body size (256 MiB).</td></tr>
         <tr><td><code>SHIITAKE_CAPTURE_ROOT</code></td><td><code>/capture</code></td><td>Root for the stdout/stderr capture files.</td></tr>
+        <tr><td><code>SHIITAKE_MIN_READY_WORKERS</code></td><td><code>1</code></td><td>Registered workers (idle + in-flight) the pool needs before <code>/ready</code> reports ready.</td></tr>
         <tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td>(unset)</td><td>OTLP endpoint. When set, the server exports traces + metrics; otherwise it logs to stdout only.</td></tr>
         <tr><td><code>OTEL_EXPORTER_OTLP_PROTOCOL</code></td><td><code>http/protobuf</code></td><td>OTLP transport: <code>grpc</code>, <code>http/protobuf</code>, or <code>http/json</code> (all plaintext).</td></tr>
         <tr><td><code>POD_NAME</code> / <code>POD_NAMESPACE</code></td><td>(downward API)</td><td>Used by the Kubernetes container-OOM probe.</td></tr>
@@ -494,7 +499,7 @@ ENTRYPOINT [<span class="s">"/usr/local/bin/shiitake-worker"</span>]</code></pre
     <p>
       The public API is versioned under <code>/api/v1</code>. Every <code>/exec</code>
       route requires <code>Authorization: Bearer &lt;token&gt;</code>; only
-      <code>/health</code> is unauthenticated. The worker dispatch endpoint
+      <code>/health</code> and <code>/ready</code> are unauthenticated. The worker dispatch endpoint
       (<code>/dispatch</code>) is a separate internal router on the loopback port
       and is never publicly reachable.
     </p>
@@ -527,7 +532,18 @@ ENTRYPOINT [<span class="s">"/usr/local/bin/shiitake-worker"</span>]</code></pre
     <p>Terminate the command (SIGTERM → SIGKILL the process group). Idempotent on already-terminal handles.</p>
 
     <div class="ep"><span class="verb get">GET</span><span class="path">/api/v1/health</span></div>
-    <p>Liveness plus a pool snapshot (<code>workers_idle</code>, <code>workers_inflight</code>). Unauthenticated — suitable for a readiness probe.</p>
+    <p><strong>Liveness.</strong> Always <code>200</code> while the server is serving, plus a pool snapshot (<code>workers_idle</code>, <code>workers_inflight</code>). Unauthenticated. An empty pool is not a reason to restart the process, so this endpoint deliberately ignores the pool — use <code>/ready</code> to gate traffic.</p>
+
+    <div class="ep"><span class="verb get">GET</span><span class="path">/api/v1/ready</span></div>
+    <p><strong>Readiness.</strong> <code>200</code> once at least <code>SHIITAKE_MIN_READY_WORKERS</code> workers are registered, <code>503</code> otherwise — so an orchestrator probe can gate on the status code alone and keep traffic off a pod whose workers have not connected (or have all died). Unauthenticated. The body carries the same verdict:</p>
+    <pre><code>{
+  <span class="p">"ready"</span>: true,
+  <span class="p">"service"</span>: <span class="s">"shiitake"</span>,
+  <span class="p">"workers_idle"</span>: 7,
+  <span class="p">"workers_inflight"</span>: 1,
+  <span class="p">"workers_required"</span>: 1
+}</code></pre>
+    <p>A worker counts as registered whether it is idle or running a command, so a fully-busy pool stays ready — gating on idle workers alone would pull a pod out of rotation exactly when it is doing the most work. Raise <code>SHIITAKE_MIN_READY_WORKERS</code> to report unready below some fraction of a large pool rather than only at zero.</p>
 
     <h3>Exit causes</h3>
     <p>A finished handle reports one <code>exit_cause</code>:</p>
