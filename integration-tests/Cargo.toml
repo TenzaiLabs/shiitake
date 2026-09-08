@@ -1,0 +1,27 @@
+[package]
+name = "shiitake-integration-tests"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+# This crate exists only to hold cross-component integration scenarios: the real
+# server (its pool + HTTP handlers) driving the real worker binary, with a client
+# standing in for the caller. Keeping it separate is why neither the server nor
+# the worker package has to depend on the other. The library is the shared
+# harness; the scenarios live in `tests/` and consume it. Never published.
+[lib]
+path = "src/lib.rs"
+
+# The harness lives in the library, so its dependencies are normal `[dependencies]`.
+[dependencies]
+shiitake-server = { path = "../shiitake-server" }
+# Builds + locates the `shiitake-worker` binary for a test in a different crate
+# (a same-package `CARGO_BIN_EXE_` isn't available here).
+escargot = "0.5"
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "time", "sync"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+serde_json = "1.0"
+tempfile = "3"
+nix = { version = "0.31", features = ["user"] }

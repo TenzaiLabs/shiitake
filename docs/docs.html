@@ -208,6 +208,7 @@
       <li><a href="#dispatch-protocol">Dispatch protocol</a></li>
       <li><a href="#clients">Clients</a></li>
       <li><a href="#observability">Observability</a></li>
+      <li><a href="#interactive-pty">Interactive PTY</a></li>
     </ul>
     <h4>Operate</h4>
     <ul>
@@ -717,6 +718,8 @@ ENTRYPOINT [<span class="s">"/usr/local/bin/shiitake-worker"</span>]</code></pre
         <tr><td><code>SHIITAKE_LEASE_TIMEOUT</code></td><td><code>45</code></td><td>Seconds of silence from the server before the worker gives up on the session. Idle it reconnects; mid-command it kills the command and exits for a fresh container. <code>0</code> waits forever.</td></tr>
         <tr><td><code>SHIITAKE_RESET_PATHS</code></td><td>(empty)</td><td>Comma-separated scratch directories to empty between commands. Empty means "clear nothing".</td></tr>
         <tr><td><code>SHIITAKE_RESTART_AFTER</code></td><td><code>0</code></td><td>Exit (recycle the container) after this many commands. <code>0</code> = stay resident; <code>N</code> = a full container teardown every <code>N</code> commands.</td></tr>
+        <tr><td><code>SHIITAKE_PTY_SHELL</code></td><td><code>bash -i</code></td><td>Default shell for an <a href="#interactive-pty">interactive PTY</a> when the open frame carries no command (whitespace-split argv). Point it at a <code>tmux</code> invocation to make the default terminal a tmux session.</td></tr>
+        <tr><td><code>SHIITAKE_HOME_ROOT</code></td><td><code>/home</code></td><td>Root under which a named PTY session's home is created (<code>&lt;root&gt;/&lt;name&gt;</code>). See <a href="#interactive-pty">naming the session's user</a>.</td></tr>
       </tbody>
     </table>
     </div>
@@ -822,6 +825,10 @@ Authorization: Bearer &lt;SHIITAKE_DISPATCH_TOKEN&gt;</code></pre>
         <tr><td><code>execute</code></td><td>server → worker</td><td>Run this command. One at a time per worker.</td></tr>
         <tr><td><code>cancel</code></td><td>server → worker</td><td>SIGKILL the in-flight command's process group.</td></tr>
         <tr><td><code>result</code></td><td>worker → server</td><td>How the command ended, plus cgroup resource usage.</td></tr>
+        <tr><td><code>pty_open</code></td><td>server → worker</td><td>Open an <a href="#interactive-pty">interactive PTY</a> and spawn the shell on it. Binary frames on the socket are then stdin (in) / pty output (out).</td></tr>
+        <tr><td><code>pty_resize</code></td><td>server → worker</td><td>Window resize for the session's tty.</td></tr>
+        <tr><td><code>pty_close</code></td><td>server → worker</td><td>End the session — SIGHUP the process group and close the pty.</td></tr>
+        <tr><td><code>pty_exit</code></td><td>worker → server</td><td>The shell exited (or the pty could not be opened). Reported after the between-session reset.</td></tr>
       </tbody>
     </table>
     </div>
@@ -916,6 +923,92 @@ let status = client.status(&handle.handle).await?;</code></pre>
       <li><strong>Metrics</strong> — <code>shiitake_</code>-prefixed gauges/counters for exit cause, duration, memory and CPU (from the worker's cgroup readings), per-stream output sizes, capture-volume free space, and pool occupancy.</li>
     </ul>
     <p>Without an endpoint set, the server logs to stdout only. The OTLP exporter is plaintext-only by design (no TLS feature, to keep the static musl link free of <code>aws-lc-rs</code>); terminate TLS at a sidecar collector if you need it.</p>
+
+    <h2 id="interactive-pty">Interactive PTY</h2>
+    <p>
+      Alongside the fire-and-forget <code>/exec</code>, a worker can host an
+      <strong>interactive terminal</strong> — a persistent shell on a real TTY
+      (job control, <code>vim</code>, resize, tab-completion) with a live,
+      bidirectional byte stream. A PTY session <strong>pins one worker</strong>
+      for its whole lifetime rather than returning it to the pool per command, so
+      it costs the pool one worker until it ends.
+    </p>
+
+    <h3>Opening a session</h3>
+    <p>
+      <code>GET /api/v1/pty</code> is a WebSocket upgrade, bearer-gated exactly
+      like <code>/exec</code> (<code>SHIITAKE_AUTH_TOKEN</code>). The
+      <strong>first</strong> message is a JSON <code>open</code> control frame;
+      after it, <strong>binary</strong> frames are the byte stream — client →
+      server is stdin, server → client is pty output — and JSON frames stay
+      control. The server closes the socket when the shell exits.
+    </p>
+    <pre><code><span class="c">// client → server, the FIRST message. `command` empty uses the worker's</span>
+<span class="c">// default shell (SHIITAKE_PTY_SHELL). `drop_to` is optional, as on /exec.</span>
+{"op": "open",
+ "command": ["bash", "-i"],
+ "working_dir": "/tmp",
+ "env": {"PATH": "/usr/bin:/bin"},
+ "cols": 120, "rows": 40,
+ "drop_to": {"uid": 1000, "gid": 1000, "supplementary_gids": []}}
+
+<span class="c">// client → server, at any time — reflow the tty</span>
+{"op": "resize", "cols": 80, "rows": 24}</code></pre>
+    <p>
+      The worker injects <code>TERM=xterm-256color</code> and runs the shell in
+      <code>working_dir</code> under the caller-supplied <code>drop_to</code> —
+      the same isolation as a command, just persistent. Scrollback is the
+      client's; nothing is captured to disk. The server↔worker
+      <a href="#dispatch-protocol">dispatch protocol</a> carries matching
+      <code>pty_open</code> / <code>pty_resize</code> / <code>pty_close</code> /
+      <code>pty_exit</code> frames for anyone writing their own worker.
+    </p>
+
+    <h3>The default shell</h3>
+    <p>
+      When the <code>open</code> frame carries no <code>command</code>, the worker
+      spawns <code>SHIITAKE_PTY_SHELL</code> (whitespace-split argv), defaulting to
+      <code>bash -i</code>. Pointing it at a transparent <code>tmux</code> makes
+      every terminal a tmux session without any protocol change:
+    </p>
+    <pre><code><span class="c"># on the worker</span>
+SHIITAKE_PTY_SHELL=<span class="s">"tmux new-session -A -D -s main"</span></code></pre>
+
+    <h3>Naming the session's user</h3>
+    <p>
+      <code>drop_to</code> is numeric, but a human terminal reads better as a
+      login name than a bare uid. So <code>drop_to</code> accepts an optional
+      <code>name</code> (plus <code>create_home</code>): while still privileged,
+      before the drop, the worker best-effort ensures a matching
+      <code>/etc/passwd</code> entry (and a home seeded from <code>/etc/skel</code>)
+      so <code>whoami</code>, <code>id -un</code>, and the shell prompt resolve the
+      uid to that name. The home lives at
+      <code>&lt;SHIITAKE_HOME_ROOT&gt;/&lt;name&gt;</code> (default root
+      <code>/home</code>), and the worker sets the shell's <code>HOME</code> to it
+      so the directory, the passwd home, and <code>HOME</code> agree.
+    </p>
+    <ul>
+      <li><strong>Idempotent</strong> — skipped when the uid or name already resolves.</li>
+      <li><strong>Never a root command</strong> — the worker only names the uid it is already about to become; it runs no caller command as root, and never names uid 0.</li>
+      <li><strong>Cleaned on reset</strong> — the between-session reset removes every passwd entry and home the worker created, so a pooled worker never accumulates names, and one session never sees another's.</li>
+    </ul>
+    <p>
+      Shiitake stays identity-agnostic: it reflects whatever <code>drop_to</code>
+      asks for. Deciding the uid and the name — e.g. mapping an authenticated
+      principal to a stable uid and a display name — is the caller's policy.
+    </p>
+
+    <h3>Pinning &amp; capacity</h3>
+    <p>
+      A session takes one <em>idle</em> worker and holds it until the shell exits
+      or the client disconnects; on the way out the worker resets before rejoining
+      the pool, so the next caller never inherits a dirty sandbox. If no worker is
+      idle the upgrade closes with a try-again code. <code>/health</code> reports
+      <code>workers_pinned</code> alongside <code>workers_idle</code> /
+      <code>workers_inflight</code>, so you can see the capacity terminals are
+      holding.
+    </p>
+    <div class="note"><p><strong>Persistence:</strong> a dropped client currently ends the session. Reconnect-after-drop (a tmux daemon that outlives the client, plus a worker held across detaches) is a later addition; the <code>SHIITAKE_PTY_SHELL</code> tmux knob above is the first half of it.</p></div>
 
     <h2 id="security">Security considerations</h2>
     <p>Shiitake runs untrusted commands by design. Its isolation properties — and where they stop — are worth understanding before you expose it.</p>
