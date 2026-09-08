@@ -70,8 +70,15 @@ struct PoolState {
     /// Workers currently held by an interactive PTY session. While a worker is
     /// here, its read loop forwards output/PtyExit to the session instead of
     /// routing Result frames.
-    pty_sessions: HashMap<WorkerId, mpsc::UnboundedSender<PtyEvent>>,
+    pty_sessions: HashMap<WorkerId, mpsc::Sender<PtyEvent>>,
 }
+
+/// Bounded backlog of pty output events per session. A slow client fills this,
+/// which blocks the worker's read loop, which stops draining the dispatch WS,
+/// which back-pressures the worker into pausing its pty reads — end-to-end flow
+/// control, instead of buffering a runaway program's output without bound. Each
+/// event holds up to one worker read (32 KiB), so this caps in-flight bytes.
+const PTY_OUTPUT_BACKLOG: usize = 64;
 
 /// Last time a worker sent any frame, plus a signal the keepalive pinger
 /// fires to tear down an unresponsive worker's read loop.
@@ -153,7 +160,7 @@ pub enum PtyEvent {
 pub struct PinnedSession {
     pub worker_id: WorkerId,
     sink: SharedSink,
-    output: mpsc::UnboundedReceiver<PtyEvent>,
+    output: mpsc::Receiver<PtyEvent>,
 }
 
 impl PinnedSession {
@@ -246,7 +253,7 @@ impl WorkerPool {
     pub async fn acquire_pinned(&self) -> Option<PinnedSession> {
         let mut s = self.state.lock().await;
         let worker = s.idle.pop_front()?;
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(PTY_OUTPUT_BACKLOG);
         s.pty_sessions.insert(worker.worker_id.clone(), tx);
         Some(PinnedSession {
             worker_id: worker.worker_id,
@@ -498,7 +505,10 @@ impl WorkerPool {
                     match msg {
                         Ok(Message::Binary(b)) => {
                             if let Some(tx) = &pty_tx {
-                                let _ = tx.send(PtyEvent::Output(b.to_vec()));
+                                // Awaits when the session's backlog is full — this
+                                // is the back-pressure that stops draining the WS
+                                // and pauses the worker's pty reads.
+                                let _ = tx.send(PtyEvent::Output(b.to_vec())).await;
                             }
                         }
                         Ok(Message::Text(t)) => match serde_json::from_str::<Frame>(&t) {
@@ -509,11 +519,13 @@ impl WorkerPool {
                                 ..
                             }) => {
                                 if let Some(tx) = &pty_tx {
-                                    let _ = tx.send(PtyEvent::Exit {
-                                        exit_code,
-                                        exit_signal,
-                                        error,
-                                    });
+                                    let _ = tx
+                                        .send(PtyEvent::Exit {
+                                            exit_code,
+                                            exit_signal,
+                                            error,
+                                        })
+                                        .await;
                                 }
                             }
                             Ok(Frame::Result(r)) => self.complete_request(r).await,
@@ -674,9 +686,11 @@ impl WorkerPool {
             // A worker that drops mid-PTY-session leaves its client still
             // attached. Notify the session so the handler closes that client
             // cleanly (with a reason) instead of blocking forever on output that
-            // will never arrive.
+            // will never arrive. `try_send` (we hold the lock): if the backlog is
+            // full the event is dropped, but removing the sender still unblocks
+            // the handler — it drains the backlog, then sees the channel closed.
             if let Some(tx) = s.pty_sessions.remove(worker_id) {
-                let _ = tx.send(PtyEvent::Exit {
+                let _ = tx.try_send(PtyEvent::Exit {
                     exit_code: None,
                     exit_signal: None,
                     error: Some("worker disconnected".to_string()),
