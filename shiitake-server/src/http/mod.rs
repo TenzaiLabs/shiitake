@@ -3,6 +3,7 @@
 pub mod dispatch;
 pub mod exec;
 pub mod health;
+pub mod pty;
 
 use crate::pool::WorkerPool;
 use axum::{
@@ -33,6 +34,9 @@ pub struct AppState {
     /// reports ready. `1` is the useful minimum; raise it to keep a large
     /// deployment out of rotation until some fraction of its pool is back.
     pub min_ready_workers: usize,
+    /// How often the `/pty` handler pings a pinned worker to keep its session
+    /// lease fresh while a client is attached (below the worker's lease).
+    pub pty_keepalive: std::time::Duration,
 }
 
 /// Default public-facing router. All routes are nested under `/api/v1`:
@@ -46,6 +50,8 @@ pub fn build_api_router(state: AppState) -> Router {
         .route("/exec/{handle}", get(exec::status).delete(exec::kill))
         .route("/exec/{handle}/stdout", get(exec::read_stdout))
         .route("/exec/{handle}/stderr", get(exec::read_stderr))
+        // Interactive terminal: a WS upgrade, bearer-gated like the rest of exec.
+        .route("/pty", get(pty::pty))
         .layer(ValidateRequestHeaderLayer::bearer(
             state.auth_token.as_str(),
         ));

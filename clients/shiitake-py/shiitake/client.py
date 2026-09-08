@@ -11,8 +11,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import json
 import random
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -102,6 +103,7 @@ class HealthResponse:
     service: str
     workers_idle: int = 0
     workers_inflight: int = 0
+    workers_pinned: int = 0
 
 
 @dataclass
@@ -208,6 +210,44 @@ class AsyncHandle:
         return r.content, r.bytes_written > len(r.content.encode("utf-8", errors="replace"))
 
 
+class AsyncPtySession:
+    """A live interactive terminal over one ``/api/v1/pty`` WebSocket.
+
+    Binary frames are the raw byte stream — server→client is pty **output**,
+    client→server is **stdin**; JSON text frames are control (only ``resize``
+    from the client). Use as an async context manager; ``output()`` yields until
+    the shell exits or the socket closes."""
+
+    def __init__(self, ws: Any) -> None:
+        self._ws = ws
+
+    async def output(self) -> AsyncIterator[bytes]:
+        """Yield pty output chunks until the session ends. Text frames (a close
+        reason, say) are not terminal bytes and are skipped."""
+        with contextlib.suppress(Exception):
+            async for message in self._ws:
+                if isinstance(message, (bytes, bytearray)):
+                    yield bytes(message)
+
+    async def send(self, data: bytes) -> None:
+        """Write keystrokes to the pty (stdin)."""
+        await self._ws.send(data)
+
+    async def resize(self, cols: int, rows: int) -> None:
+        """Reflow the tty so full-screen programs repaint."""
+        await self._ws.send(json.dumps({"op": "resize", "cols": cols, "rows": rows}))
+
+    async def aclose(self) -> None:
+        with contextlib.suppress(Exception):
+            await self._ws.close()
+
+    async def __aenter__(self) -> AsyncPtySession:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.aclose()
+
+
 class AsyncShiitakeClient(_Base):
     """Async client. Reuses a single ``httpx.AsyncClient`` for connection pooling."""
 
@@ -264,6 +304,7 @@ class AsyncShiitakeClient(_Base):
             service=d["service"],
             workers_idle=d.get("workers_idle", 0),
             workers_inflight=d.get("workers_inflight", 0),
+            workers_pinned=d.get("workers_pinned", 0),
         )
 
     async def ready(self) -> ReadyResponse:
@@ -314,6 +355,45 @@ class AsyncShiitakeClient(_Base):
     async def kill(self, handle: str) -> None:
         resp = await self._request("DELETE", self._url(f"/exec/{handle}"))
         _raise_for_status(resp)
+
+    async def attach_pty(
+        self,
+        *,
+        working_dir: str,
+        command: list[str] | None = None,
+        env: dict[str, str] | None = None,
+        cols: int = 80,
+        rows: int = 24,
+        drop_to: DropTo | Mapping[str, Any] | None = None,
+    ) -> AsyncPtySession:
+        """Open an interactive PTY. Pins one worker for the session's life;
+        raises if none is idle. ``command`` empty means the worker's default
+        shell. Requires the ``pty`` extra (``shiitake-py[pty]``)."""
+        try:
+            from websockets.asyncio.client import connect as ws_connect
+        except ImportError as exc:  # pragma: no cover - import-guard
+            raise RuntimeError("attach_pty needs the 'pty' extra: pip install shiitake-py[pty]") from exc
+
+        # `/pty` is the same origin + prefix as `/exec`, over ws(s) not http(s).
+        ws_url = self._url("/pty").replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+        open_frame: dict[str, Any] = {
+            "op": "open",
+            "command": command or [],
+            "working_dir": working_dir,
+            "env": env or {},
+            "cols": cols,
+            "rows": rows,
+        }
+        if drop_to is not None:
+            open_frame["drop_to"] = drop_to.to_json() if isinstance(drop_to, DropTo) else dict(drop_to)
+        ws = await ws_connect(ws_url, additional_headers=self._headers())
+        try:
+            await ws.send(json.dumps(open_frame))
+        except Exception:
+            with contextlib.suppress(Exception):
+                await ws.close()
+            raise
+        return AsyncPtySession(ws)
 
     async def read(
         self,

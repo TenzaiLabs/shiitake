@@ -33,7 +33,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use thiserror::Error;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{Span, info, warn};
 
 pub type WorkerSink = SplitSink<WebSocket, Message>;
@@ -41,7 +41,7 @@ pub type WorkerStream = SplitStream<WebSocket>;
 
 /// A worker's write half, shared so the keepalive pinger and dispatch/cancel
 /// can send without holding the pool lock across a (possibly slow) send.
-type SharedSink = Arc<Mutex<WorkerSink>>;
+pub type SharedSink = Arc<Mutex<WorkerSink>>;
 
 // `HandleStatus` and `ExitCause` are part of the public HTTP API; their
 // canonical definitions live in `shiitake-server-api`. The pool's internal
@@ -67,6 +67,10 @@ struct PoolState {
     inflight: HashMap<ExecId, PendingEntry>,
     handles: HashMap<ExecId, HandleRow>,
     liveness: HashMap<WorkerId, WorkerLiveness>,
+    /// Workers currently held by an interactive PTY session. While a worker is
+    /// here, its read loop forwards output/PtyExit to the session instead of
+    /// routing Result frames.
+    pty_sessions: HashMap<WorkerId, mpsc::UnboundedSender<PtyEvent>>,
 }
 
 /// Last time a worker sent any frame, plus a signal the keepalive pinger
@@ -130,6 +134,42 @@ pub struct HandleSnapshot {
     pub cancelled: bool,
 }
 
+/// A worker-side output event during a pinned PTY session, forwarded by the
+/// per-worker read loop to the `/pty` handler that owns the session.
+pub enum PtyEvent {
+    /// Raw pty bytes (merged stdout/stderr) to relay to the client.
+    Output(Vec<u8>),
+    /// The shell exited (or the pty could not open, `error` set). Terminal.
+    Exit {
+        exit_code: Option<i32>,
+        exit_signal: Option<i32>,
+        error: Option<String>,
+    },
+}
+
+/// A worker held out of the pool for one interactive PTY session. The `/pty`
+/// handler sends control/stdin through `send` and receives worker output on
+/// `recv`; `release_pinned` returns the worker to the pool.
+pub struct PinnedSession {
+    pub worker_id: WorkerId,
+    sink: SharedSink,
+    output: mpsc::UnboundedReceiver<PtyEvent>,
+}
+
+impl PinnedSession {
+    /// A clonable handle to the worker's sink, for sending frames/stdin without
+    /// borrowing the session — so a splice loop can send and `recv` at once.
+    pub fn writer(&self) -> SharedSink {
+        self.sink.clone()
+    }
+
+    /// Await the next output event from the worker; `None` once its read loop
+    /// stops forwarding (the worker disconnected).
+    pub async fn recv(&mut self) -> Option<PtyEvent> {
+        self.output.recv().await
+    }
+}
+
 #[derive(Clone)]
 pub struct WorkerPool {
     state: Arc<Mutex<PoolState>>,
@@ -152,6 +192,7 @@ impl WorkerPool {
                 inflight: HashMap::new(),
                 handles: HashMap::new(),
                 liveness: HashMap::new(),
+                pty_sessions: HashMap::new(),
             })),
             probe,
             pod_name,
@@ -192,6 +233,40 @@ impl WorkerPool {
     pub async fn snapshot(&self) -> (usize, usize) {
         let s = self.state.lock().await;
         (s.idle.len(), s.inflight.len())
+    }
+
+    /// Workers currently held by an interactive PTY session.
+    pub async fn pinned_count(&self) -> usize {
+        self.state.lock().await.pty_sessions.len()
+    }
+
+    /// Pop an idle worker and pin it to a new PTY session. `None` when no worker
+    /// is idle (the caller should surface a busy signal). Until `release_pinned`,
+    /// the worker's read loop forwards its output/PtyExit to the returned session.
+    pub async fn acquire_pinned(&self) -> Option<PinnedSession> {
+        let mut s = self.state.lock().await;
+        let worker = s.idle.pop_front()?;
+        let (tx, rx) = mpsc::unbounded_channel();
+        s.pty_sessions.insert(worker.worker_id.clone(), tx);
+        Some(PinnedSession {
+            worker_id: worker.worker_id,
+            sink: worker.sink,
+            output: rx,
+        })
+    }
+
+    /// End a PTY session: stop forwarding output and return the worker to the
+    /// idle pool if it is still connected. The worker resets its own sandbox
+    /// after the session, exactly as it does after a command.
+    pub async fn release_pinned(&self, session: PinnedSession) {
+        let mut s = self.state.lock().await;
+        s.pty_sessions.remove(&session.worker_id);
+        if s.liveness.contains_key(&session.worker_id) {
+            s.idle.push_back(WorkerEntry {
+                worker_id: session.worker_id,
+                sink: session.sink,
+            });
+        }
     }
 
     /// Send the Execute frame to the least-recently-used idle worker,
@@ -417,8 +492,30 @@ impl WorkerPool {
                 msg = stream.next() => {
                     let Some(msg) = msg else { break };
                     self.touch_worker(&worker_id).await;
+                    // A worker in a PTY session forwards its output/PtyExit to
+                    // that session instead of the Result/handle path.
+                    let pty_tx = { self.state.lock().await.pty_sessions.get(&worker_id).cloned() };
                     match msg {
+                        Ok(Message::Binary(b)) => {
+                            if let Some(tx) = &pty_tx {
+                                let _ = tx.send(PtyEvent::Output(b.to_vec()));
+                            }
+                        }
                         Ok(Message::Text(t)) => match serde_json::from_str::<Frame>(&t) {
+                            Ok(Frame::PtyExit {
+                                exit_code,
+                                exit_signal,
+                                error,
+                                ..
+                            }) => {
+                                if let Some(tx) = &pty_tx {
+                                    let _ = tx.send(PtyEvent::Exit {
+                                        exit_code,
+                                        exit_signal,
+                                        error,
+                                    });
+                                }
+                            }
                             Ok(Frame::Result(r)) => self.complete_request(r).await,
                             Ok(other) => warn!(?other, "unexpected frame from worker"),
                             Err(e) => warn!("frame parse error: {e}"),
@@ -574,6 +671,17 @@ impl WorkerPool {
         let location = {
             let mut s = self.state.lock().await;
             s.idle.retain(|w| w.worker_id != *worker_id);
+            // A worker that drops mid-PTY-session leaves its client still
+            // attached. Notify the session so the handler closes that client
+            // cleanly (with a reason) instead of blocking forever on output that
+            // will never arrive.
+            if let Some(tx) = s.pty_sessions.remove(worker_id) {
+                let _ = tx.send(PtyEvent::Exit {
+                    exit_code: None,
+                    exit_signal: None,
+                    error: Some("worker disconnected".to_string()),
+                });
+            }
             s.liveness.remove(worker_id).and_then(|l| l.location)
         };
         self.report_occupancy().await;

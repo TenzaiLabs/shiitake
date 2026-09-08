@@ -83,6 +83,7 @@ async fn serve(min_ready_workers: usize) -> (String, u16, TempDir) {
         default_workdir: std::env::temp_dir(),
         max_body_bytes: 256 * 1024 * 1024,
         min_ready_workers,
+        pty_keepalive: std::time::Duration::from_secs(10),
     });
     tokio::spawn(async move {
         axum::serve(api_listener, api_router.into_make_service())

@@ -19,6 +19,7 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         service: SERVICE.into(),
         workers_idle: idle,
         workers_inflight: inflight,
+        workers_pinned: state.pool.pinned_count().await,
     })
 }
 
