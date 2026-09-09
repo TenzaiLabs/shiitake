@@ -37,6 +37,8 @@ bearer-authenticated either way.
       value: {{ $.Values.captureRoot | quote }}
     - name: SHIITAKE_MIN_READY_WORKERS
       value: {{ $.Values.server.minReadyWorkers | quote }}
+    - name: SHIITAKE_PTY_KEEPALIVE_SECS
+      value: {{ $.Values.server.ptyKeepaliveSecs | quote }}
     {{- if $.Values.otel.enabled }}
     - name: OTEL_EXPORTER_OTLP_ENDPOINT
       value: "http://{{ $.Release.Name }}-otel:4318"
@@ -117,6 +119,10 @@ the OOM probe queries its pod, not the server's.
       value: {{ $.Values.worker.resetPaths | quote }}
     - name: SHIITAKE_RESTART_AFTER
       value: {{ $.Values.worker.restartAfter | quote }}
+    - name: SHIITAKE_HOME_ROOT
+      value: {{ $.Values.worker.homeRoot | quote }}
+    - name: SHIITAKE_LEASE_TIMEOUT
+      value: {{ $.Values.worker.leaseTimeout | quote }}
     - name: POD_NAME
       valueFrom:
         fieldRef:

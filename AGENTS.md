@@ -36,14 +36,13 @@ shiitake-worker/  shiitake-worker — bin only. client.rs (connect/Hello/serve-l
 clients/shiitake-rs/  shiitake-rs — lib. Async reqwest client over the HTTP API.
 clients/shiitake-py/  Python client for the HTTP API (httpx, policy-free; the
           optional `[pty]` extra adds the `/api/v1/pty` WebSocket client).
-integration-tests/  shiitake-integration-tests — no lib of its own. In-process
-          scenarios under tests/ drive the real server (pool + HTTP handlers)
-          against the real worker binary (located via escargot), with a shared
-          harness in tests/common. Run by `cargo test --workspace`.
 tests/    k3d-based suite: a Helm chart (chart/) deploying server + N workers in
           either topology, driven by build.sh + setup.sh + run.sh; HTTP-level
           checks in test_exec.py (both topologies), split-topology checks in
-          test_two_pod.py, and the shiitake-py client e2e in test_e2e.py
+          test_two_pod.py, and the shiitake-py client e2e in test_e2e.py — which
+          covers the `/api/v1/pty` terminal (streaming, signals, resize, byte
+          transparency, backpressure, session pinning, and the named-user drop)
+          against real root workers in the cluster
 ```
 
 The server↔worker wire frames + capture layout live in `shiitake-worker-api`
@@ -65,19 +64,17 @@ ad-hoc `env::var` reads.
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace               # unit + in-process integration tests
+cargo test --workspace               # unit + per-crate worker/server tests
 bash tests/build.sh && bash tests/setup.sh && bash tests/run.sh  # full cluster e2e (docker, k3d, kubectl, helm, python3, uv)
 SHIITAKE_E2E_TOPOLOGY=two-pod bash tests/setup.sh && SHIITAKE_E2E_TOPOLOGY=two-pod bash tests/run.sh  # same suite, split topology
 ```
 
-One integration scenario actually provisions a unix account (a `/etc/passwd`
-entry + a home) to exercise `DropTo::name`. It is gated on running as root
-**and** an explicit opt-in, so `cargo test` skips it everywhere else:
-
-```bash
-# In a throwaway root container only — it writes /etc/passwd (cleaned by reset):
-SHIITAKE_PTY_USERADD_TEST=1 cargo test -p shiitake-integration-tests
-```
+The interactive terminal (`/api/v1/pty`) is covered at two levels: the worker's
+own `shiitake-worker/tests/pty.rs` (pty open + line discipline against a mock
+dispatch), and the full client→server→worker path in the k3d e2e
+(`test_e2e.py`). The named-user drop (`DropTo::name` — a real `/etc/passwd`
+entry + home) needs a root worker, which the e2e workers already are, so it runs
+there rather than needing a special local setup.
 
 Local + CI e2e tooling (k3d, kubectl, python) is managed by `mise` (`mise.toml`)
 — run `mise install`; the test workflow uses `jdx/mise-action`. The Rust

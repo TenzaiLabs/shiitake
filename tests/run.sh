@@ -61,10 +61,13 @@ log "Running test_exec.py against ${base}"
 SHIITAKE_E2E_URL="$base" SHIITAKE_E2E_TOKEN="$TOKEN" SHIITAKE_E2E_WORKERS="$workers" \
   python3 "$ROOT/tests/test_exec.py"
 
+# The workers run as root in-cluster, so the PTY named-user drop (writes
+# /etc/passwd + setuids) can run here; SHIITAKE_E2E_ROOT_WORKERS enables it.
 log "Running shiitake-py e2e against ${base}"
-SHIITAKE_E2E_URL="$base" SHIITAKE_E2E_TOKEN="$TOKEN" \
+SHIITAKE_E2E_URL="$base" SHIITAKE_E2E_TOKEN="$TOKEN" SHIITAKE_E2E_ROOT_WORKERS=1 \
   uv run --project "$ROOT/clients/shiitake-py" --group dev \
-  pytest "$ROOT/clients/shiitake-py/tests/test_e2e.py" -q
+  pytest "$ROOT/clients/shiitake-py/tests/test_e2e.py" \
+         "$ROOT/clients/shiitake-py/tests/test_pty_e2e.py" -q
 
 # Scrape the server's emitted metrics from the OTel collector's Prometheus
 # endpoint (deployed by setup.sh with otel.enabled=true). The tests ran real
@@ -99,15 +102,17 @@ if [ -z "$metrics" ]; then
 fi
 printf '%s\n' "$metrics"
 
-# Last: deleting the server pod kills the port-forward above, and kubectl does
-# not re-establish one. test_pod_failures.py manages its own for that reason,
-# but nothing after it could use this one.
+# Last: the pod-failure suite (self-contained — own port-forward + kubectl, since
+# it kills the pods the shared forward above rides on). It includes the /pty
+# worker-death case, so it runs under uv for the shiitake-py client. Two-pod only
+# — a worker is its own pod there.
 if [ "$TOPOLOGY" = "two-pod" ]; then
   log "Running test_pod_failures.py"
   SHIITAKE_E2E_TOKEN="$TOKEN" SHIITAKE_E2E_WORKERS="$workers" \
     SHIITAKE_E2E_CONTEXT="$CONTEXT" SHIITAKE_E2E_NAMESPACE="$NAMESPACE" \
     SHIITAKE_E2E_RELEASE="$RELEASE" \
-    python3 "$ROOT/tests/test_pod_failures.py"
+    uv run --project "$ROOT/clients/shiitake-py" --group dev \
+    python "$ROOT/tests/test_pod_failures.py"
 fi
 
 log "PASS"

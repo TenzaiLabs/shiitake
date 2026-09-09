@@ -45,9 +45,9 @@ mod imp {
         let Some(name) = d.name.as_deref() else {
             return Ok(None);
         };
-        // A name with these bytes would corrupt the colon/line-delimited file;
-        // refuse rather than write a broken passwd. uid 0 is never nameable here.
-        if name.is_empty() || name.contains([':', '\n', ' ', '\t']) || d.uid == 0 {
+        // Refuse uid 0 or a name whose bytes would corrupt the passwd file, so
+        // the uid stays bare rather than named — see [`safe_to_name`].
+        if !safe_to_name(name, d.uid) {
             warn!(
                 uid = d.uid,
                 name, "refusing to name this account; leaving the uid bare"
@@ -148,6 +148,14 @@ mod imp {
         std::fs::write(PASSWD, passwd_without(&content, &pairs))
     }
 
+    /// Whether `name` may be written to `/etc/passwd` for `uid`. Refuses uid 0
+    /// (the worker never *names* the superuser) and any name whose bytes would
+    /// corrupt the colon/newline-delimited file — the guard against a caller
+    /// smuggling a second passwd entry through the name field.
+    pub(super) fn safe_to_name(name: &str, uid: u32) -> bool {
+        uid != 0 && !name.is_empty() && !name.contains([':', '\n', ' ', '\t'])
+    }
+
     /// The passwd line for a named uid. One place so the append format and the
     /// `name:x:uid:` cleanup prefix cannot drift apart.
     pub(super) fn passwd_entry(name: &str, uid: u32, gid: u32, home: &str) -> String {
@@ -229,7 +237,7 @@ mod imp {
 
 #[cfg(all(unix, test))]
 mod tests {
-    use super::imp::{passwd_entry, passwd_has, passwd_without};
+    use super::imp::{passwd_entry, passwd_has, passwd_without, safe_to_name};
 
     const BASE: &str =
         "root:x:0:0:root:/root:/bin/bash\ninteractive:x:10009:10009::/:/usr/sbin/nologin\n";
@@ -243,6 +251,23 @@ mod tests {
         );
         // The line the cleanup prefix `name:x:uid:` must match.
         assert!(line.starts_with("alice:x:2000123:"));
+    }
+
+    #[test]
+    fn safe_to_name_refuses_uid_0_and_passwd_breaking_names() {
+        assert!(
+            safe_to_name("alice", 2_000_123),
+            "an ordinary name for a non-zero uid"
+        );
+        // Never name the superuser, whatever name is asked for.
+        assert!(!safe_to_name("root", 0));
+        assert!(!safe_to_name("alice", 0));
+        // A name field is a passwd-injection vector: reject the delimiters.
+        assert!(!safe_to_name("", 2_000_123), "empty");
+        assert!(!safe_to_name("evil:x:0:0::/:/bin/sh", 2_000_123), "colon");
+        assert!(!safe_to_name("evil\nroot:x:0:0", 2_000_123), "newline");
+        assert!(!safe_to_name("two words", 2_000_123), "space");
+        assert!(!safe_to_name("tab\there", 2_000_123), "tab");
     }
 
     #[test]

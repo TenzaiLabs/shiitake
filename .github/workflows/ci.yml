@@ -57,31 +57,6 @@ jobs:
       - name: 🧪 Test
         run: cargo test --workspace --locked
 
-  # The full integration-tests crate, run as root in a throwaway container. The
-  # host `test` job above already runs these, but skips the scenarios that
-  # provision a real `/etc/passwd` account (gated on root + an opt-in); here that
-  # path runs too, where writing passwd is harmless (the reset cleans it).
-  integration-tests:
-    name: 🔬 Integration tests (container)
-    runs-on: ubuntu-latest
-    container: rust:1-bookworm
-    env:
-      SHIITAKE_PTY_USERADD_TEST: "1"
-    steps:
-      - name: 📥 Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-      - name: 🧰 Toolchain
-        run: rustup show
-      - name: 💾 Cache
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          # Build-artifact cache namespace (target/ + cargo registry), not a
-          # secret. Its own key because a container job's paths differ from the
-          # host jobs', so their caches must not mix.
-          shared-key: rust-container-${{ hashFiles('rust-toolchain.toml') }}
-      - name: 🔐 Integration tests (root, named-user path enabled)
-        run: cargo test -p shiitake-integration-tests --locked
-
   version:
     name: 🔢 Version
     runs-on: ubuntu-latest

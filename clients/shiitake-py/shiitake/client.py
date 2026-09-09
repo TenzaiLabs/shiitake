@@ -237,6 +237,17 @@ class AsyncPtySession:
         """Reflow the tty so full-screen programs repaint."""
         await self._ws.send(json.dumps({"op": "resize", "cols": cols, "rows": rows}))
 
+    @property
+    def close_code(self) -> int | None:
+        """WebSocket close code once the session ends (``None`` while open). 1000
+        is a clean shell exit; 1011 an abnormal end such as the worker dropping."""
+        return self._ws.close_code
+
+    @property
+    def close_reason(self) -> str:
+        """Human-readable close reason once the session ends (empty while open)."""
+        return self._ws.close_reason or ""
+
     async def aclose(self) -> None:
         with contextlib.suppress(Exception):
             await self._ws.close()

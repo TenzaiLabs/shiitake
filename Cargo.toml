@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "clients/shiitake-rs",
-    "integration-tests",
     "shiitake-server",
     "shiitake-server-api",
     "shiitake-worker",
