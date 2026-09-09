@@ -57,11 +57,12 @@ jobs:
       - name: 🧪 Test
         run: cargo test --workspace --locked
 
-  # The named-user PTY scenario provisions a real `/etc/passwd` account, so it is
-  # gated on root + an opt-in and skips in the job above. Run it here as root in
-  # a throwaway container, where writing passwd is harmless (the reset cleans it).
-  pty-named-user:
-    name: 🔐 PTY named-user
+  # The full integration-tests crate, run as root in a throwaway container. The
+  # host `test` job above already runs these, but skips the scenarios that
+  # provision a real `/etc/passwd` account (gated on root + an opt-in); here that
+  # path runs too, where writing passwd is harmless (the reset cleans it).
+  integration-tests:
+    name: 🔬 Integration tests (container)
     runs-on: ubuntu-latest
     container: rust:1-bookworm
     env:

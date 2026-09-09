@@ -9,15 +9,18 @@
 
 use crate::exec::{apply_drop_to, io_err};
 use anyhow::{Context, Result};
-use nix::pty::openpty;
-use nix::unistd::setsid;
+use nix::{pty::openpty, unistd::setsid};
 use shiitake_worker_api::PtyOpenFrame;
-use std::io;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::process::{ExitStatus, Stdio};
-use std::sync::OnceLock;
-use tokio::io::unix::AsyncFd;
-use tokio::process::{Child, Command};
+use std::{
+    io,
+    os::fd::{AsRawFd, OwnedFd, RawFd},
+    process::{ExitStatus, Stdio},
+    sync::OnceLock,
+};
+use tokio::{
+    io::unix::AsyncFd,
+    process::{Child, Command},
+};
 
 /// The shell spawned when a `PtyOpen` carries no explicit command. Overridable
 /// via `SHIITAKE_PTY_SHELL` (whitespace-split argv) so a deployment can make the

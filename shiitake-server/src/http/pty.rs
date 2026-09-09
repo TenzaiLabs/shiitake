@@ -6,8 +6,10 @@
 //! is client binary, and `{"op":"resize"}` reflows the tty. The session ends
 //! when the shell exits, the client disconnects, or no worker is idle.
 
-use crate::http::AppState;
-use crate::pool::{PtyEvent, SharedSink};
+use crate::{
+    http::AppState,
+    pool::{PtyEvent, SharedSink},
+};
 use axum::{
     extract::{
         State,
@@ -21,8 +23,7 @@ use futures_util::{
 };
 use serde::Deserialize;
 use shiitake_worker_api::{DropTo, ExecId, Frame, PtyOpenFrame};
-use std::collections::BTreeMap;
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 use uuid::Uuid;
 
 // WebSocket close codes (RFC 6455).

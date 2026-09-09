@@ -10,8 +10,7 @@ use shiitake_integration_tests::{
     TestServer, connect_pty, may_create_accounts, open_frame, open_pty, open_pty_bytes_with_pause,
     recv_close, recv_until,
 };
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tokio::time::timeout;
 
 #[tokio::test]

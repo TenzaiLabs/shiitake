@@ -10,6 +10,7 @@
 
 use shiitake_integration_tests::{
     TestServer, connect_pty, open_frame, open_pty_bytes, pty_send_after_ready, recv_until, resize,
+    send_stdin,
 };
 
 /// Arm `script` (which prints `READY` once armed), send one control byte, and
@@ -80,20 +81,23 @@ async fn resize_reflows_the_tty() {
     let server = TestServer::start().await;
     let _worker = server.spawn_worker().await;
 
-    // The shell reports its tty size on SIGWINCH; opened at 80x24, resized to
-    // 100x40, it must see the new size — proving `op:resize` reaches the pty
-    // (TIOCSWINSZ) and raises SIGWINCH. `stty size` prints "rows cols".
+    // Opened at 80x24, resized to 100x40; reading the size back with `stty size`
+    // (prints "rows cols") proves `op:resize` reached the pty as a TIOCSWINSZ —
+    // which is shiitake's job; the resulting SIGWINCH is the kernel's. Sampling
+    // the size after the resize — rather than from a SIGWINCH trap — avoids
+    // depending on exactly when a given bash version runs a trap relative to a
+    // blocking builtin (3.2 and 5.2 disagree, in opposite directions).
     let mut ws = connect_pty(
         server.api_port,
-        open_frame(&[
-            "bash",
-            "-c",
-            "trap 'stty size; exit 0' WINCH; echo READY; read _",
-        ]),
+        open_frame(&["bash", "-c", "echo READY; read _; stty size"]),
     )
     .await;
     recv_until(&mut ws, "READY").await;
     resize(&mut ws, 100, 40).await;
+    // The newline unblocks `read`, so the following `stty size` runs and reports
+    // the already-applied dimensions. Ordered after the resize frame on the wire,
+    // so the size is set before `stty` samples it.
+    send_stdin(&mut ws, b"\n").await;
     recv_until(&mut ws, "40 100").await;
 }
 

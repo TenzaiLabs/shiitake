@@ -13,9 +13,11 @@
 #[cfg(unix)]
 mod imp {
     use shiitake_worker_api::DropTo;
-    use std::io::{self, Write};
-    use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
+    use std::{
+        io::{self, Write},
+        path::PathBuf,
+        sync::{Mutex, OnceLock},
+    };
     use tracing::warn;
 
     const PASSWD: &str = "/etc/passwd";
@@ -284,8 +286,7 @@ mod tests {
 #[cfg(not(unix))]
 mod imp {
     use shiitake_worker_api::DropTo;
-    use std::io;
-    use std::path::PathBuf;
+    use std::{io, path::PathBuf};
 
     pub fn ensure(_d: &DropTo) -> io::Result<Option<PathBuf>> {
         Ok(None)

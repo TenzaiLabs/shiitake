@@ -10,9 +10,17 @@ use shiitake_server::{
     http::{AppState, build_api_router, build_dispatch_router},
     pool::WorkerPool,
 };
-use std::{path::PathBuf, sync::Arc, sync::OnceLock, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use tempfile::TempDir;
-use tokio::{net::TcpListener, process::Child, process::Command, time::timeout};
+use tokio::{
+    net::TcpListener,
+    process::{Child, Command},
+    time::timeout,
+};
 use tokio_tungstenite::tungstenite::{
     Message,
     client::IntoClientRequest,
@@ -311,6 +319,13 @@ pub async fn recv_until(ws: &mut PtyWs, marker: &str) {
 pub async fn resize(ws: &mut PtyWs, cols: u16, rows: u16) {
     let frame = json!({ "op": "resize", "cols": cols, "rows": rows }).to_string();
     ws.send(Message::Text(frame.into())).await.unwrap();
+}
+
+/// Send raw bytes as one stdin (binary) frame.
+pub async fn send_stdin(ws: &mut PtyWs, bytes: &[u8]) {
+    ws.send(Message::Binary(bytes.to_vec().into()))
+        .await
+        .unwrap();
 }
 
 /// Read `ws` until the server closes it; return the (code, reason) of the close
