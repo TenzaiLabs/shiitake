@@ -1004,7 +1004,7 @@ SHIITAKE_PTY_SHELL=<span class="s">"tmux new-session -A -D -s main"</span></code
       or the client disconnects; on the way out the worker resets before rejoining
       the pool, so the next caller never inherits a dirty sandbox. If no worker is
       idle the upgrade closes with a try-again code. <code>/health</code> reports
-      <code>workers_pinned</code> alongside <code>workers_idle</code> /
+      <code>workers_interactive</code> alongside <code>workers_idle</code> /
       <code>workers_inflight</code>, so you can see the capacity terminals are
       holding.
     </p>

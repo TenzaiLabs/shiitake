@@ -113,7 +113,7 @@ pub struct HealthResponse {
     /// Workers held out of the pool by an interactive session (a pinned PTY).
     /// Lets operators — and an idle reaper — see capacity a terminal is holding.
     #[serde(default)]
-    pub workers_pinned: usize,
+    pub workers_interactive: usize,
 }
 
 /// `GET /api/v1/ready` response — readiness, as distinct from liveness. The

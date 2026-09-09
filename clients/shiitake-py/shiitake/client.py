@@ -103,7 +103,7 @@ class HealthResponse:
     service: str
     workers_idle: int = 0
     workers_inflight: int = 0
-    workers_pinned: int = 0
+    workers_interactive: int = 0
 
 
 @dataclass
@@ -315,7 +315,7 @@ class AsyncShiitakeClient(_Base):
             service=d["service"],
             workers_idle=d.get("workers_idle", 0),
             workers_inflight=d.get("workers_inflight", 0),
-            workers_pinned=d.get("workers_pinned", 0),
+            workers_interactive=d.get("workers_interactive", 0),
         )
 
     async def ready(self) -> ReadyResponse:

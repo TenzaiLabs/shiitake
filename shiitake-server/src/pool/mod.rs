@@ -1,6 +1,6 @@
 //! Worker pool + handle registry.
 //!
-//! Each in-flight handle pins one worker. Dispatch returns as soon as the
+//! Each in-flight handle holds one worker. Dispatch returns as soon as the
 //! Execute frame is sent (or fails with `DispatchError::NoIdleWorker` if
 //! the pool is exhausted) — clients poll the handle for completion via
 //! the HTTP API. The worker's sink is held in the inflight slot so the
@@ -9,7 +9,7 @@
 //! The idle set is a FIFO queue: dispatch takes from the front and a worker
 //! returning from a command goes to the back, so selection is
 //! least-recently-used. A serial stream of commands therefore rotates through
-//! the whole pool instead of pinning one worker — which spreads per-worker
+//! the whole pool instead of dwelling on one worker — which spreads per-worker
 //! resource limits and `SHIITAKE_RESTART_AFTER` recycling evenly, and exercises
 //! every worker's sandbox reset rather than letting untried workers sit idle
 //! until load finally reaches them.
@@ -243,7 +243,7 @@ impl WorkerPool {
     }
 
     /// Workers currently held by an interactive PTY session.
-    pub async fn pinned_count(&self) -> usize {
+    pub async fn interactive_count(&self) -> usize {
         self.state.lock().await.pty_sessions.len()
     }
 

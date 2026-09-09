@@ -81,9 +81,9 @@ async def _wait_idle(c: AsyncShiitakeClient, want: int, deadline: float = 30.0) 
     await asyncio.wait_for(poll(), deadline)
 
 
-async def _wait_pinned(c: AsyncShiitakeClient, want: int, deadline: float = 20.0) -> None:
+async def _wait_interactive(c: AsyncShiitakeClient, want: int, deadline: float = 20.0) -> None:
     async def poll() -> None:
-        while (await c.health()).workers_pinned != want:
+        while (await c.health()).workers_interactive != want:
             await asyncio.sleep(0.1)
 
     await asyncio.wait_for(poll(), deadline)
@@ -96,7 +96,7 @@ async def test_pty_streams_a_shell_and_releases_the_worker(shiitake_client: Asyn
     await term.aclose()
     assert b"HELLO_FROM_PTY" in term.output, term.output
     # The worker unpins and resets after the shell exits.
-    await _wait_pinned(shiitake_client, 0)
+    await _wait_interactive(shiitake_client, 0)
 
 
 async def _assert_control_byte(
@@ -200,7 +200,7 @@ async def test_pty_large_output_survives_backpressure(shiitake_client: AsyncShii
     await session.aclose()
     xs = bytes(buf).count(b"X")
     assert xs == 5_000_000, f"every byte must arrive under backpressure; got {xs} of 5000000"
-    await _wait_pinned(shiitake_client, 0)
+    await _wait_interactive(shiitake_client, 0)
 
 
 async def test_pty_quiet_session_outlives_the_worker_lease(shiitake_client: AsyncShiitakeClient) -> None:
@@ -228,11 +228,11 @@ async def test_pty_two_sessions_each_pin_a_worker(shiitake_client: AsyncShiitake
         await a.wait_for(b"START_A")
         await b.wait_for(b"START_B")
         # Both sessions hold a pinned worker at the same time.
-        await _wait_pinned(shiitake_client, 2)
+        await _wait_interactive(shiitake_client, 2)
     finally:
         await a.aclose()
         await b.aclose()
-    await _wait_pinned(shiitake_client, 0)
+    await _wait_interactive(shiitake_client, 0)
 
 
 @pytest.mark.skipif(not _ROOT_WORKERS, reason="named-user drop needs root workers")

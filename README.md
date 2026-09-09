@@ -56,7 +56,7 @@ bearer token.
 
 | Method | Path                           | Purpose                                                                     |
 | ------ | ------------------------------ | --------------------------------------------------------------------------- |
-| GET    | `/api/v1/health`               | Liveness + pool snapshot (`workers_idle`, `workers_inflight`, `workers_pinned`). No auth. |
+| GET    | `/api/v1/health`               | Liveness + pool snapshot (`workers_idle`, `workers_inflight`, `workers_interactive`). No auth. |
 | GET    | `/api/v1/ready`                | Readiness: `200` once `SHIITAKE_MIN_READY_WORKERS` workers are registered, `503` otherwise. No auth. |
 | POST   | `/api/v1/exec`                 | Spawn a command. Returns `{handle, started_at}` (202). 429 if the pool is full. |
 | GET    | `/api/v1/exec/{handle}`        | Status: state, exit code/signal/cause, per-stream byte counters.             |
