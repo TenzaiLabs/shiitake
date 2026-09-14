@@ -80,6 +80,10 @@ pub fn reset(clear_paths: &[PathBuf]) -> Result<()> {
             first_err.get_or_insert(e.context(format!("clear {}", path.display())));
         }
     }
+    // Drop any `/etc/passwd` names this worker minted for a session's `drop_to`.
+    // Best-effort and path-scoped to our own entries — a stale name must not fail
+    // a reset, only be cleaned so the next session starts from the image's users.
+    crate::account::cleanup();
     match first_err {
         Some(e) => Err(e),
         None => Ok(()),

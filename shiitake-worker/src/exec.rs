@@ -71,6 +71,11 @@ pub async fn run(
         .kill_on_drop(true);
 
     let drop_to = execute.drop_to.clone();
+    // Name the target uid (if the caller asked) while we are still privileged —
+    // must happen in the parent, not the async-signal-safe `pre_exec` below.
+    if let Some(d) = drop_to.as_ref() {
+        crate::account::ensure(d).context("ensure named account")?;
+    }
     unsafe {
         cmd.pre_exec(move || {
             // Own process group so a timeout/cancel can killpg the whole tree.
@@ -228,7 +233,7 @@ async fn reap(child: &mut Child) -> Option<std::process::ExitStatus> {
 /// setuid, umask). Order is `setgid → setgroups → setuid` so all gid
 /// changes happen while the process is still uid 0.
 #[cfg(target_os = "linux")]
-fn apply_drop_to(d: &DropTo) -> std::io::Result<()> {
+pub(crate) fn apply_drop_to(d: &DropTo) -> std::io::Result<()> {
     use nix::unistd::{Gid, Uid};
 
     let gid = Gid::from_raw(d.gid);
@@ -252,11 +257,11 @@ fn apply_drop_to(d: &DropTo) -> std::io::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn apply_drop_to(_d: &DropTo) -> std::io::Result<()> {
+pub(crate) fn apply_drop_to(_d: &DropTo) -> std::io::Result<()> {
     Ok(())
 }
 
-fn io_err(e: nix::errno::Errno) -> std::io::Error {
+pub(crate) fn io_err(e: nix::errno::Errno) -> std::io::Error {
     e.into()
 }
 

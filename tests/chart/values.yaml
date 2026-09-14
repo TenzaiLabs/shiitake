@@ -33,6 +33,9 @@ server:
   # The readiness probe gates the pod on this, so the e2e never talks to a
   # server whose pool is still empty.
   minReadyWorkers: 1
+  # How often the /pty handler pings a pinned worker to keep its session lease
+  # fresh. Below worker.leaseTimeout; short so the keepalive e2e runs quickly.
+  ptyKeepaliveSecs: 3
   resources:
     requests:
       cpu: 100m
@@ -54,6 +57,13 @@ worker:
   # and rely on the in-process reset; N>0 adds a periodic full-container
   # teardown. Set >0 to exercise the restartPolicy/recycle path in the e2e.
   restartAfter: 0
+  # Where a named session's home is created (SHIITAKE_HOME_ROOT). Non-default so
+  # the e2e proves the override relocates the home off /home.
+  homeRoot: /var/lib/shiitake-homes
+  # Worker session-lease watchdog (SHIITAKE_LEASE_TIMEOUT). Above the pool's ~10s
+  # keepalive so idle/in-flight workers stay put, but low enough that the
+  # keepalive quiet-session e2e outlasts it without a long sleep.
+  leaseTimeout: 15
   resources:
     requests:
       cpu: 50m

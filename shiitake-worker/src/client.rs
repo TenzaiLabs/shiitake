@@ -16,14 +16,16 @@
 //! anything the in-process reset can't scrub. `0` disables it (pure resident);
 //! `1` exits after every command (a fresh container per command).
 
-use crate::{exec, reset};
+use crate::{exec, pty, reset};
 use anyhow::{Context, Result};
 use clap::Args;
 use futures_util::{
     SinkExt, StreamExt,
     stream::{SplitSink, SplitStream},
 };
-use shiitake_worker_api::{ExecuteFrame, Frame, ResultFrame, WorkerId, WorkerLocation};
+use shiitake_worker_api::{
+    ExecuteFrame, Frame, PtyOpenFrame, ResultFrame, WorkerId, WorkerLocation,
+};
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -54,6 +56,26 @@ enum CmdOutcome {
     Done(ResultFrame),
     /// The session died mid-command (socket closed, or the lease lapsed). The
     /// command has been SIGKILLed; the worker must recycle, not reconnect.
+    SessionLost,
+}
+
+/// A unit of work pulled off the dispatch socket between resets.
+enum Work {
+    /// A one-shot command (`bash -c`), output captured to files.
+    Execute(ExecuteFrame),
+    /// An interactive PTY session — persistent, bidirectional, pinned.
+    Pty(PtyOpenFrame),
+}
+
+/// One PTY session's outcome on the live session.
+enum PtyOutcome {
+    /// The shell exited, the server sent PtyClose, or the pty could not be
+    /// opened. Carries the `PtyExit` frame to report — sent *after* the reset
+    /// (Phase 4), like a command's Result, so the server re-advertises this
+    /// worker only once its sandbox (including any account it named) is clean.
+    Done(Box<Frame>),
+    /// The dispatch socket died mid-session; the shell has been SIGHUP'd and the
+    /// worker must recycle, not reconnect.
     SessionLost,
 }
 
@@ -262,16 +284,35 @@ async fn serve_session(
         // Idle: a lapsed lease just means this connection is dead. Nothing has
         // run, so the sandbox is clean — drop it and reconnect (which re-resolves
         // the dispatch URL, picking up a replacement server pod).
-        let Some(execute) = next_execute(&mut sink, &mut stream, lease).await? else {
+        let Some(work) = next_execute(&mut sink, &mut stream, lease).await? else {
             return Ok(SessionEnd::Closed);
         };
 
-        // Phase 2: run it, watching for a Cancel on the same socket.
-        info!(request_id = %execute.request_id, "executing");
-        let outcome = run_command(execute, &mut sink, &mut stream, capture_root, lease).await;
-        let result = match outcome {
-            CmdOutcome::Done(r) => r,
-            CmdOutcome::SessionLost => return Ok(SessionEnd::LostMidCommand),
+        // Phase 2: run it, watching the same socket for control frames. A
+        // command yields a Result to report in Phase 4; a PTY session sends its
+        // own PtyExit as it ends, so there is nothing left to report.
+        // A command yields a Result; a PTY session yields a PtyExit. Both are
+        // reported in Phase 4, after the reset, so the server only re-advertises
+        // this worker once its sandbox is clean.
+        let mut pty_exit: Option<Frame> = None;
+        let result: Option<ResultFrame> = match work {
+            Work::Execute(execute) => {
+                info!(request_id = %execute.request_id, "executing");
+                match run_command(execute, &mut sink, &mut stream, capture_root, lease).await {
+                    CmdOutcome::Done(r) => Some(r),
+                    CmdOutcome::SessionLost => return Ok(SessionEnd::LostMidCommand),
+                }
+            }
+            Work::Pty(open) => {
+                info!(session_id = %open.session_id, "pty session");
+                match run_pty(open, &mut sink, &mut stream, lease).await {
+                    PtyOutcome::Done(exit) => {
+                        pty_exit = Some(*exit);
+                        None
+                    }
+                    PtyOutcome::SessionLost => return Ok(SessionEnd::LostMidCommand),
+                }
+            }
         };
 
         *served += 1;
@@ -335,10 +376,21 @@ async fn serve_session(
         // regardless of the reset outcome, so always send it. A send failure
         // means the socket is gone — end the session and let the reconnect loop
         // take over.
-        let result_json = serde_json::to_string(&Frame::Result(result))?;
-        if let Err(e) = sink.send(Message::Text(result_json.into())).await {
-            warn!("send Result failed: {e}; ending session");
-            return Ok(SessionEnd::Closed);
+        if let Some(result) = result {
+            let result_json = serde_json::to_string(&Frame::Result(result))?;
+            if let Err(e) = sink.send(Message::Text(result_json.into())).await {
+                warn!("send Result failed: {e}; ending session");
+                return Ok(SessionEnd::Closed);
+            }
+        }
+        // A PTY session's terminal frame, sent after the reset for the same
+        // reason: the server frees the pinned worker only once it is clean.
+        if let Some(exit) = pty_exit {
+            let exit_json = serde_json::to_string(&exit)?;
+            if let Err(e) = sink.send(Message::Text(exit_json.into())).await {
+                warn!("send PtyExit failed: {e}; ending session");
+                return Ok(SessionEnd::Closed);
+            }
         }
 
         // Exit for a fresh container when the quota is reached or a reset failed.
@@ -366,7 +418,7 @@ async fn next_execute(
     sink: &mut Sink,
     stream: &mut Stream,
     lease: Duration,
-) -> Result<Option<ExecuteFrame>> {
+) -> Result<Option<Work>> {
     loop {
         let Ok(msg) = tokio::time::timeout(lease, stream.next()).await else {
             warn!(
@@ -377,9 +429,14 @@ async fn next_execute(
         };
         match msg {
             Some(Ok(Message::Text(t))) => match serde_json::from_str::<Frame>(&t)? {
-                Frame::Execute(e) => return Ok(Some(e)),
-                Frame::Cancel { .. } => warn!("Cancel with no command in flight; ignoring"),
-                Frame::Hello { .. } | Frame::Result(_) => warn!("unexpected frame; ignoring"),
+                Frame::Execute(e) => return Ok(Some(Work::Execute(e))),
+                Frame::PtyOpen(o) => return Ok(Some(Work::Pty(o))),
+                Frame::Cancel { .. } | Frame::PtyResize { .. } | Frame::PtyClose { .. } => {
+                    warn!("control frame with nothing in flight; ignoring")
+                }
+                Frame::Hello { .. } | Frame::Result(_) | Frame::PtyExit { .. } => {
+                    warn!("unexpected frame; ignoring")
+                }
             },
             Some(Ok(Message::Ping(p))) => {
                 if let Err(e) = sink.send(Message::Pong(p)).await {
@@ -477,4 +534,129 @@ async fn run_command(
         }
     };
     CmdOutcome::Done(result)
+}
+
+/// Drive one interactive PTY session: pump the pty master to/from the dispatch
+/// socket (output out as WS binary, keystrokes in from WS binary), apply
+/// resizes, and end when the shell exits or the server sends PtyClose. Reads the
+/// socket concurrently with the pty, like `run_command`, so the session stays
+/// responsive and a lease of total silence still tears it down.
+async fn run_pty(
+    open: PtyOpenFrame,
+    sink: &mut Sink,
+    stream: &mut Stream,
+    lease: Duration,
+) -> PtyOutcome {
+    let session_id = open.session_id.clone();
+
+    let mut pty = match pty::PtySession::spawn(&open) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(%session_id, "pty open failed: {e:#}");
+            // Reported in Phase 4 after the reset — which also cleans any account
+            // `spawn` named before it failed.
+            return PtyOutcome::Done(Box::new(Frame::PtyExit {
+                session_id,
+                exit_code: None,
+                exit_signal: None,
+                error: Some(format!("{e:#}")),
+            }));
+        }
+    };
+
+    let mut buf = vec![0u8; 32 * 1024];
+    let mut deadline = std::pin::pin!(tokio::time::sleep(lease));
+    // `shell_gone` = the pty hit EOF (the shell exited); `lost` = the dispatch
+    // socket died. Both are cleaned up after the loop with a single &mut borrow,
+    // which is why the loop touches `pty` only through its `&self` methods.
+    let mut shell_gone = false;
+    let mut lost = false;
+
+    loop {
+        tokio::select! {
+            biased;
+            read = pty.read_output(&mut buf) => match read {
+                Ok(0) => { shell_gone = true; break; }
+                Err(e) => {
+                    warn!(%session_id, "pty read error: {e}");
+                    shell_gone = true;
+                    break;
+                }
+                Ok(n) => {
+                    if sink.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
+                        lost = true;
+                        break;
+                    }
+                }
+            },
+            () = &mut deadline => {
+                warn!(%session_id, lease_s = lease.as_secs(),
+                      "lease lapsed with the server silent; closing pty");
+                lost = true;
+                break;
+            }
+            msg = stream.next() => {
+                deadline.as_mut().reset(tokio::time::Instant::now() + lease);
+                match msg {
+                    Some(Ok(Message::Binary(data))) => {
+                        if let Err(e) = pty.write_input(&data).await {
+                            warn!(%session_id, "pty stdin write failed: {e}");
+                        }
+                    }
+                    Some(Ok(Message::Text(t))) => match serde_json::from_str::<Frame>(&t) {
+                        Ok(Frame::PtyResize { cols, rows, .. }) => {
+                            let _ = pty.resize(cols, rows);
+                        }
+                        Ok(Frame::PtyClose { .. }) => break,
+                        _ => {} // stray Cancel/other frames: nothing in flight to touch
+                    },
+                    Some(Ok(Message::Ping(p))) => {
+                        if sink.send(Message::Pong(p)).await.is_err() {
+                            lost = true;
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
+                        lost = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Clean up + collect exit metadata (single &mut borrow, post-loop).
+    let (exit_code, exit_signal, error) = if shell_gone {
+        match pty.wait().await {
+            Ok(status) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    (status.code(), status.signal(), None)
+                }
+                #[cfg(not(unix))]
+                {
+                    (status.code(), None, None)
+                }
+            }
+            Err(e) => (None, None, Some(format!("could not reap shell: {e}"))),
+        }
+    } else {
+        // PtyClose or a lost socket: hang up the shell so it can't linger.
+        pty.shutdown().await;
+        (None, None, None)
+    };
+
+    if lost {
+        return PtyOutcome::SessionLost;
+    }
+    // Reported in Phase 4, after the reset, so the worker is clean before the
+    // server frees it for the next session.
+    PtyOutcome::Done(Box::new(Frame::PtyExit {
+        session_id,
+        exit_code,
+        exit_signal,
+        error,
+    }))
 }

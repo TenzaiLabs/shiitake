@@ -60,6 +60,19 @@ pub struct DropTo {
     /// worker's current umask.
     #[serde(default)]
     pub umask: Option<u32>,
+    /// Optional login name for `uid`. When set, the worker — still privileged,
+    /// before the drop — ensures a matching `/etc/passwd` entry exists so tools
+    /// that resolve the uid (`whoami`, `id -un`, a shell's `\u` prompt) read a
+    /// real name instead of a bare number. Idempotent (skipped when `uid`
+    /// already resolves) and undone by the between-session reset. Shiitake stays
+    /// identity-agnostic: it materializes the name the caller chose for the uid
+    /// it is already dropping into — it never runs a caller command as root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Create (and own, by `uid:gid`) `/home/<name>` when ensuring the account,
+    /// so the session has a writable home. Ignored without `name`.
+    #[serde(default)]
+    pub create_home: bool,
 }
 
 /// Where a worker's container lives, reported on `Hello` so the server can ask
@@ -98,6 +111,31 @@ pub enum Frame {
     /// stats those files for byte counts, so only exit metadata and the
     /// per-command resource usage travel on the wire.
     Result(ResultFrame),
+
+    /// Server → worker: open an interactive PTY and spawn a shell on it. Unlike
+    /// `Execute`, the session is persistent and bidirectional: its byte stream
+    /// travels as WS **binary** frames (server→worker = stdin, worker→server =
+    /// pty output), while these control frames stay JSON. The worker is pinned
+    /// to this one session until it ends.
+    PtyOpen(PtyOpenFrame),
+    /// Server → worker: window resize for the session's PTY.
+    PtyResize {
+        session_id: ExecId,
+        cols: u16,
+        rows: u16,
+    },
+    /// Server → worker: end the session — SIGHUP the process group and close the
+    /// pty. Idempotent with a `PtyExit` the worker may already have sent.
+    PtyClose { session_id: ExecId },
+    /// Worker → server: the shell exited, or the pty could not be opened
+    /// (`error` set). Terminal frame; the worker then resets and rejoins idle.
+    PtyExit {
+        session_id: ExecId,
+        exit_code: Option<i32>,
+        exit_signal: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +145,24 @@ pub struct ExecuteFrame {
     pub working_dir: String,
     pub env: BTreeMap<String, String>,
     pub timeout_secs: f64,
+    /// Optional privilege-drop directive. `None` means run as the worker uid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drop_to: Option<DropTo>,
+}
+
+/// Parameters for an interactive PTY session (`Frame::PtyOpen`). Mirrors
+/// `ExecuteFrame`'s identity/cwd/env handling; there is no `timeout_secs` — a
+/// terminal lives until the shell exits or the client disconnects.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtyOpenFrame {
+    pub session_id: ExecId,
+    /// Shell argv. Empty means the worker's default (`["bash", "-i"]`).
+    #[serde(default)]
+    pub command: Vec<String>,
+    pub working_dir: String,
+    pub env: BTreeMap<String, String>,
+    pub cols: u16,
+    pub rows: u16,
     /// Optional privilege-drop directive. `None` means run as the worker uid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drop_to: Option<DropTo>,

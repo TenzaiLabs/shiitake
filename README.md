@@ -56,13 +56,14 @@ bearer token.
 
 | Method | Path                           | Purpose                                                                     |
 | ------ | ------------------------------ | --------------------------------------------------------------------------- |
-| GET    | `/api/v1/health`               | Liveness + pool snapshot (`workers_idle`, `workers_inflight`). No auth.      |
+| GET    | `/api/v1/health`               | Liveness + pool snapshot (`workers_idle`, `workers_inflight`, `workers_interactive`). No auth. |
 | GET    | `/api/v1/ready`                | Readiness: `200` once `SHIITAKE_MIN_READY_WORKERS` workers are registered, `503` otherwise. No auth. |
 | POST   | `/api/v1/exec`                 | Spawn a command. Returns `{handle, started_at}` (202). 429 if the pool is full. |
 | GET    | `/api/v1/exec/{handle}`        | Status: state, exit code/signal/cause, per-stream byte counters.             |
 | GET    | `/api/v1/exec/{handle}/stdout` | Read stdout. Serves the capture file with HTTP `Range` support (`206`/`416`); tail with `Range: bytes=-N`. |
 | GET    | `/api/v1/exec/{handle}/stderr` | Read stderr.                                                                |
 | DELETE | `/api/v1/exec/{handle}`        | SIGTERM → SIGKILL the command. Idempotent on terminal handles.              |
+| GET    | `/api/v1/pty`                  | Open an [interactive terminal](https://tenzailabs.github.io/shiitake/docs.html#interactive-pty) (WebSocket upgrade, bearer-gated like `/exec`). Pins one worker for the session. |
 | GET    | `/dispatch`                    | **Internal.** WebSocket workers connect to for dispatch. Its own listener, guarded by `SHIITAKE_DISPATCH_TOKEN` — never expose it outside the cluster. |
 
 `POST /api/v1/exec` body:
@@ -148,6 +149,8 @@ You only need it to write your own worker; the shipped binary speaks it for you.
 | `POD_NAME` / `POD_NAMESPACE` | (downward API)             | This worker's own pod, reported to the server so its container-OOM probe queries the right one. Omit outside Kubernetes. |
 | `SHIITAKE_CONTAINER_NAME` | (the worker id)               | This worker's container name within its pod, for the same probe. |
 | `SHIITAKE_LEASE_TIMEOUT`| `45`                            | Seconds of silence from the server before the worker gives up on the session. Idle it reconnects; mid-command it kills the command and exits for a fresh container. `0` waits forever. |
+| `SHIITAKE_PTY_SHELL`    | `bash -i`                       | Default shell for an [interactive PTY](https://tenzailabs.github.io/shiitake/docs.html#interactive-pty) when the open frame carries no command (whitespace-split argv). Point it at `tmux` to make the default terminal a tmux session. |
+| `SHIITAKE_HOME_ROOT`    | `/home`                         | Root under which a named PTY session's home is created (`<root>/<name>`). |
 
 ## Distribution & deployment
 

@@ -56,6 +56,11 @@ struct Config {
     /// Registered workers the pool needs before `/ready` reports ready.
     #[arg(long, env = "SHIITAKE_MIN_READY_WORKERS", default_value_t = 1)]
     min_ready_workers: usize,
+    /// How often the `/pty` handler pings a pinned worker to keep its session
+    /// lease alive while a client is attached. Must stay below the worker's
+    /// `SHIITAKE_LEASE_TIMEOUT`.
+    #[arg(long, env = "SHIITAKE_PTY_KEEPALIVE_SECS", default_value_t = 10)]
+    pty_keepalive_secs: u64,
     #[arg(long, env = "POD_NAME", default_value = "shiitake")]
     pod_name: String,
     #[arg(long, env = "POD_NAMESPACE", default_value = "")]
@@ -100,6 +105,7 @@ async fn main() -> Result<()> {
         default_workdir: cfg.default_workdir,
         max_body_bytes: cfg.max_body_bytes,
         min_ready_workers: cfg.min_ready_workers,
+        pty_keepalive: Duration::from_secs(cfg.pty_keepalive_secs),
     };
     let api = build_api_router(state);
     let dispatch = build_dispatch_router(pool.clone(), &cfg.dispatch_token);

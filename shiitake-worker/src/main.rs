@@ -12,9 +12,11 @@
 //! reads as a crash. The wire/disk contract comes from the
 //! `shiitake-worker-api` crate.
 
+mod account;
 mod cgroup;
 mod client;
 mod exec;
+mod pty;
 mod reset;
 
 use clap::Parser;

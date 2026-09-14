@@ -6,6 +6,8 @@ containers with it, so there was no independent failure to reconcile. Split
 apart, each side dies on its own, and the contract is:
 
   * a worker lost mid-command   -> its handle is reconciled, never left Running
+  * a PTY worker lost mid-session -> the client is closed 1011 with a reason,
+                                   not left hanging on output that never comes
   * the server lost while idle  -> workers reconnect; the pool refills itself
   * the server lost mid-command -> the command is killed and that worker
                                    recycles, rather than reconnecting onto a
@@ -313,6 +315,47 @@ class PodFailures(unittest.TestCase):
                     msg=f"idle worker {pod} recycled ({count} -> {after[pod]}) when "
                         f"it only needed to reconnect",
                 )
+
+    def test_60_pty_worker_death_closes_the_client_with_a_reason(self):
+        """The /pty analogue of test_10: a session whose worker dies mid-stream
+        must close the client 1011 with a reason, not leave it waiting on output
+        that will never come. Uses the shiitake-py WebSocket client (this suite
+        runs under uv for it); imported lazily so the rest still runs on python3."""
+        import asyncio
+
+        from shiitake.client import AsyncShiitakeClient
+
+        PF.ensure()
+
+        async def drive():
+            async with AsyncShiitakeClient(f"http://127.0.0.1:{PORT}", auth_token=TOKEN) as c:
+                session = await c.attach_pty(
+                    working_dir="/tmp", command=["bash", "-c", "echo READY; sleep 60"]
+                )
+                buf = bytearray()
+
+                async def until(needle):
+                    async for chunk in session.output():
+                        buf.extend(chunk)
+                        if needle in buf:
+                            return
+
+                # Shell up + worker pinned, then kill the workers under it.
+                await asyncio.wait_for(until(b"READY"), 20)
+                delete_pods("app=shiitake-worker")
+
+                # Drain to the close rather than hang on output that won't arrive.
+                async def drain():
+                    async for _ in session.output():
+                        pass
+
+                await asyncio.wait_for(drain(), 30)
+                return session.close_code, session.close_reason
+
+        code, reason = asyncio.run(drive())
+        self.assertEqual(code, 1011, f"abnormal worker loss closes 1011; got {code} / {reason!r}")
+        self.assertIn("worker disconnected", reason, f"reason should name the cause; got {reason!r}")
+        wait_for_pool()  # the Deployment replaces the workers, unattended
 
 
 if __name__ == "__main__":
