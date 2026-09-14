@@ -8,7 +8,7 @@
 #
 # Build context is the repository root: `docker build -f tests/Dockerfile.worker .`
 
-FROM rust:1-slim-trixie@sha256:3b05f7c617a200c41c3506097f0d15fc193a1c93bfd8f141007b47cac8f95d3c AS builder
+FROM rust:1-slim-trixie@sha256:bce1476d4be4d78b83705bc5f428b86d640eeeea33e9dadafbc037b5703a53bf AS builder
 ARG TARGETARCH
 RUN apt-get update \
  && apt-get install -y --no-install-recommends musl-tools \
