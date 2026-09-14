@@ -85,7 +85,7 @@ matrixes the e2e over both topologies. `ci.yml` runs
 format, clippy, test, and version as four parallel jobs; clippy and test share a
 `Swatinem/rust-cache` keyed on `rust-toolchain.toml` (a toolchain bump starts
 from a clean cache). The toolchain is pinned in `rust-toolchain.toml` (edition
-2024, Rust 1.98.0); the format check is its own job under nightly because
+2024, Rust 1.98.1); the format check is its own job under nightly because
 `rustfmt.toml` uses the unstable `imports_granularity` / `group_imports`
 options. Each crate declares its own dependencies (no `[workspace.dependencies]`),
 kept current with `cargo upgrade --incompatible`. Release Drafter maintains a draft release and autolabels PRs.
