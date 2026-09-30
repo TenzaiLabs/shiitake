@@ -4,7 +4,7 @@
 # static musl binary so the runtime image can be a minimal Alpine.
 #
 # Build context is the repository root: `docker build -f Dockerfile.server .`
-FROM rust:1-slim-trixie@sha256:bce1476d4be4d78b83705bc5f428b86d640eeeea33e9dadafbc037b5703a53bf AS builder
+FROM rust:1-slim-trixie@sha256:4cd829461bd5c4d511c32e269da9cb8929223b666519d8004e35fc8d1d771ab7 AS builder
 ARG TARGETARCH
 RUN apt-get update \
  && apt-get install -y --no-install-recommends musl-tools \
@@ -25,7 +25,7 @@ RUN set -eux; \
 
 # The server makes outbound TLS calls to the Kubernetes API (container-OOM
 # detection) so it needs a CA bundle; it never executes user commands itself.
-FROM alpine:3.24@sha256:a2d49ea686c2adfe3c992e47dc3b5e7fa6e6b5055609400dc2acaeb241c829f4
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /out/shiitake-server /usr/local/bin/shiitake-server
 USER 65532:65532
