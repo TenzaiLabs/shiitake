@@ -20,6 +20,7 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         workers_idle: idle,
         workers_inflight: inflight,
         workers_interactive: state.pool.interactive_count().await,
+        workers_sessions: state.pool.session_count().await,
     })
 }
 
@@ -42,6 +43,7 @@ pub async fn ready(State(state): State<AppState>) -> (StatusCode, Json<ReadyResp
             service: SERVICE.into(),
             workers_idle: idle,
             workers_inflight: inflight,
+            workers_sessions: state.pool.session_count().await,
             workers_required: state.min_ready_workers,
         }),
     )

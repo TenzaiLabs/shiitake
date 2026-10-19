@@ -66,6 +66,7 @@ async fn dispatch_with_one_fake_worker_marks_handle_completed() {
         let hello = serde_json::to_string(&Frame::Hello {
             location: None,
             worker_id: WorkerId::new("fake-0"),
+            profile: "default".into(),
         })
         .unwrap();
         ws.send(Message::Text(hello.into())).await.unwrap();
@@ -156,6 +157,7 @@ async fn worker_drop_marks_handle_worker_died() {
         let hello = serde_json::to_string(&Frame::Hello {
             location: None,
             worker_id: WorkerId::new("doomed"),
+            profile: "default".into(),
         })
         .unwrap();
         ws.send(Message::Text(hello.into())).await.unwrap();
@@ -250,6 +252,7 @@ async fn serial_dispatch_rotates_through_idle_workers() {
         let mut ws = connect_worker(addr.port()).await;
         let hello = serde_json::to_string(&Frame::Hello {
             worker_id: WorkerId::new(*id),
+            profile: "default".into(),
             location: None,
         })
         .unwrap();

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """End-to-end checks against a live shiitake-server + worker pool.
 
-Talks to the server over HTTP exactly the way any client would: POST /exec to
-spawn, poll GET /exec/{handle}, stream output from /exec/{handle}/{stdout,stderr}.
+Talks to the server over HTTP exactly the way any client would: create a
+session, submit commands, poll their handles, then release the session.
 Standard library only — no third-party packages.
 
 Config via env:
@@ -58,21 +58,32 @@ def _request(method, path, body=None, token=TOKEN):
 # end: what we executed, how long it took, and how many 429s the pool returned.
 _COMMANDS = {}  # handle -> dict(cmd, spawned_at, retries_429, status, exit_cause, seconds)
 _TOTAL_429 = 0
+_SESSIONS = {}  # handle -> session id
+_RELEASED = set()
 
 
-def spawn(command, env=None, timeout=300.0, workdir=None, busy_deadline=90.0):
-    """POST /exec, retrying while the pool is exhausted (429). `command` is a
-    shell command run as `bash -c <command>`."""
+def spawn(command, env=None, timeout=300.0, workdir=None, busy_deadline=90.0,
+          profile="default", mode="parallel"):
+    """Reserve a worker, submit a command, and remember its session for release."""
     global _TOTAL_429
-    body = {"command": command, "timeout": timeout, "env": env or {}}
+    body = {"profile": profile, "env": env or {}}
     if workdir is not None:
         body["workdir"] = workdir
     deadline = time.monotonic() + busy_deadline
     retries = 0
     while True:
-        status, payload = _request("POST", "/exec", body)
-        if status == 202:
-            handle = payload["handle"]
+        status, payload = _request("POST", "/sessions", body)
+        if status == 201:
+            sid = payload["session_id"]
+            status, command_payload = _request(
+                "POST", f"/sessions/{sid}/commands",
+                {"command": command, "timeout": timeout, "mode": mode},
+            )
+            if status != 202:
+                _request("DELETE", f"/sessions/{sid}")
+                raise AssertionError(f"submit command -> {status}: {command_payload}")
+            handle = command_payload["handle"]
+            _SESSIONS[handle] = sid
             _COMMANDS[handle] = {
                 "cmd": command,
                 "spawned_at": time.monotonic(),
@@ -87,7 +98,11 @@ def spawn(command, env=None, timeout=300.0, workdir=None, busy_deadline=90.0):
             _TOTAL_429 += 1
             time.sleep(0.5)
             continue
-        raise AssertionError(f"POST /exec -> {status}: {payload}")
+        raise AssertionError(f"POST /sessions -> {status}: {payload}")
+
+
+def command_path(handle):
+    return f"/sessions/{_SESSIONS[handle]}/commands/{handle}"
 
 
 def wait_for_idle(count, deadline=60.0):
@@ -112,8 +127,8 @@ def wait_for_idle(count, deadline=60.0):
 
 
 def get_status(handle):
-    status, payload = _request("GET", f"/exec/{handle}")
-    assert status == 200, f"GET /exec/{handle} -> {status}: {payload}"
+    status, payload = _request("GET", command_path(handle))
+    assert status == 200, f"GET command {handle} -> {status}: {payload}"
     return payload
 
 
@@ -127,6 +142,10 @@ def wait(handle, deadline=90.0):
                 rec["seconds"] = time.monotonic() - rec["spawned_at"]
                 rec["status"] = snap["status"]
                 rec["exit_cause"] = snap.get("exit_cause")
+            if handle not in _RELEASED:
+                released, details = _request("DELETE", f"/sessions/{_SESSIONS[handle]}")
+                assert released == 200, f"release session -> {released}: {details}"
+                _RELEASED.add(handle)
             return snap
         if time.monotonic() > end:
             raise AssertionError(f"handle {handle} still running after {deadline}s: {snap}")
@@ -136,7 +155,7 @@ def wait(handle, deadline=90.0):
 def read_stream(handle, stream, range_header=None):
     """Raw GET of a capture stream. Returns (status, bytes). The endpoint
     serves the file directly, honouring an optional HTTP Range header."""
-    url = f"{BASE}/api/v1/exec/{handle}/{stream}"
+    url = f"{BASE}/api/v1{command_path(handle)}/{stream}"
     headers = {}
     if TOKEN:
         headers["Authorization"] = f"Bearer {TOKEN}"
@@ -158,8 +177,10 @@ def read_all(handle, stream):
     return body.decode(errors="replace")
 
 
-def run(command, env=None, timeout=300.0, workdir=None, wait_deadline=90.0):
-    handle = spawn(command, env=env, timeout=timeout, workdir=workdir)
+def run(command, env=None, timeout=300.0, workdir=None, wait_deadline=90.0,
+        profile="default", mode="parallel"):
+    handle = spawn(command, env=env, timeout=timeout, workdir=workdir,
+                   profile=profile, mode=mode)
     snap = wait(handle, deadline=wait_deadline)
     return snap, read_all(handle, "stdout"), read_all(handle, "stderr")
 
@@ -204,13 +225,13 @@ class HealthAndAuth(unittest.TestCase):
     def test_04_auth_required(self):
         if not TOKEN:
             self.skipTest("auth disabled")
-        status, _ = _request("GET", "/exec/does-not-exist", token=None)
+        status, _ = _request("GET", "/sessions/does-not-exist", token=None)
         self.assertEqual(status, 401)
-        status, _ = _request("GET", "/exec/does-not-exist", token="wrong-token")
+        status, _ = _request("GET", "/sessions/does-not-exist", token="wrong-token")
         self.assertEqual(status, 401)
 
     def test_05_unknown_handle_404(self):
-        status, _ = _request("GET", "/exec/00000000000000000000000000000000")
+        status, _ = _request("GET", "/sessions/00000000000000000000000000000000")
         self.assertEqual(status, 404)
 
 
@@ -292,7 +313,7 @@ class Lifecycle(unittest.TestCase):
         handle = spawn("sleep 30", env=PATH_ENV, timeout=60.0)
         # Give the worker a moment to actually start the command.
         time.sleep(1.0)
-        status, payload = _request("DELETE", f"/exec/{handle}")
+        status, payload = _request("DELETE", command_path(handle))
         self.assertEqual(status, 200, msg=payload)
         snap = wait(handle, deadline=20.0)
         self.assertTrue(snap["cancelled"])
@@ -344,8 +365,14 @@ class Readiness(unittest.TestCase):
         the whole pool must therefore keep the pod ready — gating on idle
         workers would pull it out of rotation exactly under load, which is the
         failure this endpoint exists to avoid."""
-        idle = wait_for_idle(2)
-        handles = [spawn("sleep 3", env=PATH_ENV, timeout=30.0) for _ in range(idle)]
+        wait_for_idle(POOL_SIZE)
+        status, profiles = _request("GET", "/profiles")
+        self.assertEqual(status, 200)
+        handles = []
+        for profile in profiles:
+            for _ in range(profile["idle"]):
+                handles.append(spawn("sleep 3", env=PATH_ENV, timeout=30.0,
+                                     profile=profile["name"]))
         try:
             # Poll across the busy window: every sample must be ready, and at
             # least one must catch the pool with no idle worker left.
@@ -360,12 +387,67 @@ class Readiness(unittest.TestCase):
                 time.sleep(0.1)
             self.assertTrue(
                 saw_no_idle,
-                f"pool never ran out of idle workers after dispatching {idle} commands; "
+                f"pool never ran out of idle workers after dispatching {len(handles)} commands; "
                 "readiness was not exercised under load",
             )
         finally:
             for h in handles:
                 wait(h, deadline=30.0)
+
+
+class SessionsAndProfiles(unittest.TestCase):
+    def test_60_profile_selection_and_mounts(self):
+        status, profiles = _request("GET", "/profiles")
+        self.assertEqual(status, 200)
+        self.assertGreaterEqual({p["name"] for p in profiles}, {"default", "isolated"})
+        _, shared, _ = run("test -d /shared && echo YES || echo NO", profile="default")
+        _, isolated, _ = run("test -d /shared && echo YES || echo NO", profile="isolated")
+        self.assertEqual(shared.strip(), "YES")
+        self.assertEqual(isolated.strip(), "NO")
+
+    def test_61_stateful_context_and_parallel_jobs(self):
+        status, session = _request("POST", "/sessions", {
+            "profile": "default", "env": PATH_ENV, "workdir": "/tmp",
+        })
+        self.assertEqual(status, 201, session)
+        sid = session["session_id"]
+        try:
+            status, job = _request("POST", f"/sessions/{sid}/commands", {
+                "command": "cd /; export SESSION_MARKER=kept", "mode": "stateful",
+            })
+            self.assertEqual(status, 202, job)
+            setup = job["handle"]
+            while True:
+                _, snap = _request("GET", f"/sessions/{sid}/commands/{setup}")
+                if snap["status"] != "running":
+                    break
+                time.sleep(0.1)
+            self.assertEqual(snap["exit_code"], 0, snap)
+            handles = []
+            for command in ("sleep 1; echo $SESSION_MARKER", "sleep 1; pwd"):
+                status, job = _request("POST", f"/sessions/{sid}/commands", {
+                    "command": command, "mode": "parallel",
+                })
+                self.assertEqual(status, 202, job)
+                handles.append(job["handle"])
+            for handle, expected in zip(handles, ("kept\n", "/\n")):
+                while True:
+                    _, snap = _request("GET", f"/sessions/{sid}/commands/{handle}")
+                    if snap["status"] != "running":
+                        break
+                    time.sleep(0.1)
+                self.assertEqual(snap["exit_code"], 0, snap)
+                url = f"{BASE}/api/v1/sessions/{sid}/commands/{handle}/stdout"
+                req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TOKEN}"})
+                with urllib.request.urlopen(req) as resp:
+                    self.assertEqual(resp.read().decode(), expected)
+        finally:
+            status, payload = _request("DELETE", f"/sessions/{sid}")
+            self.assertEqual(status, 200, payload)
+
+    def test_62_unknown_profile(self):
+        status, _ = _request("POST", "/sessions", {"profile": "missing"})
+        self.assertEqual(status, 404)
 
 
 def print_summary():

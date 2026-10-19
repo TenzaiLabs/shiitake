@@ -2,8 +2,9 @@
 //! (de)serializes the `shiitake-server-api` types.
 
 use shiitake_server_api::{
-    DropTo, ExecRequest, HandleSnapshotJson, HealthResponse, ReadyResponse, SpawnResponse,
-    StatusResponse,
+    CreateSessionRequest, DropTo, HandleSnapshotJson, HealthResponse, ProfileResponse,
+    ReadyResponse, SessionCommandMode, SessionCommandRequest, SessionId, SessionResponse,
+    SpawnResponse, StatusResponse,
 };
 use std::collections::BTreeMap;
 
@@ -49,6 +50,52 @@ pub struct Client {
     auth_token: Option<String>,
 }
 
+/// A worker reserved in one profile. Call `release` when finished.
+pub struct Session<'a> {
+    client: &'a Client,
+    pub details: SessionResponse,
+}
+
+impl Session<'_> {
+    pub async fn submit(
+        &self,
+        command: impl Into<String>,
+        timeout: f64,
+        mode: SessionCommandMode,
+    ) -> Result<SpawnResponse, ClientError> {
+        self.client
+            .submit(&self.details.session_id, command, timeout, mode)
+            .await
+    }
+
+    pub async fn status(&self, handle: &str) -> Result<StatusResponse, ClientError> {
+        self.client
+            .command_status(&self.details.session_id, handle)
+            .await
+    }
+
+    pub async fn kill(&self, handle: &str) -> Result<HandleSnapshotJson, ClientError> {
+        self.client
+            .kill_command(&self.details.session_id, handle)
+            .await
+    }
+
+    pub async fn read(
+        &self,
+        handle: &str,
+        stream: Stream,
+        range: Option<&str>,
+    ) -> Result<ReadChunk, ClientError> {
+        self.client
+            .read_command(&self.details.session_id, handle, stream, range)
+            .await
+    }
+
+    pub async fn release(self) -> Result<SessionResponse, ClientError> {
+        self.client.release_session(&self.details.session_id).await
+    }
+}
+
 impl Client {
     /// `base_url` is the server origin, e.g. `http://localhost:8080`. The
     /// `/api/v1` prefix is added by the client.
@@ -71,78 +118,123 @@ impl Client {
         }
     }
 
-    /// Spawn a command. `command` is run as `bash -c <command>`.
-    pub async fn spawn(
+    pub async fn profiles(&self) -> Result<Vec<ProfileResponse>, ClientError> {
+        let resp = self
+            .auth(self.http.get(self.url("/profiles")))
+            .send()
+            .await?;
+        Ok(error_for_status(resp).await?.json().await?)
+    }
+
+    pub async fn create_session(
         &self,
-        command: impl Into<String>,
+        profile: impl Into<String>,
         workdir: Option<String>,
-        timeout: f64,
         env: BTreeMap<String, String>,
         drop_to: Option<DropTo>,
-    ) -> Result<SpawnResponse, ClientError> {
-        let body = ExecRequest {
-            command: command.into(),
+    ) -> Result<Session<'_>, ClientError> {
+        let body = CreateSessionRequest {
+            profile: profile.into(),
             workdir,
-            timeout,
             env,
             drop_to,
+            cols: 80,
+            rows: 24,
         };
         let resp = self
-            .auth(self.http.post(self.url("/exec")).json(&body))
+            .auth(self.http.post(self.url("/sessions")).json(&body))
             .send()
             .await?;
         if resp.status().as_u16() == 429 {
             return Err(ClientError::NoIdleWorker);
         }
-        Ok(error_for_status(resp).await?.json().await?)
+        let details = error_for_status(resp).await?.json().await?;
+        Ok(Session {
+            client: self,
+            details,
+        })
     }
 
-    pub async fn status(&self, handle: &str) -> Result<StatusResponse, ClientError> {
+    pub async fn session_status(&self, id: &SessionId) -> Result<SessionResponse, ClientError> {
         let resp = self
-            .auth(self.http.get(self.url(&format!("/exec/{handle}"))))
+            .auth(self.http.get(self.url(&format!("/sessions/{id}"))))
             .send()
             .await?;
         Ok(error_for_status(resp).await?.json().await?)
     }
 
-    pub async fn kill(&self, handle: &str) -> Result<HandleSnapshotJson, ClientError> {
+    pub async fn release_session(&self, id: &SessionId) -> Result<SessionResponse, ClientError> {
         let resp = self
-            .auth(self.http.delete(self.url(&format!("/exec/{handle}"))))
+            .auth(self.http.delete(self.url(&format!("/sessions/{id}"))))
             .send()
             .await?;
         Ok(error_for_status(resp).await?.json().await?)
     }
 
-    pub async fn health(&self) -> Result<HealthResponse, ClientError> {
-        let resp = self.http.get(self.url("/health")).send().await?;
-        Ok(error_for_status(resp).await?.json().await?)
-    }
-
-    /// Readiness: whether the pool has enough registered workers to serve.
-    /// The server answers `503` when it is not ready, which is a valid answer
-    /// rather than a transport failure — the verdict is returned on
-    /// [`ReadyResponse::ready`] either way.
-    pub async fn ready(&self) -> Result<ReadyResponse, ClientError> {
-        let resp = self.http.get(self.url("/ready")).send().await?;
-        if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-            return Ok(resp.json().await?);
-        }
-        Ok(error_for_status(resp).await?.json().await?)
-    }
-
-    /// Read a slice of a captured stream. `range` is an HTTP byte-range spec
-    /// such as `bytes=0-` or `bytes=-4096`; `None` fetches the whole stream.
-    /// Reading past EOF yields an empty chunk rather than an error.
-    pub async fn read(
+    pub async fn submit(
         &self,
+        id: &SessionId,
+        command: impl Into<String>,
+        timeout: f64,
+        mode: SessionCommandMode,
+    ) -> Result<SpawnResponse, ClientError> {
+        let body = SessionCommandRequest {
+            command: command.into(),
+            timeout,
+            mode,
+        };
+        let resp = self
+            .auth(
+                self.http
+                    .post(self.url(&format!("/sessions/{id}/commands")))
+                    .json(&body),
+            )
+            .send()
+            .await?;
+        Ok(error_for_status(resp).await?.json().await?)
+    }
+
+    pub async fn command_status(
+        &self,
+        id: &SessionId,
+        handle: &str,
+    ) -> Result<StatusResponse, ClientError> {
+        let resp = self
+            .auth(
+                self.http
+                    .get(self.url(&format!("/sessions/{id}/commands/{handle}"))),
+            )
+            .send()
+            .await?;
+        Ok(error_for_status(resp).await?.json().await?)
+    }
+
+    pub async fn kill_command(
+        &self,
+        id: &SessionId,
+        handle: &str,
+    ) -> Result<HandleSnapshotJson, ClientError> {
+        let resp = self
+            .auth(
+                self.http
+                    .delete(self.url(&format!("/sessions/{id}/commands/{handle}"))),
+            )
+            .send()
+            .await?;
+        Ok(error_for_status(resp).await?.json().await?)
+    }
+
+    pub async fn read_command(
+        &self,
+        id: &SessionId,
         handle: &str,
         stream: Stream,
         range: Option<&str>,
     ) -> Result<ReadChunk, ClientError> {
-        let mut rb = self.auth(
-            self.http
-                .get(self.url(&format!("/exec/{handle}/{}", stream.as_str()))),
-        );
+        let mut rb = self.auth(self.http.get(self.url(&format!(
+            "/sessions/{id}/commands/{handle}/{}",
+            stream.as_str()
+        ))));
         if let Some(r) = range {
             rb = rb.header(reqwest::header::RANGE, r);
         }
@@ -164,8 +256,27 @@ impl Client {
             .get(reqwest::header::CONTENT_RANGE)
             .and_then(|v| v.to_str().ok())
             .and_then(parse_total);
-        let bytes = resp.bytes().await?.to_vec();
-        Ok(ReadChunk { bytes, total })
+        Ok(ReadChunk {
+            bytes: resp.bytes().await?.to_vec(),
+            total,
+        })
+    }
+
+    pub async fn health(&self) -> Result<HealthResponse, ClientError> {
+        let resp = self.http.get(self.url("/health")).send().await?;
+        Ok(error_for_status(resp).await?.json().await?)
+    }
+
+    /// Readiness: whether the pool has enough registered workers to serve.
+    /// The server answers `503` when it is not ready, which is a valid answer
+    /// rather than a transport failure — the verdict is returned on
+    /// [`ReadyResponse::ready`] either way.
+    pub async fn ready(&self) -> Result<ReadyResponse, ClientError> {
+        let resp = self.http.get(self.url("/ready")).send().await?;
+        if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            return Ok(resp.json().await?);
+        }
+        Ok(error_for_status(resp).await?.json().await?)
     }
 }
 

@@ -43,6 +43,29 @@ impl ExecId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Display)]
+#[serde(transparent)]
+#[display("{_0}")]
+pub struct SessionId(String);
+
+impl SessionId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+pub fn default_profile() -> String {
+    "default".to_string()
+}
+
+fn is_default_profile(profile: &String) -> bool {
+    profile == "default"
+}
+
 /// Optional privilege-drop directive carried on an Execute frame.
 ///
 /// When present, the worker performs `setgid → setgroups → setuid → umask`
@@ -95,6 +118,11 @@ pub enum Frame {
     /// Worker → server: first frame after connect, advertises availability.
     Hello {
         worker_id: WorkerId,
+        #[serde(
+            default = "default_profile",
+            skip_serializing_if = "is_default_profile"
+        )]
+        profile: String,
         /// For the server's OOM probe. Omitted when the worker has no pod
         /// identity (local runs); the server then falls back to its own pod.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -105,12 +133,43 @@ pub enum Frame {
     /// Server → worker: cancel the in-flight command. Worker SIGKILLs the
     /// process group and follows up with a Result frame whose `cancelled`
     /// flag is set.
-    Cancel { request_id: ExecId },
+    Cancel {
+        request_id: ExecId,
+    },
     /// Worker → server: the result of an Execute. The output lives on
     /// disk under `<capture_root>/<request_id>/{stdout,stderr}` — the server
     /// stats those files for byte counts, so only exit metadata and the
     /// per-command resource usage travel on the wire.
     Result(ResultFrame),
+
+    /// A worker remains reserved from Open until Closed. Commands may overlap
+    /// within that interval; the identity belongs to the session, not a job.
+    SessionOpen(SessionOpenFrame),
+    SessionReady {
+        session_id: SessionId,
+        error: Option<String>,
+    },
+    SessionRun {
+        session_id: SessionId,
+        execute: ExecuteFrame,
+        #[serde(default)]
+        mode: SessionCommandMode,
+    },
+    SessionClose {
+        session_id: SessionId,
+    },
+    SessionClosed {
+        session_id: SessionId,
+        error: Option<String>,
+        /// False when the worker is recycling or its reset failed.
+        #[serde(default = "session_reusable_default")]
+        reusable: bool,
+    },
+    SessionResize {
+        session_id: SessionId,
+        cols: u16,
+        rows: u16,
+    },
 
     /// Server → worker: open an interactive PTY and spawn a shell on it. Unlike
     /// `Execute`, the session is persistent and bidirectional: its byte stream
@@ -126,7 +185,9 @@ pub enum Frame {
     },
     /// Server → worker: end the session — SIGHUP the process group and close the
     /// pty. Idempotent with a `PtyExit` the worker may already have sent.
-    PtyClose { session_id: ExecId },
+    PtyClose {
+        session_id: ExecId,
+    },
     /// Worker → server: the shell exited, or the pty could not be opened
     /// (`error` set). Terminal frame; the worker then resets and rejoins idle.
     PtyExit {
@@ -136,6 +197,88 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionOpenFrame {
+    pub session_id: SessionId,
+    pub working_dir: String,
+    pub env: BTreeMap<String, String>,
+    pub drop_to: Option<DropTo>,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+fn session_reusable_default() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCommandMode {
+    #[default]
+    Stateful,
+    Parallel,
+}
+
+/// Binary output on the dispatch socket. The first byte is the stream, then a
+/// u16 big-endian id length, UTF-8 id bytes, and raw output bytes. Stream 3 is
+/// client terminal input; streams 0/1/2 are worker stdout/stderr/PTY output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OutputStream {
+    Stdout = 0,
+    Stderr = 1,
+    Terminal = 2,
+    Stdin = 3,
+}
+
+impl TryFrom<u8> for OutputStream {
+    type Error = &'static str;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Stdout),
+            1 => Ok(Self::Stderr),
+            2 => Ok(Self::Terminal),
+            3 => Ok(Self::Stdin),
+            _ => Err("unknown output stream"),
+        }
+    }
+}
+
+pub struct OutputChunk<'a> {
+    pub stream: OutputStream,
+    pub id: &'a str,
+    pub bytes: &'a [u8],
+}
+
+impl<'a> OutputChunk<'a> {
+    pub fn encode(&self) -> Vec<u8> {
+        let len = u16::try_from(self.id.len()).expect("id fits in output header");
+        let mut out = Vec::with_capacity(3 + self.id.len() + self.bytes.len());
+        out.push(self.stream as u8);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(self.id.as_bytes());
+        out.extend_from_slice(self.bytes);
+        out
+    }
+
+    pub fn decode(bytes: &'a [u8]) -> Result<Self, &'static str> {
+        if bytes.len() < 3 {
+            return Err("short output header");
+        }
+        let stream = OutputStream::try_from(bytes[0])?;
+        let len = usize::from(u16::from_be_bytes([bytes[1], bytes[2]]));
+        if bytes.len() < 3 + len {
+            return Err("short output id");
+        }
+        let id = std::str::from_utf8(&bytes[3..3 + len]).map_err(|_| "invalid output id")?;
+        Ok(Self {
+            stream,
+            id,
+            bytes: &bytes[3 + len..],
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,6 +369,7 @@ mod tests {
     fn worker_id_is_wire_transparent() {
         let frame = Frame::Hello {
             worker_id: WorkerId::new("worker-0"),
+            profile: default_profile(),
             location: None,
         };
         let json = serde_json::to_string(&frame).unwrap();
@@ -249,6 +393,7 @@ mod tests {
     fn hello_carries_an_optional_worker_location() {
         let frame = Frame::Hello {
             worker_id: WorkerId::new("worker-0"),
+            profile: default_profile(),
             location: Some(WorkerLocation {
                 pod: "shiitake-workers-abc".into(),
                 namespace: "shiitake".into(),
@@ -320,6 +465,7 @@ mod documented_frames {
         let Frame::Hello {
             worker_id,
             location,
+            ..
         } = f
         else {
             panic!("expected Hello")

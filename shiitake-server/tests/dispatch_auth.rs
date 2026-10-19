@@ -85,6 +85,7 @@ async fn accepts_a_worker_presenting_the_token() {
     // A Hello from another pod, the shape the split topology sends.
     let hello = serde_json::to_string(&Frame::Hello {
         worker_id: WorkerId::new("shiitake-workers-xyz"),
+        profile: "default".into(),
         location: Some(WorkerLocation {
             pod: "shiitake-workers-xyz".into(),
             namespace: "shiitake".into(),

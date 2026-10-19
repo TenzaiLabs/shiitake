@@ -32,9 +32,29 @@ spec:
               "root" $
               "name" (printf "worker-%d" $i)
               "workerId" (printf "worker-%d" $i)
+              "profile" $.Values.worker.profile
+              "resources" $.Values.worker.resources
+              "sharedFolder" $.Values.worker.sharedFolder
+              "dispatchUrl" (printf "ws://127.0.0.1:%v/dispatch" $.Values.server.dispatchPort)
+              "perContainerRestart" true) | nindent 8 }}
+        {{- end }}
+        {{- range $profile := .Values.workerProfiles }}
+        {{- range $i := until (int $profile.count) }}
+        {{- include "shiitake.workerContainer" (dict
+              "root" $
+              "name" (printf "%s-%d" $profile.name $i)
+              "workerId" (printf "%s-%d" $profile.name $i)
+              "profile" $profile.name
+              "dispatchToken" $profile.dispatchToken
+              "resources" $profile.resources
+              "sharedFolder" $profile.sharedFolder
               "dispatchUrl" (printf "ws://127.0.0.1:%v/dispatch" $.Values.server.dispatchPort)
               "perContainerRestart" true) | nindent 8 }}
         {{- end }}
         {{- end }}
+        {{- end }}
       volumes:
         {{- include "shiitake.captureVolume" (dict "root" .) | nindent 8 }}
+        {{- if and (ne .Values.topology "two-pod") .Values.worker.sharedFolder }}
+        {{- include "shiitake.sharedFolderVolume" (dict "root" .) | nindent 8 }}
+        {{- end }}

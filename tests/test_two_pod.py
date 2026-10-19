@@ -3,8 +3,8 @@
 
 test_exec.py must pass in either topology — the contract doesn't change when the
 server and the workers stop sharing a pod. Checked here is what the split makes
-newly true: commands running in worker pods of their own, capture spanning both
-pods, and a NetworkPolicy confining the workers but not the server.
+newly true: commands running in worker pods of their own, streamed output
+without a shared capture volume, and a NetworkPolicy confining the workers.
 
 Run against a cluster deployed with `topology=two-pod` (tests/setup.sh with
 SHIITAKE_E2E_TOPOLOGY=two-pod). Config via env, on top of test_exec.py's:
@@ -77,13 +77,14 @@ class Topology(unittest.TestCase):
             )
         self.assertEqual(len({s["worker_id"] for s in snaps}), 2, msg=snaps)
 
-    def test_02_capture_volume_spans_both_pods(self):
-        # The worker writes in its pod, the server serves from its own. Anything
-        # less than a shared volume reads back empty or short.
+    def test_02_output_streams_without_a_shared_volume(self):
+        # The isolated profile mounts no application volume shared with the
+        # server; all bytes must travel over the dispatch connection.
         size = 256 * 1024
         snap, out, _ = run(
             f"python3 -c 'print(\"x\" * {size})'",
             env=PATH_ENV,
+            profile="isolated",
             wait_deadline=60.0,
         )
         self.assertEqual(snap["status"], "completed", msg=snap)

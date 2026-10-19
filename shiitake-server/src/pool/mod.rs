@@ -24,16 +24,20 @@ use futures_util::{
     stream::{SplitSink, SplitStream},
 };
 use shiitake_worker_api::{
-    ExecId, ExecuteFrame, Frame, ResourceUsage, ResultFrame, WorkerId, WorkerLocation, capture,
+    ExecId, ExecuteFrame, Frame, OutputChunk, OutputStream, ResourceUsage, ResultFrame,
+    SessionCommandMode, SessionId, SessionOpenFrame, WorkerId, WorkerLocation, capture,
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 use thiserror::Error;
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{Mutex, Notify, mpsc, oneshot},
+};
 use tracing::{Span, info, warn};
 
 pub type WorkerSink = SplitSink<WebSocket, Message>;
@@ -59,6 +63,9 @@ pub enum DispatchError {
 struct PendingEntry {
     sink: SharedSink,
     worker_id: WorkerId,
+    profile: String,
+    session_id: Option<SessionId>,
+    mode: SessionCommandMode,
     started_at: Instant,
 }
 
@@ -71,6 +78,51 @@ struct PoolState {
     /// here, its read loop forwards output/PtyExit to the session instead of
     /// routing Result frames.
     pty_sessions: HashMap<WorkerId, mpsc::Sender<PtyEvent>>,
+    sessions: HashMap<SessionId, SessionRecord>,
+    worker_sessions: HashMap<WorkerId, SessionId>,
+}
+
+struct SessionRecord {
+    worker_id: WorkerId,
+    profile: String,
+    sink: SharedSink,
+    /// Orders SessionRun before SessionClose when submit and release race.
+    send_lock: Arc<Mutex<()>>,
+    state: shiitake_server_api::SessionState,
+    created_at: SystemTime,
+    finished_at: Option<SystemTime>,
+    opened: Option<oneshot::Sender<Result<(), String>>>,
+    closed: Vec<oneshot::Sender<()>>,
+    terminal: Option<mpsc::Sender<TerminalEvent>>,
+    working_dir: String,
+    env: std::collections::BTreeMap<String, String>,
+    drop_to: Option<shiitake_worker_api::DropTo>,
+    stateful_count: usize,
+}
+
+#[derive(Clone)]
+pub struct SessionSnapshot {
+    pub session_id: SessionId,
+    pub worker_id: WorkerId,
+    pub profile: String,
+    pub state: shiitake_server_api::SessionState,
+    pub created_at: SystemTime,
+}
+
+#[derive(Debug, Error)]
+pub enum SessionError {
+    #[error("unknown profile")]
+    UnknownProfile,
+    #[error("no idle worker in profile")]
+    Busy,
+    #[error("session not found")]
+    NotFound,
+    #[error("session is not active")]
+    NotActive,
+    #[error("terminal is attached or a stateful command is active")]
+    TerminalBusy,
+    #[error("worker failed: {0}")]
+    Worker(String),
 }
 
 /// Bounded backlog of pty output events per session. A slow client fills this,
@@ -88,10 +140,12 @@ struct WorkerLiveness {
     /// Where this worker's container runs, as reported on `Hello`. Read on
     /// disconnect to aim the OOM probe; see [`WorkerPool::worker_location`].
     location: Option<WorkerLocation>,
+    profile: String,
 }
 
 struct WorkerEntry {
     worker_id: WorkerId,
+    profile: String,
     sink: SharedSink,
 }
 
@@ -102,6 +156,7 @@ struct HandleRow {
 
 struct HandleStateInner {
     handle_id: ExecId,
+    session_id: Option<SessionId>,
     worker_id: WorkerId,
     started_at: SystemTime,
     inner: Mutex<HandleRuntime>,
@@ -130,6 +185,7 @@ struct HandleRuntime {
 #[derive(Debug, Clone)]
 pub struct HandleSnapshot {
     pub handle_id: ExecId,
+    pub session_id: Option<SessionId>,
     pub worker_id: WorkerId,
     pub started_at: SystemTime,
     pub status: HandleStatus,
@@ -159,6 +215,7 @@ pub enum PtyEvent {
 /// `recv`; `release_pinned` returns the worker to the pool.
 pub struct PinnedSession {
     pub worker_id: WorkerId,
+    profile: String,
     sink: SharedSink,
     output: mpsc::Receiver<PtyEvent>,
 }
@@ -175,6 +232,56 @@ impl PinnedSession {
     pub async fn recv(&mut self) -> Option<PtyEvent> {
         self.output.recv().await
     }
+}
+
+pub struct TerminalAttachment {
+    pub session_id: SessionId,
+    sink: SharedSink,
+    output: mpsc::Receiver<TerminalEvent>,
+}
+
+pub enum TerminalEvent {
+    Output(Vec<u8>),
+    Closed(Option<String>),
+}
+
+impl TerminalAttachment {
+    pub fn writer(&self) -> SharedSink {
+        self.sink.clone()
+    }
+    pub async fn recv(&mut self) -> Option<TerminalEvent> {
+        self.output.recv().await
+    }
+    pub async fn send(&self, bytes: &[u8]) -> Result<(), String> {
+        let chunk = OutputChunk {
+            stream: OutputStream::Stdin,
+            id: self.session_id.as_str(),
+            bytes,
+        };
+        self.sink
+            .lock()
+            .await
+            .send(Message::Binary(chunk.encode().into()))
+            .await
+            .map_err(|e| e.to_string())
+    }
+    pub async fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+        let frame = Frame::SessionResize {
+            session_id: self.session_id.clone(),
+            cols,
+            rows,
+        };
+        send_frame(&self.sink, &frame).await
+    }
+}
+
+async fn send_frame(sink: &SharedSink, frame: &Frame) -> Result<(), String> {
+    let json = serde_json::to_string(frame).map_err(|e| e.to_string())?;
+    sink.lock()
+        .await
+        .send(Message::Text(json.into()))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[derive(Clone)]
@@ -200,6 +307,8 @@ impl WorkerPool {
                 handles: HashMap::new(),
                 liveness: HashMap::new(),
                 pty_sessions: HashMap::new(),
+                sessions: HashMap::new(),
+                worker_sessions: HashMap::new(),
             })),
             probe,
             pod_name,
@@ -239,12 +348,372 @@ impl WorkerPool {
     /// Snapshot for the /health and /ready endpoints: (idle, in-flight).
     pub async fn snapshot(&self) -> (usize, usize) {
         let s = self.state.lock().await;
-        (s.idle.len(), s.inflight.len())
+        let mut busy: HashSet<WorkerId> =
+            s.inflight.values().map(|p| p.worker_id.clone()).collect();
+        busy.extend(s.worker_sessions.keys().cloned());
+        busy.extend(s.pty_sessions.keys().cloned());
+        (s.idle.len(), busy.len())
     }
 
     /// Workers currently held by an interactive PTY session.
     pub async fn interactive_count(&self) -> usize {
         self.state.lock().await.pty_sessions.len()
+    }
+
+    pub async fn session_count(&self) -> usize {
+        self.state.lock().await.worker_sessions.len()
+    }
+
+    pub async fn profiles(&self) -> Vec<shiitake_server_api::ProfileResponse> {
+        let s = self.state.lock().await;
+        let mut counts: HashMap<String, (usize, usize)> = HashMap::new();
+        for l in s.liveness.values() {
+            counts.entry(l.profile.clone()).or_default();
+        }
+        for w in &s.idle {
+            counts.entry(w.profile.clone()).or_default().0 += 1;
+        }
+        for session in s.sessions.values() {
+            if matches!(
+                session.state,
+                shiitake_server_api::SessionState::Opening
+                    | shiitake_server_api::SessionState::Active
+                    | shiitake_server_api::SessionState::Closing
+            ) {
+                counts.entry(session.profile.clone()).or_default().1 += 1;
+            }
+        }
+        let mut out: Vec<_> = counts
+            .into_iter()
+            .map(
+                |(name, (idle, allocated))| shiitake_server_api::ProfileResponse {
+                    name,
+                    idle,
+                    allocated,
+                },
+            )
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    pub async fn session_snapshot(&self, id: &SessionId) -> Option<SessionSnapshot> {
+        let s = self.state.lock().await;
+        s.sessions.get(id).map(|r| SessionSnapshot {
+            session_id: id.clone(),
+            worker_id: r.worker_id.clone(),
+            profile: r.profile.clone(),
+            state: r.state,
+            created_at: r.created_at,
+        })
+    }
+
+    pub async fn create_session(
+        &self,
+        profile: String,
+        open: SessionOpenFrame,
+    ) -> Result<SessionSnapshot, SessionError> {
+        let id = open.session_id.clone();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let worker = {
+            let mut s = self.state.lock().await;
+            if !s.liveness.values().any(|w| w.profile == profile) {
+                return Err(SessionError::UnknownProfile);
+            }
+            let pos = s
+                .idle
+                .iter()
+                .position(|w| w.profile == profile)
+                .ok_or(SessionError::Busy)?;
+            let worker = s.idle.remove(pos).expect("position came from idle");
+            s.worker_sessions
+                .insert(worker.worker_id.clone(), id.clone());
+            s.sessions.insert(
+                id.clone(),
+                SessionRecord {
+                    worker_id: worker.worker_id.clone(),
+                    profile: profile.clone(),
+                    sink: worker.sink.clone(),
+                    send_lock: Arc::new(Mutex::new(())),
+                    state: shiitake_server_api::SessionState::Opening,
+                    created_at: SystemTime::now(),
+                    opened: Some(ready_tx),
+                    closed: Vec::new(),
+                    finished_at: None,
+                    terminal: None,
+                    working_dir: open.working_dir.clone(),
+                    env: open.env.clone(),
+                    drop_to: open.drop_to.clone(),
+                    stateful_count: 0,
+                },
+            );
+            worker
+        };
+        if let Err(e) = tokio::time::timeout(
+            Duration::from_secs(10),
+            send_frame(&worker.sink, &Frame::SessionOpen(open)),
+        )
+        .await
+        .map_err(|_| "session open send timed out".to_string())
+        .and_then(|result| result)
+        {
+            self.handle_worker_drop(&worker.worker_id).await;
+            return Err(SessionError::Worker(e));
+        }
+        match tokio::time::timeout(Duration::from_secs(10), ready_rx).await {
+            Ok(Ok(Ok(()))) => self
+                .session_snapshot(&id)
+                .await
+                .ok_or(SessionError::NotFound),
+            Ok(Ok(Err(e))) => Err(SessionError::Worker(e)),
+            Ok(Err(_)) => Err(SessionError::Worker(
+                "worker disconnected during open".into(),
+            )),
+            Err(_) => {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    send_frame(&worker.sink, &Frame::SessionClose { session_id: id }),
+                )
+                .await;
+                self.evict_worker(&worker.worker_id).await;
+                Err(SessionError::Worker("session open timed out".into()))
+            }
+        }
+    }
+
+    async fn evict_worker(&self, id: &WorkerId) {
+        let shutdown = {
+            let s = self.state.lock().await;
+            s.liveness.get(id).map(|l| l.shutdown.clone())
+        };
+        if let Some(shutdown) = shutdown {
+            shutdown.notify_one();
+        }
+    }
+
+    pub async fn close_session(&self, id: &SessionId) -> Result<SessionSnapshot, SessionError> {
+        let send_lock = {
+            let s = self.state.lock().await;
+            s.sessions
+                .get(id)
+                .ok_or(SessionError::NotFound)?
+                .send_lock
+                .clone()
+        };
+        let send_guard = send_lock.lock().await;
+        let (sink, worker_id, rx, send_close) = {
+            let mut s = self.state.lock().await;
+            let rec = s.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
+            if matches!(
+                rec.state,
+                shiitake_server_api::SessionState::Closed
+                    | shiitake_server_api::SessionState::Failed
+            ) {
+                return Ok(SessionSnapshot {
+                    session_id: id.clone(),
+                    worker_id: rec.worker_id.clone(),
+                    profile: rec.profile.clone(),
+                    state: rec.state,
+                    created_at: rec.created_at,
+                });
+            }
+            let (tx, rx) = oneshot::channel();
+            let send_close = rec.state != shiitake_server_api::SessionState::Closing;
+            rec.state = shiitake_server_api::SessionState::Closing;
+            rec.closed.push(tx);
+            (rec.sink.clone(), rec.worker_id.clone(), rx, send_close)
+        };
+        if send_close
+            && let Err(e) = tokio::time::timeout(
+                Duration::from_secs(10),
+                send_frame(
+                    &sink,
+                    &Frame::SessionClose {
+                        session_id: id.clone(),
+                    },
+                ),
+            )
+            .await
+            .map_err(|_| "session close send timed out".to_string())
+            .and_then(|result| result)
+        {
+            self.evict_worker(&worker_id).await;
+            return Err(SessionError::Worker(e));
+        }
+        drop(send_guard);
+        if tokio::time::timeout(Duration::from_secs(15), rx)
+            .await
+            .is_err()
+        {
+            self.evict_worker(&worker_id).await;
+            return Err(SessionError::Worker(
+                "session close timed out; worker evicted".into(),
+            ));
+        }
+        self.session_snapshot(id)
+            .await
+            .ok_or(SessionError::NotFound)
+    }
+
+    pub async fn submit_session_command(
+        &self,
+        id: &SessionId,
+        request_id: ExecId,
+        command: String,
+        timeout: f64,
+        mode: SessionCommandMode,
+    ) -> Result<HandleSnapshot, SessionError> {
+        let send_lock = {
+            let s = self.state.lock().await;
+            s.sessions
+                .get(id)
+                .ok_or(SessionError::NotFound)?
+                .send_lock
+                .clone()
+        };
+        let _send_guard = send_lock.lock().await;
+        let (worker_id, profile, sink, working_dir, env, drop_to) = {
+            let s = self.state.lock().await;
+            let rec = s.sessions.get(id).ok_or(SessionError::NotFound)?;
+            if rec.state != shiitake_server_api::SessionState::Active {
+                return Err(SessionError::NotActive);
+            }
+            if mode == SessionCommandMode::Stateful && rec.terminal.is_some() {
+                return Err(SessionError::TerminalBusy);
+            }
+            (
+                rec.worker_id.clone(),
+                rec.profile.clone(),
+                rec.sink.clone(),
+                rec.working_dir.clone(),
+                rec.env.clone(),
+                rec.drop_to.clone(),
+            )
+        };
+        let dir = capture::handle_dir(&self.capture_root, &request_id);
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| SessionError::Worker(e.to_string()))?;
+        for stream in [capture::Stream::Stdout, capture::Stream::Stderr] {
+            tokio::fs::File::create(capture::stream_path(
+                &self.capture_root,
+                &request_id,
+                stream,
+            ))
+            .await
+            .map_err(|e| SessionError::Worker(e.to_string()))?;
+        }
+        let started_at = SystemTime::now();
+        let span = tracing::info_span!("shiitake.exec", handle = %request_id,
+            worker = %worker_id, session = %id, profile = %profile,
+            exit_cause = tracing::field::Empty, exit_code = tracing::field::Empty,
+            duration_seconds = tracing::field::Empty);
+        let row = HandleRow {
+            state: Arc::new(HandleStateInner {
+                handle_id: request_id.clone(),
+                session_id: Some(id.clone()),
+                worker_id: worker_id.clone(),
+                started_at,
+                inner: Mutex::new(HandleRuntime {
+                    last_polled_at: started_at,
+                    status: HandleStatus::Running,
+                    finished_at: None,
+                    exit_code: None,
+                    exit_signal: None,
+                    exit_cause: None,
+                    timed_out: false,
+                    cancelled: false,
+                    span: Some(span),
+                }),
+                completion: Notify::new(),
+            }),
+        };
+        {
+            let mut s = self.state.lock().await;
+            let rec = s.sessions.get(id).ok_or(SessionError::NotFound)?;
+            if rec.state != shiitake_server_api::SessionState::Active {
+                return Err(SessionError::NotActive);
+            }
+            if mode == SessionCommandMode::Stateful && rec.terminal.is_some() {
+                return Err(SessionError::TerminalBusy);
+            }
+            s.inflight.insert(
+                request_id.clone(),
+                PendingEntry {
+                    sink: sink.clone(),
+                    worker_id: worker_id.clone(),
+                    profile,
+                    session_id: Some(id.clone()),
+                    mode,
+                    started_at: Instant::now(),
+                },
+            );
+            s.handles.insert(request_id.clone(), row.clone());
+            if mode == SessionCommandMode::Stateful
+                && let Some(rec) = s.sessions.get_mut(id)
+            {
+                rec.stateful_count += 1;
+            }
+        }
+        let execute = ExecuteFrame {
+            request_id: request_id.clone(),
+            command,
+            working_dir,
+            env,
+            timeout_secs: timeout,
+            drop_to,
+        };
+        if let Err(e) = tokio::time::timeout(
+            Duration::from_secs(10),
+            send_frame(
+                &sink,
+                &Frame::SessionRun {
+                    session_id: id.clone(),
+                    execute,
+                    mode,
+                },
+            ),
+        )
+        .await
+        .map_err(|_| "session command send timed out".to_string())
+        .and_then(|result| result)
+        {
+            self.handle_worker_drop(&worker_id).await;
+            return Err(SessionError::Worker(e));
+        }
+        let runtime = row.state.inner.lock().await;
+        Ok(snapshot_from(&row.state, &runtime))
+    }
+
+    pub async fn attach_terminal(
+        &self,
+        id: &SessionId,
+    ) -> Result<TerminalAttachment, SessionError> {
+        let mut s = self.state.lock().await;
+        let rec = s.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
+        if rec.state != shiitake_server_api::SessionState::Active {
+            return Err(SessionError::NotActive);
+        }
+        if rec.terminal.is_some() {
+            return Err(SessionError::Busy);
+        }
+        if rec.stateful_count > 0 {
+            return Err(SessionError::TerminalBusy);
+        }
+        let (tx, rx) = mpsc::channel(64);
+        rec.terminal = Some(tx);
+        Ok(TerminalAttachment {
+            session_id: id.clone(),
+            sink: rec.sink.clone(),
+            output: rx,
+        })
+    }
+
+    pub async fn detach_terminal(&self, id: &SessionId) {
+        let mut s = self.state.lock().await;
+        if let Some(rec) = s.sessions.get_mut(id) {
+            rec.terminal = None;
+        }
     }
 
     /// Pop an idle worker and pin it to a new PTY session. `None` when no worker
@@ -257,6 +726,7 @@ impl WorkerPool {
         s.pty_sessions.insert(worker.worker_id.clone(), tx);
         Some(PinnedSession {
             worker_id: worker.worker_id,
+            profile: worker.profile,
             sink: worker.sink,
             output: rx,
         })
@@ -271,6 +741,7 @@ impl WorkerPool {
         if s.liveness.contains_key(&session.worker_id) {
             s.idle.push_back(WorkerEntry {
                 worker_id: session.worker_id,
+                profile: session.profile,
                 sink: session.sink,
             });
         }
@@ -335,6 +806,7 @@ impl WorkerPool {
         let row = HandleRow {
             state: Arc::new(HandleStateInner {
                 handle_id: handle_id.clone(),
+                session_id: None,
                 worker_id: worker.worker_id.clone(),
                 started_at,
                 inner: Mutex::new(runtime),
@@ -348,6 +820,9 @@ impl WorkerPool {
                 PendingEntry {
                     sink: worker.sink,
                     worker_id: worker.worker_id.clone(),
+                    profile: worker.profile,
+                    session_id: None,
+                    mode: SessionCommandMode::Parallel,
                     started_at: Instant::now(),
                 },
             );
@@ -356,6 +831,7 @@ impl WorkerPool {
 
         Ok(HandleSnapshot {
             handle_id: row.state.handle_id.clone(),
+            session_id: None,
             worker_id: row.state.worker_id.clone(),
             started_at: row.state.started_at,
             status: HandleStatus::Running,
@@ -471,6 +947,7 @@ impl WorkerPool {
     pub async fn register_and_run(
         &self,
         worker_id: WorkerId,
+        profile: String,
         location: Option<WorkerLocation>,
         sink: WorkerSink,
         mut stream: WorkerStream,
@@ -478,8 +955,12 @@ impl WorkerPool {
         let shutdown = Arc::new(Notify::new());
         {
             let mut s = self.state.lock().await;
+            if s.liveness.contains_key(&worker_id) {
+                return Err(anyhow::anyhow!("duplicate worker id {worker_id}"));
+            }
             s.idle.push_back(WorkerEntry {
                 worker_id: worker_id.clone(),
+                profile: profile.clone(),
                 sink: Arc::new(Mutex::new(sink)),
             });
             s.liveness.insert(
@@ -488,6 +969,7 @@ impl WorkerPool {
                     last_seen: Instant::now(),
                     shutdown: shutdown.clone(),
                     location,
+                    profile,
                 },
             );
             info!(%worker_id, idle = s.idle.len(), "worker registered");
@@ -509,9 +991,17 @@ impl WorkerPool {
                                 // is the back-pressure that stops draining the WS
                                 // and pauses the worker's pty reads.
                                 let _ = tx.send(PtyEvent::Output(b.to_vec())).await;
+                            } else if let Ok(chunk) = OutputChunk::decode(&b) {
+                                self.route_output(&worker_id, chunk).await;
                             }
                         }
                         Ok(Message::Text(t)) => match serde_json::from_str::<Frame>(&t) {
+                            Ok(Frame::SessionReady { session_id, error }) => {
+                                self.session_ready(&worker_id, &session_id, error).await;
+                            }
+                            Ok(Frame::SessionClosed { session_id, error, reusable }) => {
+                                self.session_closed(&worker_id, &session_id, error, reusable).await;
+                            }
                             Ok(Frame::PtyExit {
                                 exit_code,
                                 exit_signal,
@@ -547,6 +1037,150 @@ impl WorkerPool {
         Ok(())
     }
 
+    async fn route_output(&self, worker_id: &WorkerId, chunk: OutputChunk<'_>) {
+        match chunk.stream {
+            OutputStream::Stdout | OutputStream::Stderr => {
+                let id = ExecId::new(chunk.id);
+                let authorized = {
+                    let s = self.state.lock().await;
+                    s.inflight
+                        .get(&id)
+                        .is_some_and(|p| p.worker_id == *worker_id && p.session_id.is_some())
+                };
+                if !authorized {
+                    return;
+                }
+                let which = if chunk.stream == OutputStream::Stdout {
+                    capture::Stream::Stdout
+                } else {
+                    capture::Stream::Stderr
+                };
+                let path = capture::stream_path(&self.capture_root, &id, which);
+                match tokio::fs::OpenOptions::new().append(true).open(&path).await {
+                    Ok(mut file) => {
+                        if let Err(e) = file.write_all(chunk.bytes).await {
+                            warn!(%id, "could not spool command output: {e}");
+                        }
+                    }
+                    Err(e) => warn!(%id, "could not open command spool: {e}"),
+                }
+            }
+            OutputStream::Terminal => {
+                let tx = {
+                    let s = self.state.lock().await;
+                    s.worker_sessions
+                        .get(worker_id)
+                        .filter(|id| id.as_str() == chunk.id)
+                        .and_then(|id| s.sessions.get(id))
+                        .and_then(|rec| rec.terminal.clone())
+                };
+                if let Some(tx) = tx {
+                    let _ = tx.send(TerminalEvent::Output(chunk.bytes.to_vec())).await;
+                }
+            }
+            OutputStream::Stdin => warn!(%worker_id, "unexpected terminal input from worker"),
+        }
+    }
+
+    async fn session_ready(&self, worker_id: &WorkerId, id: &SessionId, error: Option<String>) {
+        let mut s = self.state.lock().await;
+        let Some(rec) = s.sessions.get_mut(id) else {
+            return;
+        };
+        if rec.worker_id != *worker_id {
+            return;
+        }
+        if rec.state == shiitake_server_api::SessionState::Opening {
+            rec.state = if error.is_some() {
+                shiitake_server_api::SessionState::Failed
+            } else {
+                shiitake_server_api::SessionState::Active
+            };
+            if error.is_some() {
+                rec.finished_at = Some(SystemTime::now());
+            }
+        }
+        if let Some(tx) = rec.opened.take() {
+            let _ = tx.send(error.map_or(Ok(()), Err));
+        }
+    }
+
+    async fn session_closed(
+        &self,
+        worker_id: &WorkerId,
+        id: &SessionId,
+        error: Option<String>,
+        reusable: bool,
+    ) {
+        let (pending, closed): (Vec<ExecId>, Vec<oneshot::Sender<()>>) = {
+            let mut s = self.state.lock().await;
+            let Some(rec) = s.sessions.get_mut(id) else {
+                return;
+            };
+            if rec.worker_id != *worker_id {
+                return;
+            }
+            rec.state = if error.is_some() {
+                shiitake_server_api::SessionState::Failed
+            } else {
+                shiitake_server_api::SessionState::Closed
+            };
+            rec.finished_at = Some(SystemTime::now());
+            if let Some(tx) = rec.terminal.take() {
+                let _ = tx.try_send(TerminalEvent::Closed(error.clone()));
+            }
+            if let Some(tx) = rec.opened.take() {
+                let _ = tx.send(Err(error.clone().unwrap_or_else(|| "shell closed".into())));
+            }
+            let closed = std::mem::take(&mut rec.closed);
+            let profile = rec.profile.clone();
+            let sink = rec.sink.clone();
+            s.worker_sessions.remove(worker_id);
+            if reusable && s.liveness.contains_key(worker_id) {
+                s.idle.push_back(WorkerEntry {
+                    worker_id: worker_id.clone(),
+                    profile,
+                    sink,
+                });
+            }
+            let ids: Vec<_> = s
+                .inflight
+                .iter()
+                .filter(|(_, p)| p.session_id.as_ref() == Some(id))
+                .map(|(rid, _)| rid.clone())
+                .collect();
+            for rid in &ids {
+                s.inflight.remove(rid);
+            }
+            (ids, closed)
+        };
+        for rid in pending {
+            if let Some(row) = { self.state.lock().await.handles.get(&rid).cloned() } {
+                let finished_at = SystemTime::now();
+                let mut runtime = row.state.inner.lock().await;
+                if runtime.status == HandleStatus::Running {
+                    runtime.finished_at = Some(finished_at);
+                    runtime.status = HandleStatus::Error;
+                    runtime.cancelled = true;
+                    runtime.exit_cause = Some(ExitCause::Cancelled);
+                    self.finalize_telemetry(
+                        &mut runtime,
+                        &row.state,
+                        finished_at,
+                        ExitCause::Cancelled,
+                        &ResourceUsage::default(),
+                    )
+                    .await;
+                    row.state.completion.notify_waiters();
+                }
+            }
+        }
+        for tx in closed {
+            let _ = tx.send(());
+        }
+        self.report_occupancy().await;
+    }
+
     /// Refresh a worker's last-seen timestamp. Called on every inbound frame
     /// (Result, Pong, …) so the keepalive pinger can tell a live worker from
     /// a wedged one.
@@ -567,10 +1201,19 @@ impl WorkerPool {
         let row = {
             let mut s = self.state.lock().await;
             if let Some(p) = s.inflight.remove(&result.request_id) {
-                s.idle.push_back(WorkerEntry {
-                    worker_id: p.worker_id,
-                    sink: p.sink,
-                });
+                if let Some(id) = p.session_id {
+                    if p.mode == SessionCommandMode::Stateful
+                        && let Some(rec) = s.sessions.get_mut(&id)
+                    {
+                        rec.stateful_count = rec.stateful_count.saturating_sub(1);
+                    }
+                } else {
+                    s.idle.push_back(WorkerEntry {
+                        worker_id: p.worker_id,
+                        profile: p.profile,
+                        sink: p.sink,
+                    });
+                }
             }
             s.handles.get(&result.request_id).cloned()
         };
@@ -680,9 +1323,23 @@ impl WorkerPool {
         // path on a real disconnect (crash/eviction); on reconnect it Hellos
         // and registers afresh. Take the location on the way out — the OOM probe
         // needs it and the liveness entry is about to go.
-        let location = {
+        let (location, closed) = {
             let mut s = self.state.lock().await;
+            let mut closed = Vec::new();
             s.idle.retain(|w| w.worker_id != *worker_id);
+            if let Some(id) = s.worker_sessions.remove(worker_id)
+                && let Some(rec) = s.sessions.get_mut(&id)
+            {
+                rec.state = shiitake_server_api::SessionState::Failed;
+                rec.finished_at = Some(SystemTime::now());
+                if let Some(tx) = rec.terminal.take() {
+                    let _ = tx.try_send(TerminalEvent::Closed(Some("worker disconnected".into())));
+                }
+                if let Some(tx) = rec.opened.take() {
+                    let _ = tx.send(Err("worker disconnected".into()));
+                }
+                closed = std::mem::take(&mut rec.closed);
+            }
             // A worker that drops mid-PTY-session leaves its client still
             // attached. Notify the session so the handler closes that client
             // cleanly (with a reason) instead of blocking forever on output that
@@ -696,10 +1353,16 @@ impl WorkerPool {
                     error: Some("worker disconnected".to_string()),
                 });
             }
-            s.liveness.remove(worker_id).and_then(|l| l.location)
+            (
+                s.liveness.remove(worker_id).and_then(|l| l.location),
+                closed,
+            )
         };
         self.report_occupancy().await;
         if pending.is_empty() {
+            for tx in closed {
+                let _ = tx.send(());
+            }
             return;
         }
 
@@ -724,6 +1387,9 @@ impl WorkerPool {
                 let finished_at = SystemTime::now();
                 {
                     let mut runtime = row.state.inner.lock().await;
+                    if runtime.status != HandleStatus::Running {
+                        continue;
+                    }
                     runtime.finished_at = Some(finished_at);
                     runtime.status = status;
                     runtime.exit_cause = Some(cause);
@@ -746,6 +1412,9 @@ impl WorkerPool {
                 %worker_id, ?cause, waited_ms = %waited.as_millis(),
                 "handle fulfilled by worker_drop reconciler"
             );
+        }
+        for tx in closed {
+            let _ = tx.send(());
         }
     }
 
@@ -794,7 +1463,7 @@ impl WorkerPool {
                 let last = self.last_polled(&snap.handle_id).await.unwrap_or(now);
                 let idle = now.duration_since(last).unwrap_or_default();
                 match snap.status {
-                    HandleStatus::Running if idle > running_ttl => {
+                    HandleStatus::Running if snap.session_id.is_none() && idle > running_ttl => {
                         warn!(handle_id = %snap.handle_id, idle_s = idle.as_secs(),
                               "idle TTL reached; cancelling");
                         self.cancel(&snap.handle_id).await;
@@ -812,6 +1481,11 @@ impl WorkerPool {
                     _ => {}
                 }
             }
+            let mut s = self.state.lock().await;
+            s.sessions.retain(|_, rec| {
+                rec.finished_at
+                    .is_none_or(|at| now.duration_since(at).unwrap_or_default() <= terminal_ttl)
+            });
         }
     }
 
@@ -835,7 +1509,14 @@ impl WorkerPool {
                 let s = self.state.lock().await;
                 let idle = s.idle.iter().map(|w| (&w.worker_id, &w.sink));
                 let inflight = s.inflight.values().map(|p| (&p.worker_id, &p.sink));
+                let sessions = s
+                    .worker_sessions
+                    .iter()
+                    .filter_map(|(wid, id)| s.sessions.get(id).map(|r| (wid, &r.sink)));
+                let mut seen = HashSet::new();
                 idle.chain(inflight)
+                    .chain(sessions)
+                    .filter(|(worker_id, _)| seen.insert((*worker_id).clone()))
                     .filter_map(|(worker_id, sink)| {
                         s.liveness.get(worker_id).map(|l| {
                             (
@@ -889,6 +1570,7 @@ impl WorkerPool {
 fn snapshot_from(state: &HandleStateInner, runtime: &HandleRuntime) -> HandleSnapshot {
     HandleSnapshot {
         handle_id: state.handle_id.clone(),
+        session_id: state.session_id.clone(),
         worker_id: state.worker_id.clone(),
         started_at: state.started_at,
         status: runtime.status,

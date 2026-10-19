@@ -9,45 +9,90 @@ use crate::pool::WorkerPool;
 use axum::{
     extract::{
         State,
-        ws::{Message, WebSocketUpgrade},
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    response::Response,
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
 use shiitake_worker_api::Frame;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 use tracing::{info, warn};
 
-pub async fn connect(State(pool): State<Arc<WorkerPool>>, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |socket| async move {
-        let (sink, mut stream) = socket.split();
-        // Read the first frame; must be Hello.
-        let (worker_id, location) = match stream.next().await {
-            Some(Ok(Message::Text(t))) => match serde_json::from_str::<Frame>(&t) {
-                Ok(Frame::Hello {
-                    worker_id,
-                    location,
-                }) => (worker_id, location),
-                Ok(other) => {
-                    warn!(?other, "first frame was not Hello; closing");
-                    return;
-                }
-                Err(e) => {
-                    warn!("parse Hello: {e}");
-                    return;
-                }
-            },
-            other => {
-                warn!(?other, "no Hello frame; closing");
+/// Profile-bound dispatch credentials. The default profile uses the ordinary
+/// dispatch token; every additional profile gets a distinct token. A worker
+/// cannot claim a different profile in Hello with its own credential.
+#[derive(Clone)]
+pub struct ProfileCredentials {
+    pub pool: Arc<WorkerPool>,
+    pub tokens: Arc<BTreeMap<String, String>>,
+}
+
+pub async fn connect_scoped(
+    State(credentials): State<ProfileCredentials>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let bearer = headers
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "));
+    let Some(profile) = bearer.and_then(|token| {
+        credentials
+            .tokens
+            .iter()
+            .find(|(_, expected)| expected.as_str() == token)
+            .map(|(name, _)| name.clone())
+    }) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    upgrade.on_upgrade(move |socket| run_socket(credentials.pool, socket, Some(profile)))
+}
+
+async fn run_socket(pool: Arc<WorkerPool>, socket: WebSocket, expected_profile: Option<String>) {
+    let (sink, mut stream) = socket.split();
+    // Read the first frame; must be Hello.
+    let (worker_id, profile, location) = match stream.next().await {
+        Some(Ok(Message::Text(t))) => match serde_json::from_str::<Frame>(&t) {
+            Ok(Frame::Hello {
+                worker_id,
+                profile,
+                location,
+            }) => (worker_id, profile, location),
+            Ok(other) => {
+                warn!(?other, "first frame was not Hello; closing");
                 return;
             }
-        };
-        info!(%worker_id, pod = ?location.as_ref().map(|l| &l.pod), "worker handshake complete");
-        if let Err(e) = pool
-            .register_and_run(worker_id, location, sink, stream)
-            .await
-        {
-            warn!("pool run error: {e}");
+            Err(e) => {
+                warn!("parse Hello: {e}");
+                return;
+            }
+        },
+        other => {
+            warn!(?other, "no Hello frame; closing");
+            return;
         }
-    })
+    };
+    if profile.is_empty()
+        || !profile
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        warn!(%worker_id, %profile, "invalid worker profile");
+        return;
+    }
+    if expected_profile
+        .as_deref()
+        .is_some_and(|expected| expected != profile)
+    {
+        warn!(%worker_id, %profile, "worker tried to claim a different profile");
+        return;
+    }
+    info!(%worker_id, %profile, pod = ?location.as_ref().map(|l| &l.pod), "worker handshake complete");
+    if let Err(e) = pool
+        .register_and_run(worker_id, profile, location, sink, stream)
+        .await
+    {
+        warn!("pool run error: {e}");
+    }
 }

@@ -79,6 +79,7 @@ pub async fn status(
     let root = state.pool.capture_root();
     Ok(Json(StatusResponse {
         handle: snap.handle_id.clone(),
+        session_id: snap.session_id,
         worker_id: snap.worker_id,
         status: snap.status,
         started_at: to_epoch(snap.started_at),

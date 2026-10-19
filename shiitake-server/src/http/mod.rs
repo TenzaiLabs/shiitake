@@ -4,6 +4,7 @@ pub mod dispatch;
 pub mod exec;
 pub mod health;
 pub mod pty;
+pub mod sessions;
 
 use crate::pool::WorkerPool;
 use axum::{
@@ -11,7 +12,7 @@ use axum::{
     extract::DefaultBodyLimit,
     routing::{get, post},
 };
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tower_http::validate_request::ValidateRequestHeaderLayer;
 
 /// Generic state for shiitake-server's built-in handlers.
@@ -23,7 +24,7 @@ use tower_http::validate_request::ValidateRequestHeaderLayer;
 #[derive(Clone)]
 pub struct AppState {
     pub pool: Arc<WorkerPool>,
-    /// Bearer token guarding the `/exec` routes (the binary refuses to start
+    /// Bearer token guarding session routes (the binary refuses to start
     /// if it is empty). `/health` and `/ready` stay unauthenticated.
     pub auth_token: Arc<String>,
     /// Used when the request body omits `workdir`.
@@ -40,25 +41,39 @@ pub struct AppState {
 }
 
 /// Default public-facing router. All routes are nested under `/api/v1`:
-/// `/api/v1/health`, `/api/v1/ready`, `/api/v1/exec`, `/api/v1/exec/{handle}*`.
+/// `/api/v1/health`, `/api/v1/ready`, `/api/v1/profiles`, `/api/v1/sessions`.
 pub fn build_api_router(state: AppState) -> Router {
     // tower-http's `bearer` is marked deprecated ("too basic"), but a static
     // shared secret is exactly our case, so we use it rather than hand-rolling.
     #[allow(deprecated)]
-    let exec = Router::new()
-        .route("/exec", post(exec::exec))
-        .route("/exec/{handle}", get(exec::status).delete(exec::kill))
-        .route("/exec/{handle}/stdout", get(exec::read_stdout))
-        .route("/exec/{handle}/stderr", get(exec::read_stderr))
-        // Interactive terminal: a WS upgrade, bearer-gated like the rest of exec.
-        .route("/pty", get(pty::pty))
+    let protected = Router::new()
+        .route("/profiles", get(sessions::profiles))
+        .route("/sessions", post(sessions::create))
+        .route(
+            "/sessions/{id}",
+            get(sessions::status).delete(sessions::close),
+        )
+        .route("/sessions/{id}/commands", post(sessions::run))
+        .route(
+            "/sessions/{id}/commands/{handle}",
+            get(sessions::command_status).delete(sessions::cancel),
+        )
+        .route(
+            "/sessions/{id}/commands/{handle}/stdout",
+            get(sessions::stdout),
+        )
+        .route(
+            "/sessions/{id}/commands/{handle}/stderr",
+            get(sessions::stderr),
+        )
+        .route("/sessions/{id}/terminal", get(sessions::terminal))
         .layer(ValidateRequestHeaderLayer::bearer(
             state.auth_token.as_str(),
         ));
     let v1 = Router::new()
         .route("/health", get(health::health))
         .route("/ready", get(health::ready))
-        .merge(exec);
+        .merge(protected);
     let max_body_bytes = state.max_body_bytes;
     Router::new()
         .nest("/api/v1", v1)
@@ -73,11 +88,22 @@ pub fn build_api_router(state: AppState) -> Router {
 /// `auth_token`: the dispatch path may cross pods, where being loopback-bound is
 /// no longer what protects it.
 pub fn build_dispatch_router(pool: Arc<WorkerPool>, dispatch_token: &str) -> Router {
-    // Same reasoning as `build_api_router`: a static shared secret is exactly
-    // what tower-http's deprecated-as-"too basic" `bearer` does well.
-    #[allow(deprecated)]
+    build_dispatch_router_with_profiles(pool, dispatch_token, BTreeMap::new())
+}
+
+/// Dispatch router that binds each worker credential to one profile. Use this
+/// for deployments with more than one profile, especially root workers.
+pub fn build_dispatch_router_with_profiles(
+    pool: Arc<WorkerPool>,
+    default_token: &str,
+    extra_tokens: BTreeMap<String, String>,
+) -> Router {
+    let mut tokens = BTreeMap::from([("default".to_string(), default_token.to_string())]);
+    tokens.extend(extra_tokens);
     Router::new()
-        .route("/dispatch", get(dispatch::connect))
-        .layer(ValidateRequestHeaderLayer::bearer(dispatch_token))
-        .with_state(pool)
+        .route("/dispatch", get(dispatch::connect_scoped))
+        .with_state(dispatch::ProfileCredentials {
+            pool,
+            tokens: Arc::new(tokens),
+        })
 }

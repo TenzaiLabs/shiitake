@@ -47,6 +47,7 @@ POOL_SIZE = int(os.environ.get("SHIITAKE_E2E_WORKERS", "8"))
 PORT = int(os.environ.get("SHIITAKE_E2E_FAILOVER_PORT", "18090"))
 
 PATH_ENV = {"PATH": "/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"}
+_SESSIONS = {}
 
 
 def kubectl(*args, check=True):
@@ -154,13 +155,19 @@ def api(path, method="GET", body=None, token=TOKEN, timeout=10, raw=False):
 
 
 def spawn(command, timeout=300.0, deadline=120.0):
-    """POST /exec, waiting out a server that is still coming back."""
+    """Create a session and command, waiting out a recovering server."""
     end = time.monotonic() + deadline
-    body = {"command": command, "timeout": timeout, "env": PATH_ENV}
     while time.monotonic() < end:
-        status, payload = api("/exec", method="POST", body=body)
-        if status == 202:
-            return payload["handle"]
+        status, payload = api("/sessions", method="POST", body={"env": PATH_ENV})
+        if status == 201:
+            sid = payload["session_id"]
+            status, payload = api(f"/sessions/{sid}/commands", method="POST", body={
+                "command": command, "timeout": timeout, "mode": "parallel",
+            })
+            if status == 202:
+                _SESSIONS[payload["handle"]] = sid
+                return payload["handle"]
+            api(f"/sessions/{sid}", method="DELETE")
         time.sleep(2.0)
     raise AssertionError(f"could not spawn {command!r} within {deadline}s")
 
@@ -185,10 +192,11 @@ def wait_for_terminal(handle, deadline=180.0):
     outcome here, not a failure."""
     end = time.monotonic() + deadline
     while time.monotonic() < end:
-        status, snap = api(f"/exec/{handle}")
+        status, snap = api(f"/sessions/{_SESSIONS[handle]}/commands/{handle}")
         if status == 404:
             return None
         if status == 200 and snap["status"] != "running":
+            api(f"/sessions/{_SESSIONS[handle]}", method="DELETE")
             return snap
         time.sleep(1.0)
     raise AssertionError(f"handle {handle} still running after {deadline}s")
@@ -200,7 +208,7 @@ def running_handle(command="sleep 120"):
     handle = spawn(command, timeout=600.0)
     end = time.monotonic() + 60.0
     while time.monotonic() < end:
-        status, snap = api(f"/exec/{handle}")
+        status, snap = api(f"/sessions/{_SESSIONS[handle]}/commands/{handle}")
         if status == 200 and snap["status"] == "running" and snap.get("worker_id"):
             return handle, snap["worker_id"]
         time.sleep(0.5)
@@ -317,7 +325,7 @@ class PodFailures(unittest.TestCase):
                 )
 
     def test_60_pty_worker_death_closes_the_client_with_a_reason(self):
-        """The /pty analogue of test_10: a session whose worker dies mid-stream
+        """A terminal whose worker dies mid-stream
         must close the client 1011 with a reason, not leave it waiting on output
         that will never come. Uses the shiitake-py WebSocket client (this suite
         runs under uv for it); imported lazily so the rest still runs on python3."""
@@ -329,9 +337,9 @@ class PodFailures(unittest.TestCase):
 
         async def drive():
             async with AsyncShiitakeClient(f"http://127.0.0.1:{PORT}", auth_token=TOKEN) as c:
-                session = await c.attach_pty(
-                    working_dir="/tmp", command=["bash", "-c", "echo READY; sleep 60"]
-                )
+                reserved = await c.create_session(workdir="/tmp", env=PATH_ENV)
+                session = await reserved.attach_terminal()
+                await session.send(b"echo READY; sleep 60\n")
                 buf = bytearray()
 
                 async def until(needle):

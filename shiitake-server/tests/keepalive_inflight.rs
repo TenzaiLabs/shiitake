@@ -78,6 +78,7 @@ async fn an_inflight_worker_is_pinged() {
 
     let hello = serde_json::to_string(&Frame::Hello {
         worker_id: WorkerId::new("busy-0"),
+        profile: "default".into(),
         location: None,
     })
     .unwrap();
@@ -124,6 +125,7 @@ async fn an_inflight_worker_that_stops_answering_is_evicted() {
 
     let hello = serde_json::to_string(&Frame::Hello {
         worker_id: WorkerId::new("wedged-0"),
+        profile: "default".into(),
         location: None,
     })
     .unwrap();

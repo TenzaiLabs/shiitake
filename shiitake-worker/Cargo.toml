@@ -12,7 +12,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 nix = { version = "0.31", features = ["resource", "signal", "process", "user", "term"] }
 futures-util = "0.3"
 clap = { version = "4", features = ["derive", "env"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "process", "sync", "time", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "process", "sync", "time", "net", "fs"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 libc = "0.2"
 shiitake-worker-api = { path = "../shiitake-worker-api" }
