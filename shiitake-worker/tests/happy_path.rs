@@ -98,6 +98,11 @@ async fn drive(
         Some(Ok(Message::Text(_))) => {}
         other => panic!("expected Hello, got {other:?}"),
     }
+    sink.send(Message::Text(
+        r#"{"kind":"hello_ack","protocol_version":2}"#.into(),
+    ))
+    .await
+    .unwrap();
 
     let mut env = BTreeMap::new();
     env.insert(

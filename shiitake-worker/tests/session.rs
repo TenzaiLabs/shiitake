@@ -87,6 +87,13 @@ async fn drive(mut ws: WebSocket, scratch: &str, capture: &str) -> anyhow::Resul
     };
     assert_eq!(worker_id.as_str(), "profiled-worker");
     assert_eq!(profile, "isolated");
+    send(
+        &mut ws,
+        Frame::HelloAck {
+            protocol_version: 2,
+        },
+    )
+    .await;
     let session = SessionId::new("session-a");
     let mut env = BTreeMap::new();
     env.insert("PATH".into(), std::env::var("PATH").unwrap());

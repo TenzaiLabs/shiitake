@@ -67,12 +67,22 @@ async fn dispatch_with_one_fake_worker_marks_handle_completed() {
     let worker_task = tokio::spawn(async move {
         let mut ws = connect_worker(addr.port()).await;
         let hello = serde_json::to_string(&Frame::Hello {
+            protocol_version: 2,
             location: None,
             worker_id: WorkerId::new("fake-0"),
             profile: "default".into(),
         })
         .unwrap();
         ws.send(Message::Text(hello.into())).await.unwrap();
+
+        let ack: Frame =
+            serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+        assert!(matches!(
+            ack,
+            Frame::HelloAck {
+                protocol_version: 2
+            }
+        ));
 
         let exec_msg = ws.next().await.unwrap().unwrap();
         let exec_text = match exec_msg {
@@ -177,6 +187,7 @@ async fn failed_spool_write_does_not_report_success() {
         let mut ws = connect_worker(port).await;
         ws.send(Message::Text(
             serde_json::to_string(&Frame::Hello {
+                protocol_version: 2,
                 worker_id: WorkerId::new("spool-fail"),
                 profile: "default".into(),
                 location: None,
@@ -278,6 +289,7 @@ async fn worker_drop_marks_handle_worker_died() {
     let worker_task = tokio::spawn(async move {
         let mut ws = connect_worker(addr.port()).await;
         let hello = serde_json::to_string(&Frame::Hello {
+            protocol_version: 2,
             location: None,
             worker_id: WorkerId::new("doomed"),
             profile: "default".into(),
@@ -285,6 +297,7 @@ async fn worker_drop_marks_handle_worker_died() {
         .unwrap();
         ws.send(Message::Text(hello.into())).await.unwrap();
         // Receive Execute, then ABRUPTLY close.
+        let _ = ws.next().await;
         let _ = ws.next().await;
         ws.close(None).await.ok();
     });
@@ -374,6 +387,7 @@ async fn serial_dispatch_rotates_through_idle_workers() {
         // each before starting the next, so the idle order is deterministic.
         let mut ws = connect_worker(addr.port()).await;
         let hello = serde_json::to_string(&Frame::Hello {
+            protocol_version: 2,
             worker_id: WorkerId::new(*id),
             profile: "default".into(),
             location: None,

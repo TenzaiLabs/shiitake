@@ -14,8 +14,8 @@ use axum::{
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response},
 };
-use futures_util::StreamExt;
-use shiitake_worker_api::Frame;
+use futures_util::{SinkExt, StreamExt};
+use shiitake_worker_api::{Frame, PROTOCOL_VERSION};
 use std::{collections::BTreeMap, sync::Arc};
 use tracing::{info, warn};
 
@@ -50,15 +50,26 @@ pub async fn connect_scoped(
 }
 
 async fn run_socket(pool: Arc<WorkerPool>, socket: WebSocket, expected_profile: Option<String>) {
-    let (sink, mut stream) = socket.split();
+    let (mut sink, mut stream) = socket.split();
     // Read the first frame; must be Hello.
     let (worker_id, profile, location) = match stream.next().await {
         Some(Ok(Message::Text(t))) => match serde_json::from_str::<Frame>(&t) {
             Ok(Frame::Hello {
                 worker_id,
+                protocol_version,
                 profile,
                 location,
-            }) => (worker_id, profile, location),
+            }) if protocol_version == PROTOCOL_VERSION => (worker_id, profile, location),
+            Ok(Frame::Hello {
+                protocol_version, ..
+            }) => {
+                warn!(
+                    protocol_version,
+                    expected = PROTOCOL_VERSION,
+                    "rejecting incompatible worker protocol"
+                );
+                return;
+            }
             Ok(other) => {
                 warn!(?other, "first frame was not Hello; closing");
                 return;
@@ -86,6 +97,13 @@ async fn run_socket(pool: Arc<WorkerPool>, socket: WebSocket, expected_profile: 
         .is_some_and(|expected| expected != profile)
     {
         warn!(%worker_id, %profile, "worker tried to claim a different profile");
+        return;
+    }
+    let ack = serde_json::to_string(&Frame::HelloAck {
+        protocol_version: PROTOCOL_VERSION,
+    })
+    .expect("HelloAck serializes");
+    if sink.send(Message::Text(ack.into())).await.is_err() {
         return;
     }
     info!(%worker_id, %profile, pod = ?location.as_ref().map(|l| &l.pod), "worker handshake complete");

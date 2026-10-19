@@ -41,6 +41,11 @@ All authenticated public routes are under `/api/v1`: `GET /profiles`,
 unauthenticated. Legacy `/exec` and `/pty` public routes were removed in the
 0.5.0 session API. The internal `/dispatch` listener has a separate bearer
 credential from the public API.
+Dispatch protocol version 2 streams command output: the worker sends
+`Hello.protocol_version = 2`, waits for the server's `HelloAck`, and only then
+accepts work. The server rejects older Hello frames before pool registration.
+This deliberately fences mixed-version rollouts that would otherwise lose
+output when one side expects a shared capture volume.
 
 At creation a session fixes its profile, working directory, environment,
 `DropTo`, and terminal size. Stateful commands source a script in the live

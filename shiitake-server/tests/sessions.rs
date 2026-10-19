@@ -56,6 +56,7 @@ async fn fake_worker(port: u16, id: &'static str, profile: &'static str) {
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
     ws.send(Message::Text(
         serde_json::to_string(&Frame::Hello {
+            protocol_version: 2,
             worker_id: WorkerId::new(id),
             profile: profile.into(),
             location: None,
@@ -270,6 +271,7 @@ async fn dispatch_credential_cannot_claim_another_profile() {
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
     ws.send(Message::Text(
         serde_json::to_string(&Frame::Hello {
+            protocol_version: 2,
             worker_id: WorkerId::new("spoof"),
             profile: "default".into(),
             location: None,

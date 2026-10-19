@@ -286,6 +286,7 @@ async fn serve_session(
     let (mut sink, mut stream) = ws.split();
 
     let hello = serde_json::to_string(&Frame::Hello {
+        protocol_version: shiitake_worker_api::PROTOCOL_VERSION,
         worker_id: WorkerId::new(worker_id.as_str()),
         profile: profile.clone(),
         location,
@@ -293,6 +294,40 @@ async fn serve_session(
     sink.send(Message::Text(hello.into()))
         .await
         .context("send Hello")?;
+
+    // An older server ignores Hello's new field and may still dispatch a
+    // command. Refuse that command before running it so its output cannot be
+    // silently lost; only a matching HelloAck makes this connection usable.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match stream.next().await {
+                Some(Ok(Message::Text(t))) => match serde_json::from_str::<Frame>(&t)? {
+                    Frame::HelloAck { protocol_version }
+                        if protocol_version == shiitake_worker_api::PROTOCOL_VERSION =>
+                    {
+                        return Ok(());
+                    }
+                    Frame::Execute(execute) => {
+                        let error = ResultFrame::errored(
+                            execute.request_id,
+                            "incompatible dispatcher protocol; command was not run",
+                        );
+                        let frame = serde_json::to_string(&Frame::Result(error))?;
+                        sink.send(Message::Text(frame.into())).await?;
+                        anyhow::bail!("dispatcher did not acknowledge protocol version");
+                    }
+                    other => anyhow::bail!("unexpected dispatcher handshake frame: {other:?}"),
+                },
+                Some(Ok(Message::Ping(p))) => sink.send(Message::Pong(p)).await?,
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
+                    anyhow::bail!("dispatcher closed before protocol acknowledgement")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .context("dispatcher protocol acknowledgement timed out")??;
 
     loop {
         // Phase 1: wait for the next command (or session end).
@@ -475,6 +510,7 @@ async fn next_execute(
                     warn!("control frame with nothing in flight; ignoring")
                 }
                 Frame::Hello { .. }
+                | Frame::HelloAck { .. }
                 | Frame::Result(_)
                 | Frame::PtyExit { .. }
                 | Frame::SessionReady { .. }

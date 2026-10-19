@@ -108,6 +108,7 @@ async fn connect_worker(dispatch_port: u16, id: &str) -> WorkerConn {
     );
     let (mut ws, _) = connect_async(req).await.unwrap();
     let hello = serde_json::to_string(&Frame::Hello {
+        protocol_version: 2,
         worker_id: WorkerId::new(id),
         profile: "default".into(),
         location: None,

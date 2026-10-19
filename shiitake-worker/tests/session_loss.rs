@@ -155,6 +155,11 @@ async fn drive(socket: WebSocket, hello_tx: mpsc::Sender<()>, behaviour: Behavio
         Some(Ok(Message::Text(_))) => {}
         other => panic!("expected Hello, got {other:?}"),
     }
+    sink.send(Message::Text(
+        r#"{"kind":"hello_ack","protocol_version":2}"#.into(),
+    ))
+    .await
+    .unwrap();
     hello_tx.send(()).await.ok();
 
     let sends_command = matches!(

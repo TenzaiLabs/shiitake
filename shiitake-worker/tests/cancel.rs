@@ -76,6 +76,11 @@ async fn worker_honors_cancel_mid_exec() {
 async fn handle(socket: WebSocket, result_tx: mpsc::Sender<(serde_json::Value, Vec<u8>)>) {
     let (mut sink, mut stream) = socket.split();
     let _hello = stream.next().await;
+    sink.send(Message::Text(
+        r#"{"kind":"hello_ack","protocol_version":2}"#.into(),
+    ))
+    .await
+    .unwrap();
 
     let mut env = BTreeMap::new();
     env.insert(

@@ -69,6 +69,12 @@ async fn worker_kills_command_on_timeout() {
 
 async fn handle(mut socket: WebSocket, result_tx: mpsc::Sender<(serde_json::Value, Vec<u8>)>) {
     let _hello = socket.next().await;
+    socket
+        .send(Message::Text(
+            r#"{"kind":"hello_ack","protocol_version":2}"#.into(),
+        ))
+        .await
+        .unwrap();
 
     let mut env = BTreeMap::new();
     env.insert(

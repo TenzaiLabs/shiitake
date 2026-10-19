@@ -112,12 +112,19 @@ pub struct WorkerLocation {
     pub container: String,
 }
 
+/// Dispatch wire version. Version 2 streams command output before Result;
+/// version 1 required a capture volume shared by server and worker.
+pub const PROTOCOL_VERSION: u16 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Frame {
     /// Worker → server: first frame after connect, advertises availability.
     Hello {
         worker_id: WorkerId,
+        /// Missing in pre-streaming workers; such workers must not be scheduled.
+        #[serde(default)]
+        protocol_version: u16,
         #[serde(
             default = "default_profile",
             skip_serializing_if = "is_default_profile"
@@ -128,6 +135,11 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         location: Option<WorkerLocation>,
     },
+    /// Server → worker: confirms that both peers use the same wire protocol.
+    /// A worker must wait for this before accepting work from the dispatcher.
+    HelloAck {
+        protocol_version: u16,
+    },
     /// Server → worker: a command to run.
     Execute(ExecuteFrame),
     /// Server → worker: cancel the in-flight command. Worker SIGKILLs the
@@ -136,10 +148,10 @@ pub enum Frame {
     Cancel {
         request_id: ExecId,
     },
-    /// Worker → server: the result of an Execute. The output lives on
-    /// disk under `<capture_root>/<request_id>/{stdout,stderr}` — the server
-    /// stats those files for byte counts, so only exit metadata and the
-    /// per-command resource usage travel on the wire.
+    /// Worker → server: the result of an Execute. Stdout/stderr travel first
+    /// as binary OutputChunk frames and are spooled by the server. Result
+    /// carries exit metadata and resource usage. The worker removes its
+    /// temporary local capture files after streaming them.
     Result(ResultFrame),
 
     /// A worker remains reserved from Open until Closed. Commands may overlap
@@ -363,35 +375,45 @@ mod tests {
 
     // `WorkerId` is `#[serde(transparent)]`, so it must be wire-identical to the
     // bare `String` it replaced: a `Hello` frame serializes its worker_id as a
-    // plain JSON string, and an old-format payload still deserializes. This
-    // pins the protocol so the newtype can never silently change the wire shape.
+    // plain JSON string. A pre-version Hello still deserializes as version 0
+    // so the server can explicitly reject it before scheduling a command.
     #[test]
     fn worker_id_is_wire_transparent() {
         let frame = Frame::Hello {
+            protocol_version: 2,
             worker_id: WorkerId::new("worker-0"),
             profile: default_profile(),
             location: None,
         };
         let json = serde_json::to_string(&frame).unwrap();
-        assert_eq!(json, r#"{"kind":"hello","worker_id":"worker-0"}"#);
+        assert_eq!(
+            json,
+            r#"{"kind":"hello","worker_id":"worker-0","protocol_version":2}"#
+        );
 
         // The pre-newtype payload (a bare string) still deserializes.
         let parsed: Frame =
             serde_json::from_str(r#"{"kind":"hello","worker_id":"worker-7"}"#).unwrap();
         match parsed {
-            Frame::Hello { worker_id, .. } => assert_eq!(worker_id.as_str(), "worker-7"),
+            Frame::Hello {
+                worker_id,
+                protocol_version,
+                ..
+            } => {
+                assert_eq!(worker_id.as_str(), "worker-7");
+                assert_eq!(protocol_version, 0);
+            }
             _ => panic!("expected Hello"),
         }
     }
 
     // A worker that knows where it runs (the two-pod topology) puts that on the
-    // Hello; a worker that doesn't omits the field entirely, so the frame stays
-    // byte-identical to what a pre-location worker sends. Both directions are
-    // pinned here because the server's OOM probe reads this field and must keep
-    // accepting either shape.
+    // Hello; a worker that doesn't omits the field entirely. Both directions
+    // are pinned here because the server's OOM probe reads this field.
     #[test]
     fn hello_carries_an_optional_worker_location() {
         let frame = Frame::Hello {
+            protocol_version: 2,
             worker_id: WorkerId::new("worker-0"),
             profile: default_profile(),
             location: Some(WorkerLocation {
@@ -403,7 +425,7 @@ mod tests {
         let json = serde_json::to_string(&frame).unwrap();
         assert_eq!(
             json,
-            r#"{"kind":"hello","worker_id":"worker-0","location":{"pod":"shiitake-workers-abc","namespace":"shiitake","container":"worker"}}"#
+            r#"{"kind":"hello","worker_id":"worker-0","protocol_version":2,"location":{"pod":"shiitake-workers-abc","namespace":"shiitake","container":"worker"}}"#
         );
 
         let parsed: Frame = serde_json::from_str(&json).unwrap();
@@ -444,10 +466,8 @@ mod tests {
     }
 }
 
-/// The frame examples published in `docs/docs.html` under "The dispatch
-/// protocol", verbatim. Someone writing their own worker builds against those,
-/// so a change here that leaves them stale is a change that misleads them — this
-/// fails first.
+/// Example frames for the dispatch protocol. Someone writing their own worker
+/// builds against these, so keep them aligned with the documented version.
 #[cfg(test)]
 mod documented_frames {
     use super::*;
@@ -457,6 +477,7 @@ mod documented_frames {
         let f: Frame = serde_json::from_str(
             r#"{"kind": "hello",
                 "worker_id": "shiitake-workers-6d4b8f9c7-x2k9p",
+                "protocol_version": 2,
                 "location": {"pod": "shiitake-workers-6d4b8f9c7-x2k9p",
                              "namespace": "shiitake",
                              "container": "worker"}}"#,
@@ -464,6 +485,7 @@ mod documented_frames {
         .expect("documented hello frame must deserialize");
         let Frame::Hello {
             worker_id,
+            protocol_version,
             location,
             ..
         } = f
@@ -471,6 +493,7 @@ mod documented_frames {
             panic!("expected Hello")
         };
         assert_eq!(worker_id.as_str(), "shiitake-workers-6d4b8f9c7-x2k9p");
+        assert_eq!(protocol_version, PROTOCOL_VERSION);
         assert_eq!(location.expect("location").container, "worker");
     }
 

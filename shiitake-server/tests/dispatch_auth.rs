@@ -84,6 +84,7 @@ async fn accepts_a_worker_presenting_the_token() {
             .expect("upgrade with the right token must succeed");
     // A Hello from another pod, the shape the split topology sends.
     let hello = serde_json::to_string(&Frame::Hello {
+        protocol_version: 2,
         worker_id: WorkerId::new("shiitake-workers-xyz"),
         profile: "default".into(),
         location: Some(WorkerLocation {
@@ -103,4 +104,22 @@ async fn accepts_a_worker_presenting_the_token() {
         sleep(Duration::from_millis(20)).await;
     }
     panic!("worker never registered: {:?}", pool.snapshot().await);
+}
+
+#[tokio::test]
+async fn rejects_a_pre_streaming_worker_before_pool_registration() {
+    let (pool, _capture) = new_pool();
+    let port = dispatch_listener(pool.clone()).await;
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(request(port, Some("Bearer test-dispatch-token")))
+            .await
+            .unwrap();
+    // The old Hello has no protocol_version; it must never enter the pool.
+    ws.send(Message::Text(
+        r#"{"kind":"hello","worker_id":"legacy-worker"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(pool.snapshot().await, (0, 0));
 }
