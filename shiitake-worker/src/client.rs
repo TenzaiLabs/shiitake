@@ -515,7 +515,7 @@ async fn run_command(
     // message, so a merely slow command never trips it.
     let mut deadline = std::pin::pin!(tokio::time::sleep(lease));
 
-    let result = loop {
+    let mut result = loop {
         if session_lost {
             // Cancel already signalled; just let exec wind down so we don't
             // leak the child, then end the session.
@@ -579,6 +579,52 @@ async fn run_command(
             }
         }
     };
+    // The legacy Execute frame still uses a worker-local capture while the
+    // process runs. Send its completed streams over dispatch before Result so
+    // the server can spool them without a shared volume.
+    for (stream_kind, wire_kind) in [
+        (capture::Stream::Stdout, OutputStream::Stdout),
+        (capture::Stream::Stderr, OutputStream::Stderr),
+    ] {
+        let path = capture::stream_path(capture_root, &request_id, stream_kind);
+        let mut file = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                result.error = Some(format!("could not read command output: {e}"));
+                break;
+            }
+        };
+        let mut buf = vec![0u8; 32 * 1024];
+        loop {
+            let n = match file.read(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    result.error = Some(format!("could not read command output: {e}"));
+                    break;
+                }
+            };
+            if n == 0 {
+                break;
+            }
+            let chunk = OutputChunk {
+                stream: wire_kind,
+                id: request_id.as_str(),
+                bytes: &buf[..n],
+            };
+            if !matches!(
+                tokio::time::timeout(lease, sink.send(Message::Binary(chunk.encode().into())))
+                    .await,
+                Ok(Ok(()))
+            ) {
+                let _ = capture::purge(capture_root, &request_id).await;
+                return CmdOutcome::SessionLost;
+            }
+        }
+    }
+    if let Err(e) = capture::purge(capture_root, &request_id).await {
+        warn!(%request_id, "could not purge legacy command capture: {e}");
+    }
     CmdOutcome::Done(result)
 }
 
@@ -711,7 +757,11 @@ enum SessionEvent {
     Output(ExecId, OutputStream, Vec<u8>),
     Result(ResultFrame),
     Interrupt,
-    Abort,
+    Abort {
+        request_id: ExecId,
+        timed_out: bool,
+        cancelled: bool,
+    },
 }
 
 /// One worker hosts one session, but runs several jobs concurrently. The PTY
@@ -878,7 +928,16 @@ async fn run_session(
                 SessionEvent::Interrupt => {
                     let _ = pty.write_input(b"\x03").await;
                 }
-                SessionEvent::Abort => {
+                SessionEvent::Abort { request_id, timed_out, cancelled } => {
+                    let _ = send_worker_frame(sink, &Frame::Result(ResultFrame {
+                        request_id,
+                        exit_code: None,
+                        exit_signal: None,
+                        timed_out,
+                        cancelled,
+                        usage: ResourceUsage::default(),
+                        error: Some("stateful command did not stop".into()),
+                    })).await;
                     close_error = Some("stateful command did not stop".into());
                     break;
                 }
@@ -944,6 +1003,7 @@ async fn run_session(
         }
     }
 
+    drop(event_rx);
     for cancel in running.values() {
         let _ = cancel.send(true);
     }
@@ -955,6 +1015,15 @@ async fn run_session(
     })
     .await;
     tasks.abort_all();
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
+    for rid in running.keys() {
+        if let Err(e) = capture::purge(capture_root, rid).await {
+            warn!(%rid, "could not purge session capture after close: {e}");
+        }
+    }
     if lost {
         PtyOutcome::SessionLost
     } else {
@@ -1127,11 +1196,19 @@ async fn watch_stateful_job(
             timed_out = !cancelled;
             interrupted_at = Some(tokio::time::Instant::now());
             if tx.send(SessionEvent::Interrupt).await.is_err() {
+                abandon_stateful_job(done_tx, out, err, &root, &rid).await;
                 return;
             }
         }
         if interrupted_at.is_some_and(|at| at.elapsed() > Duration::from_secs(2)) {
-            let _ = tx.send(SessionEvent::Abort).await;
+            abandon_stateful_job(done_tx, out, err, &root, &rid).await;
+            let _ = tx
+                .send(SessionEvent::Abort {
+                    request_id: rid,
+                    timed_out,
+                    cancelled,
+                })
+                .await;
             return;
         }
         sleep(Duration::from_millis(10)).await;
@@ -1152,6 +1229,23 @@ async fn watch_stateful_job(
         .await;
 }
 
+async fn abandon_stateful_job(
+    done: watch::Sender<bool>,
+    out: tokio::task::JoinHandle<()>,
+    err: tokio::task::JoinHandle<()>,
+    root: &Path,
+    rid: &ExecId,
+) {
+    let _ = done.send(true);
+    out.abort();
+    err.abort();
+    let _ = out.await;
+    let _ = err.await;
+    if let Err(e) = capture::purge(root, rid).await {
+        warn!(%rid, "could not purge aborted stateful capture: {e}");
+    }
+}
+
 async fn tail_capture(
     root: PathBuf,
     rid: ExecId,
@@ -1164,14 +1258,14 @@ async fn tail_capture(
     let mut file = loop {
         match tokio::fs::File::open(&path).await {
             Ok(f) => break f,
-            Err(_) if *done.borrow() => return,
+            Err(_) if *done.borrow() || done.has_changed().is_err() => return,
             Err(_) => sleep(Duration::from_millis(10)).await,
         }
     };
     let mut buf = vec![0u8; 32 * 1024];
     loop {
         match file.read(&mut buf).await {
-            Ok(0) if *done.borrow() => return,
+            Ok(0) if *done.borrow() || done.has_changed().is_err() => return,
             Ok(0) => sleep(Duration::from_millis(10)).await,
             Ok(n) => {
                 if tx

@@ -7,6 +7,7 @@ use axum::{
     routing::get,
 };
 use futures_util::StreamExt;
+use shiitake_worker_api::{OutputChunk, OutputStream};
 use std::{collections::BTreeMap, time::Duration};
 use tempfile::TempDir;
 use tokio::{net::TcpListener, process::Command, sync::mpsc, time::timeout};
@@ -21,7 +22,7 @@ async fn worker_kills_command_on_timeout() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let (result_tx, mut result_rx) = mpsc::channel::<serde_json::Value>(1);
+    let (result_tx, mut result_rx) = mpsc::channel::<(serde_json::Value, Vec<u8>)>(1);
     let app: Router = Router::new().route(
         "/dispatch",
         get(move |upgrade: WebSocketUpgrade| {
@@ -47,7 +48,7 @@ async fn worker_kills_command_on_timeout() {
         .spawn()
         .expect("spawn worker");
 
-    let result = timeout(Duration::from_secs(10), result_rx.recv())
+    let (result, stderr) = timeout(Duration::from_secs(10), result_rx.recv())
         .await
         .expect("no result frame")
         .expect("channel closed");
@@ -59,15 +60,14 @@ async fn worker_kills_command_on_timeout() {
     assert_eq!(result["timed_out"], true);
     assert_eq!(result["cancelled"], false);
 
-    let stderr = capture_root.path().join("req-timeout/stderr");
-    let body = std::fs::read_to_string(&stderr).expect("stderr capture should exist");
+    let body = String::from_utf8(stderr).unwrap();
     assert!(
         body.contains("timed out"),
         "expected timeout marker in stderr capture, got {body:?}"
     );
 }
 
-async fn handle(mut socket: WebSocket, result_tx: mpsc::Sender<serde_json::Value>) {
+async fn handle(mut socket: WebSocket, result_tx: mpsc::Sender<(serde_json::Value, Vec<u8>)>) {
     let _hello = socket.next().await;
 
     let mut env = BTreeMap::new();
@@ -90,13 +90,23 @@ async fn handle(mut socket: WebSocket, result_tx: mpsc::Sender<serde_json::Value
         .await
         .unwrap();
 
+    let mut stderr = Vec::new();
     while let Some(msg) = socket.next().await {
-        if let Ok(Message::Text(t)) = msg {
-            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
-            if v.get("kind").and_then(|k| k.as_str()) == Some("result") {
-                result_tx.send(v).await.ok();
-                return;
+        match msg {
+            Ok(Message::Binary(b)) => {
+                let chunk = OutputChunk::decode(&b).unwrap();
+                if chunk.stream == OutputStream::Stderr {
+                    stderr.extend_from_slice(chunk.bytes);
+                }
             }
+            Ok(Message::Text(t)) => {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v.get("kind").and_then(|k| k.as_str()) == Some("result") {
+                    result_tx.send((v, stderr)).await.ok();
+                    return;
+                }
+            }
+            _ => {}
         }
     }
 }

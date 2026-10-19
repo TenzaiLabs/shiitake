@@ -11,7 +11,9 @@ use shiitake_server::{
 use shiitake_server_api::{
     CreateSessionRequest, SessionCommandRequest, SessionResponse, SpawnResponse, StatusResponse,
 };
-use shiitake_worker_api::{Frame, OutputChunk, OutputStream, ResultFrame, WorkerId};
+use shiitake_worker_api::{
+    Frame, OutputChunk, OutputStream, ResultFrame, SessionId, SessionOpenFrame, WorkerId,
+};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tokio::{net::TcpListener, time::timeout};
@@ -301,4 +303,65 @@ async fn dispatch_rejects_ambiguous_profile_credentials() {
     ] {
         assert!(build_dispatch_router_with_profiles(pool.clone(), "default-token", extra).is_err());
     }
+}
+
+#[tokio::test]
+async fn idle_session_expires_and_releases_its_worker() {
+    let capture = TempDir::new().unwrap();
+    let pool = Arc::new(WorkerPool::new(
+        None,
+        "server".into(),
+        "test".into(),
+        capture.path().into(),
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let router =
+        build_dispatch_router_with_profiles(pool.clone(), "default-token", BTreeMap::new())
+            .unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    tokio::spawn(fake_worker(port, "idle-0", "default"));
+    timeout(Duration::from_secs(3), async {
+        while pool.profiles().await.first().is_none_or(|p| p.idle == 0) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let id = SessionId::new(uuid::Uuid::new_v4().simple().to_string());
+    pool.create_session(
+        "default".into(),
+        SessionOpenFrame {
+            session_id: id.clone(),
+            working_dir: "/tmp".into(),
+            env: BTreeMap::new(),
+            drop_to: None,
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    .unwrap();
+    let sweeper = tokio::spawn(pool.clone().run_sweeper(
+        Duration::from_millis(10),
+        Duration::from_millis(80),
+        Duration::from_secs(1),
+    ));
+    timeout(Duration::from_secs(3), async {
+        while pool
+            .profiles()
+            .await
+            .first()
+            .is_none_or(|p| p.idle != 1 || p.allocated != 0)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    sweeper.abort();
+    assert_eq!(
+        pool.session_snapshot(&id).await.unwrap().state,
+        shiitake_server_api::SessionState::Closed
+    );
 }

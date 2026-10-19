@@ -297,7 +297,8 @@ class AsyncSession:
     ) -> AsyncHandle:
         body = {"command": command, "timeout": timeout, "mode": mode}
         resp = await self._client._request(
-            "POST", self._client._url(f"/sessions/{self.session_id}/commands"), json=body
+            "POST", self._client._url(f"/sessions/{self.session_id}/commands"),
+            json=body, retry_transport=False,
         )
         _raise_for_status(resp)
         d = resp.json()

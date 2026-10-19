@@ -7,11 +7,14 @@ use shiitake_server::{
     http::build_dispatch_router,
     pool::{ExitCause, HandleStatus, WorkerPool},
 };
-use shiitake_worker_api::{ExecId, ExecuteFrame, Frame, ResultFrame, WorkerId};
+use shiitake_worker_api::{
+    ExecId, ExecuteFrame, Frame, OutputChunk, OutputStream, ResultFrame, WorkerId, capture,
+};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tokio::{
     net::TcpListener,
+    sync::oneshot,
     time::{sleep, timeout},
 };
 use tokio_tungstenite::tungstenite::{
@@ -82,6 +85,15 @@ async fn dispatch_with_one_fake_worker_marks_handle_completed() {
             other => panic!("expected Execute, got {other:?}"),
         };
 
+        let chunk = OutputChunk {
+            stream: OutputStream::Stdout,
+            id: exec.request_id.as_str(),
+            bytes: b"legacy output\n",
+        };
+        ws.send(Message::Binary(chunk.encode().into()))
+            .await
+            .unwrap();
+
         let result = ResultFrame {
             request_id: exec.request_id,
             exit_code: Some(0),
@@ -130,6 +142,117 @@ async fn dispatch_with_one_fake_worker_marks_handle_completed() {
     assert_eq!(after.status, HandleStatus::Completed);
     assert_eq!(after.exit_code, Some(0));
     assert_eq!(after.exit_cause, Some(ExitCause::Normal));
+    assert_eq!(
+        pool.capture_len(&snap.handle_id, capture::Stream::Stdout),
+        14
+    );
+    assert_eq!(
+        tokio::fs::read(capture::stream_path(
+            capture.path(),
+            &snap.handle_id,
+            capture::Stream::Stdout
+        ))
+        .await
+        .unwrap(),
+        b"legacy output\n"
+    );
+}
+
+#[tokio::test]
+async fn failed_spool_write_does_not_report_success() {
+    let capture = TempDir::new().unwrap();
+    let pool = Arc::new(WorkerPool::new(
+        None,
+        "server".into(),
+        "test".into(),
+        capture.path().into(),
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = build_dispatch_router(pool.clone(), DISPATCH_TOKEN);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (received_tx, received_rx) = oneshot::channel();
+    let (proceed_tx, proceed_rx) = oneshot::channel();
+    let worker = tokio::spawn(async move {
+        let mut ws = connect_worker(port).await;
+        ws.send(Message::Text(
+            serde_json::to_string(&Frame::Hello {
+                worker_id: WorkerId::new("spool-fail"),
+                profile: "default".into(),
+                location: None,
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let execute = loop {
+            if let Some(Ok(Message::Text(t))) = ws.next().await
+                && let Frame::Execute(execute) = serde_json::from_str(&t).unwrap()
+            {
+                break execute;
+            }
+        };
+        received_tx.send(()).unwrap();
+        proceed_rx.await.unwrap();
+        ws.send(Message::Binary(
+            OutputChunk {
+                stream: OutputStream::Stdout,
+                id: execute.request_id.as_str(),
+                bytes: b"lost bytes",
+            }
+            .encode()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        ws.send(Message::Text(
+            serde_json::to_string(&Frame::Result(ResultFrame {
+                request_id: execute.request_id,
+                exit_code: Some(0),
+                exit_signal: None,
+                timed_out: false,
+                cancelled: false,
+                usage: Default::default(),
+                error: None,
+            }))
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    });
+    sleep(Duration::from_millis(100)).await;
+    let snap = pool
+        .dispatch(ExecuteFrame {
+            request_id: ExecId::new(uuid::Uuid::new_v4().simple().to_string()),
+            command: "echo lost bytes".into(),
+            working_dir: "/tmp".into(),
+            env: BTreeMap::new(),
+            timeout_secs: 5.0,
+            drop_to: None,
+        })
+        .await
+        .unwrap();
+    received_rx.await.unwrap();
+    tokio::fs::remove_file(capture::stream_path(
+        capture.path(),
+        &snap.handle_id,
+        capture::Stream::Stdout,
+    ))
+    .await
+    .unwrap();
+    proceed_tx.send(()).unwrap();
+    timeout(
+        Duration::from_secs(3),
+        pool.wait_for_terminal(&snap.handle_id),
+    )
+    .await
+    .unwrap();
+    worker.await.unwrap();
+    let done = pool.touch_and_snapshot(&snap.handle_id).await.unwrap();
+    assert_eq!(done.status, HandleStatus::Error);
+    assert_eq!(done.exit_cause, Some(ExitCause::OutputError));
 }
 
 #[tokio::test]

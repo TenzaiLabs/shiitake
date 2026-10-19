@@ -101,6 +101,25 @@ async def test_create_session_does_not_repeat_ambiguous_failure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_spawn_does_not_repeat_lost_response() -> None:
+    attempts = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        if req.url.path == "/api/v1/sessions":
+            return httpx.Response(201, json=session_payload())
+        attempts += 1
+        raise httpx.ReadTimeout("command response lost")
+
+    client = await with_mock(handler, max_retries=3, retry_initial_delay=0)
+    session = await client.create_session()
+    with pytest.raises(httpx.ReadTimeout):
+        await session.spawn("echo once")
+    assert attempts == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_session_command_modes_and_range_output() -> None:
     seen: list[tuple[str, str, dict[str, object] | None]] = []
 

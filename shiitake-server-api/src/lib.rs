@@ -122,6 +122,8 @@ pub enum ExitCause {
     OomContainer,
     Timeout,
     WorkerDied,
+    WorkerError,
+    OutputError,
     Cancelled,
 }
 

@@ -50,10 +50,17 @@ working directory and exported environment, but do not change parent state.
 A terminal attachment is detachable. It cannot overlap a stateful job, and at
 most one attachment is active at a time. Command strings use shell syntax.
 The worker clears the inherited environment; pass `PATH` for external tools.
+The sweeper releases idle sessions after the running TTL (one hour in the
+binary); session-status requests and command submissions/completions refresh that clock, while
+running commands and attached terminals prevent expiry. Explicit release is
+still the normal lifecycle. Clients do not retry non-idempotent session-create
+or command-submit POSTs after ambiguous transport failures.
 
 Workers send tagged binary chunks for stdout, stderr, and terminal output
 through `/dispatch`; the server spools command output locally for HTTP range
 reads. Worker capture files are temporary and local to the worker container.
+The internal legacy `Execute` frame also sends its captured stdout/stderr over
+dispatch before Result, then purges its local files.
 No capture volume is shared between server and worker pods. The server purges
 orphaned spool files on startup and old handles by TTL; storage is unbounded.
 The server-side spool must therefore have enough capacity for expected output.

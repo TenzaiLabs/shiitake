@@ -30,9 +30,12 @@ use shiitake_worker_api::{
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::CString,
-    os::fd::{AsRawFd, FromRawFd},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
+    },
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant, SystemTime},
 };
 use thiserror::Error;
@@ -92,6 +95,7 @@ struct SessionRecord {
     send_lock: Arc<Mutex<()>>,
     state: shiitake_server_api::SessionState,
     created_at: SystemTime,
+    last_activity_at: SystemTime,
     finished_at: Option<SystemTime>,
     opened: Option<oneshot::Sender<Result<(), String>>>,
     closed: Vec<oneshot::Sender<()>>,
@@ -177,6 +181,7 @@ struct HandleRuntime {
     exit_cause: Option<ExitCause>,
     timed_out: bool,
     cancelled: bool,
+    spool_failed: bool,
     /// The exec span, opened at dispatch and dropped at completion so its
     /// exported duration matches the command's wall-clock lifetime. `None`
     /// once the handle has reached a terminal state.
@@ -291,10 +296,10 @@ fn open_capture_stream(
     id: &ExecId,
     stream: capture::Stream,
 ) -> std::io::Result<std::fs::File> {
-    if id.as_str().len() != 32 || !id.as_str().bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !valid_capture_id(id.as_str()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "capture handle must be a canonical UUID",
+            "capture handle has invalid path characters",
         ));
     }
     let component = CString::new(id.as_str())
@@ -329,6 +334,30 @@ fn open_capture_stream(
     Ok(unsafe { std::fs::File::from_raw_fd(file_fd) })
 }
 
+fn valid_capture_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn open_capture_root(root: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let path = CString::new(root.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: path is NUL-terminated and open returns a fresh descriptor.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
 #[derive(Clone)]
 pub struct WorkerPool {
     state: Arc<Mutex<PoolState>>,
@@ -336,7 +365,7 @@ pub struct WorkerPool {
     pod_name: String,
     namespace: String,
     capture_root: PathBuf,
-    capture_dir: Option<Arc<std::fs::File>>,
+    capture_dir: Arc<OnceLock<Arc<std::fs::File>>>,
 }
 
 impl WorkerPool {
@@ -349,13 +378,15 @@ impl WorkerPool {
         // Pin the configured spool directory before request processing. Output
         // writes use relative openat calls against this descriptor, so a
         // worker-supplied frame can never turn into an arbitrary path open.
-        let capture_dir = match std::fs::File::open(&capture_root) {
-            Ok(dir) => Some(Arc::new(dir)),
+        let capture_dir = Arc::new(OnceLock::new());
+        match open_capture_root(&capture_root) {
+            Ok(dir) => {
+                let _ = capture_dir.set(Arc::new(dir));
+            }
             Err(e) => {
                 warn!(root = %capture_root.display(), "could not open capture root: {e}");
-                None
             }
-        };
+        }
         Self {
             state: Arc::new(Mutex::new(PoolState {
                 idle: VecDeque::new(),
@@ -378,10 +409,18 @@ impl WorkerPool {
         &self.capture_root
     }
 
+    fn capture_dir(&self) -> Option<Arc<std::fs::File>> {
+        if let Some(dir) = self.capture_dir.get() {
+            return Some(dir.clone());
+        }
+        let dir = Arc::new(open_capture_root(&self.capture_root).ok()?);
+        let _ = self.capture_dir.set(dir.clone());
+        self.capture_dir.get().cloned()
+    }
+
     pub fn capture_len(&self, id: &ExecId, stream: capture::Stream) -> u64 {
-        self.capture_dir
-            .as_ref()
-            .and_then(|dir| open_capture_stream(dir, id, stream).ok())
+        self.capture_dir()
+            .and_then(|dir| open_capture_stream(&dir, id, stream).ok())
             .and_then(|file| file.metadata().ok())
             .map_or(0, |metadata| metadata.len())
     }
@@ -463,13 +502,18 @@ impl WorkerPool {
     }
 
     pub async fn session_snapshot(&self, id: &SessionId) -> Option<SessionSnapshot> {
-        let s = self.state.lock().await;
-        s.sessions.get(id).map(|r| SessionSnapshot {
-            session_id: id.clone(),
-            worker_id: r.worker_id.clone(),
-            profile: r.profile.clone(),
-            state: r.state,
-            created_at: r.created_at,
+        let mut s = self.state.lock().await;
+        s.sessions.get_mut(id).map(|r| {
+            if r.state == shiitake_server_api::SessionState::Active {
+                r.last_activity_at = SystemTime::now();
+            }
+            SessionSnapshot {
+                session_id: id.clone(),
+                worker_id: r.worker_id.clone(),
+                profile: r.profile.clone(),
+                state: r.state,
+                created_at: r.created_at,
+            }
         })
     }
 
@@ -502,6 +546,7 @@ impl WorkerPool {
                     send_lock: Arc::new(Mutex::new(())),
                     state: shiitake_server_api::SessionState::Opening,
                     created_at: SystemTime::now(),
+                    last_activity_at: SystemTime::now(),
                     opened: Some(ready_tx),
                     closed: Vec::new(),
                     finished_at: None,
@@ -557,6 +602,14 @@ impl WorkerPool {
     }
 
     pub async fn close_session(&self, id: &SessionId) -> Result<SessionSnapshot, SessionError> {
+        self.close_session_inner(id, None).await
+    }
+
+    async fn close_session_inner(
+        &self,
+        id: &SessionId,
+        idle_gate: Option<(SystemTime, Duration)>,
+    ) -> Result<SessionSnapshot, SessionError> {
         let send_lock = {
             let s = self.state.lock().await;
             s.sessions
@@ -568,6 +621,25 @@ impl WorkerPool {
         let send_guard = send_lock.lock().await;
         let (sink, worker_id, rx, send_close) = {
             let mut s = self.state.lock().await;
+            if let Some((now, ttl)) = idle_gate {
+                let rec = s.sessions.get(id).ok_or(SessionError::NotFound)?;
+                let still_idle = rec.state == shiitake_server_api::SessionState::Active
+                    && rec.terminal.is_none()
+                    && !s
+                        .inflight
+                        .values()
+                        .any(|p| p.session_id.as_ref() == Some(id))
+                    && now.duration_since(rec.last_activity_at).unwrap_or_default() > ttl;
+                if !still_idle {
+                    return Ok(SessionSnapshot {
+                        session_id: id.clone(),
+                        worker_id: rec.worker_id.clone(),
+                        profile: rec.profile.clone(),
+                        state: rec.state,
+                        created_at: rec.created_at,
+                    });
+                }
+            }
             let rec = s.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
             if matches!(
                 rec.state,
@@ -628,6 +700,9 @@ impl WorkerPool {
         timeout: f64,
         mode: SessionCommandMode,
     ) -> Result<HandleSnapshot, SessionError> {
+        if !valid_capture_id(request_id.as_str()) {
+            return Err(SessionError::Worker("invalid command handle id".into()));
+        }
         let send_lock = {
             let s = self.state.lock().await;
             s.sessions
@@ -656,17 +731,22 @@ impl WorkerPool {
             )
         };
         let dir = capture::handle_dir(&self.capture_root, &request_id);
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .map_err(|e| SessionError::Worker(e.to_string()))?;
-        for stream in [capture::Stream::Stdout, capture::Stream::Stderr] {
-            tokio::fs::File::create(capture::stream_path(
-                &self.capture_root,
-                &request_id,
-                stream,
-            ))
-            .await
-            .map_err(|e| SessionError::Worker(e.to_string()))?;
+        let setup = async {
+            tokio::fs::create_dir_all(&dir).await?;
+            for stream in [capture::Stream::Stdout, capture::Stream::Stderr] {
+                tokio::fs::File::create(capture::stream_path(
+                    &self.capture_root,
+                    &request_id,
+                    stream,
+                ))
+                .await?;
+            }
+            Ok::<(), std::io::Error>(())
+        }
+        .await;
+        if let Err(e) = setup {
+            let _ = capture::purge(&self.capture_root, &request_id).await;
+            return Err(SessionError::Worker(e.to_string()));
         }
         let started_at = SystemTime::now();
         let span = tracing::info_span!("shiitake.exec", handle = %request_id,
@@ -688,37 +768,53 @@ impl WorkerPool {
                     exit_cause: None,
                     timed_out: false,
                     cancelled: false,
+                    spool_failed: false,
                     span: Some(span),
                 }),
                 completion: Notify::new(),
             }),
         };
-        {
+        let registration = {
             let mut s = self.state.lock().await;
-            let rec = s.sessions.get(id).ok_or(SessionError::NotFound)?;
-            if rec.state != shiitake_server_api::SessionState::Active {
-                return Err(SessionError::NotActive);
+            let error = match s.sessions.get(id) {
+                None => Some(SessionError::NotFound),
+                Some(rec) if rec.state != shiitake_server_api::SessionState::Active => {
+                    Some(SessionError::NotActive)
+                }
+                Some(rec) if mode == SessionCommandMode::Stateful && rec.terminal.is_some() => {
+                    Some(SessionError::TerminalBusy)
+                }
+                Some(_) => None,
+            };
+            if let Some(error) = error {
+                Err(error)
+            } else {
+                s.inflight.insert(
+                    request_id.clone(),
+                    PendingEntry {
+                        sink: sink.clone(),
+                        worker_id: worker_id.clone(),
+                        profile,
+                        session_id: Some(id.clone()),
+                        mode,
+                        started_at: Instant::now(),
+                    },
+                );
+                s.handles.insert(request_id.clone(), row.clone());
+                if mode == SessionCommandMode::Stateful
+                    && let Some(rec) = s.sessions.get_mut(id)
+                {
+                    rec.stateful_count += 1;
+                }
+                if let Some(rec) = s.sessions.get_mut(id) {
+                    rec.last_activity_at = SystemTime::now();
+                }
+                Ok(())
             }
-            if mode == SessionCommandMode::Stateful && rec.terminal.is_some() {
-                return Err(SessionError::TerminalBusy);
-            }
-            s.inflight.insert(
-                request_id.clone(),
-                PendingEntry {
-                    sink: sink.clone(),
-                    worker_id: worker_id.clone(),
-                    profile,
-                    session_id: Some(id.clone()),
-                    mode,
-                    started_at: Instant::now(),
-                },
-            );
-            s.handles.insert(request_id.clone(), row.clone());
-            if mode == SessionCommandMode::Stateful
-                && let Some(rec) = s.sessions.get_mut(id)
-            {
-                rec.stateful_count += 1;
-            }
+        };
+        if let Err(error) = registration {
+            let _ = capture::purge(&self.capture_root, &request_id).await;
+            return Err(error);
         }
         let execute = ExecuteFrame {
             request_id: request_id.clone(),
@@ -760,13 +856,14 @@ impl WorkerPool {
             return Err(SessionError::NotActive);
         }
         if rec.terminal.is_some() {
-            return Err(SessionError::Busy);
+            return Err(SessionError::TerminalBusy);
         }
         if rec.stateful_count > 0 {
             return Err(SessionError::TerminalBusy);
         }
         let (tx, rx) = mpsc::channel(64);
         rec.terminal = Some(tx);
+        rec.last_activity_at = SystemTime::now();
         Ok(TerminalAttachment {
             session_id: id.clone(),
             sink: rec.sink.clone(),
@@ -778,6 +875,7 @@ impl WorkerPool {
         let mut s = self.state.lock().await;
         if let Some(rec) = s.sessions.get_mut(id) {
             rec.terminal = None;
+            rec.last_activity_at = SystemTime::now();
         }
     }
 
@@ -819,6 +917,9 @@ impl WorkerPool {
     /// Result frame (or its connection drops).
     pub async fn dispatch(&self, execute: ExecuteFrame) -> Result<HandleSnapshot, DispatchError> {
         let handle_id = execute.request_id.clone();
+        if !valid_capture_id(handle_id.as_str()) {
+            return Err(DispatchError::Send("invalid command handle id".into()));
+        }
         let started_at = SystemTime::now();
 
         let worker = {
@@ -832,22 +933,33 @@ impl WorkerPool {
             }
         };
 
-        let serialized = serde_json::to_string(&Frame::Execute(execute))
-            .map_err(|e| DispatchError::Send(e.to_string()))?;
-        if let Err(e) = worker
-            .sink
-            .lock()
-            .await
-            .send(Message::Text(serialized.into()))
-            .await
-        {
-            // Couldn't even send Execute; surface the failure and don't
-            // create a handle. The worker is gone — don't re-register.
-            return Err(DispatchError::Send(format!(
-                "worker {}: {e}",
-                worker.worker_id
-            )));
+        let dir = capture::handle_dir(&self.capture_root, &handle_id);
+        let setup = async {
+            tokio::fs::create_dir_all(&dir).await?;
+            for stream in [capture::Stream::Stdout, capture::Stream::Stderr] {
+                tokio::fs::File::create(capture::stream_path(
+                    &self.capture_root,
+                    &handle_id,
+                    stream,
+                ))
+                .await?;
+            }
+            Ok::<(), std::io::Error>(())
         }
+        .await;
+        if let Err(e) = setup {
+            let _ = capture::purge(&self.capture_root, &handle_id).await;
+            self.state.lock().await.idle.push_front(worker);
+            return Err(DispatchError::Send(format!("capture setup: {e}")));
+        }
+        let serialized = match serde_json::to_string(&Frame::Execute(execute)) {
+            Ok(serialized) => serialized,
+            Err(e) => {
+                let _ = capture::purge(&self.capture_root, &handle_id).await;
+                self.state.lock().await.idle.push_front(worker);
+                return Err(DispatchError::Send(e.to_string()));
+            }
+        };
 
         let span = tracing::info_span!(
             "shiitake.exec",
@@ -866,6 +978,7 @@ impl WorkerPool {
             exit_cause: None,
             timed_out: false,
             cancelled: false,
+            spool_failed: false,
             span: Some(span),
         };
         let row = HandleRow {
@@ -883,7 +996,7 @@ impl WorkerPool {
             s.inflight.insert(
                 handle_id.clone(),
                 PendingEntry {
-                    sink: worker.sink,
+                    sink: worker.sink.clone(),
                     worker_id: worker.worker_id.clone(),
                     profile: worker.profile,
                     session_id: None,
@@ -892,6 +1005,26 @@ impl WorkerPool {
                 },
             );
             s.handles.insert(handle_id.clone(), row.clone());
+        }
+
+        if let Err(e) = worker
+            .sink
+            .lock()
+            .await
+            .send(Message::Text(serialized.into()))
+            .await
+        {
+            {
+                let mut s = self.state.lock().await;
+                s.inflight.remove(&handle_id);
+                s.handles.remove(&handle_id);
+            }
+            let _ = capture::purge(&self.capture_root, &handle_id).await;
+            self.evict_worker(&worker.worker_id).await;
+            return Err(DispatchError::Send(format!(
+                "worker {}: {e}",
+                worker.worker_id
+            )));
         }
 
         Ok(HandleSnapshot {
@@ -917,6 +1050,23 @@ impl WorkerPool {
             let s = self.state.lock().await;
             s.handles.get(handle_id).cloned()
         }?;
+        let mut runtime = row.state.inner.lock().await;
+        runtime.last_polled_at = SystemTime::now();
+        Some(snapshot_from(&row.state, &runtime))
+    }
+
+    pub async fn touch_session_handle(
+        &self,
+        session_id: &SessionId,
+        handle_id: &ExecId,
+    ) -> Option<HandleSnapshot> {
+        let row = {
+            let s = self.state.lock().await;
+            s.handles.get(handle_id).cloned()
+        }?;
+        if row.state.session_id.as_ref() != Some(session_id) {
+            return None;
+        }
         let mut runtime = row.state.inner.lock().await;
         runtime.last_polled_at = SystemTime::now();
         Some(snapshot_from(&row.state, &runtime))
@@ -1105,17 +1255,17 @@ impl WorkerPool {
     async fn route_output(&self, worker_id: &WorkerId, chunk: OutputChunk<'_>) {
         match chunk.stream {
             OutputStream::Stdout | OutputStream::Stderr => {
-                // Output IDs on the wire are untrusted. Only canonical UUIDs
-                // issued by this server may address capture files.
-                let Ok(parsed) = uuid::Uuid::parse_str(chunk.id) else {
+                // Output IDs on the wire are untrusted. Require a single safe
+                // path component and an in-flight handle owned by this worker.
+                if !valid_capture_id(chunk.id) {
                     return;
-                };
-                let id = ExecId::new(parsed.simple().to_string());
+                }
+                let id = ExecId::new(chunk.id);
                 let authorized = {
                     let s = self.state.lock().await;
                     s.inflight
                         .get(&id)
-                        .is_some_and(|p| p.worker_id == *worker_id && p.session_id.is_some())
+                        .is_some_and(|p| p.worker_id == *worker_id)
                 };
                 if !authorized {
                     return;
@@ -1125,18 +1275,23 @@ impl WorkerPool {
                 } else {
                     capture::Stream::Stderr
                 };
-                let Some(dir) = self.capture_dir.as_ref() else {
+                let Some(dir) = self.capture_dir() else {
                     warn!(%id, "capture spool is unavailable");
+                    self.mark_spool_failed(&id).await;
                     return;
                 };
-                match open_capture_stream(dir, &id, which) {
+                match open_capture_stream(&dir, &id, which) {
                     Ok(file) => {
                         let mut file = tokio::fs::File::from_std(file);
                         if let Err(e) = file.write_all(chunk.bytes).await {
                             warn!(%id, "could not spool command output: {e}");
+                            self.mark_spool_failed(&id).await;
                         }
                     }
-                    Err(e) => warn!(%id, "could not open command spool: {e}"),
+                    Err(e) => {
+                        warn!(%id, "could not open command spool: {e}");
+                        self.mark_spool_failed(&id).await;
+                    }
                 }
             }
             OutputStream::Terminal => {
@@ -1153,6 +1308,13 @@ impl WorkerPool {
                 }
             }
             OutputStream::Stdin => warn!(%worker_id, "unexpected terminal input from worker"),
+        }
+    }
+
+    async fn mark_spool_failed(&self, id: &ExecId) {
+        let row = { self.state.lock().await.handles.get(id).cloned() };
+        if let Some(row) = row {
+            row.state.inner.lock().await.spool_failed = true;
         }
     }
 
@@ -1186,7 +1348,7 @@ impl WorkerPool {
         error: Option<String>,
         reusable: bool,
     ) {
-        let (pending, closed, terminal) = {
+        let (pending, closed, terminal, cause) = {
             let mut s = self.state.lock().await;
             let Some(rec) = s.sessions.get_mut(id) else {
                 return;
@@ -1194,6 +1356,12 @@ impl WorkerPool {
             if rec.worker_id != *worker_id {
                 return;
             }
+            let cause =
+                if rec.state == shiitake_server_api::SessionState::Closing && error.is_none() {
+                    ExitCause::Cancelled
+                } else {
+                    ExitCause::WorkerError
+                };
             rec.state = if error.is_some() {
                 shiitake_server_api::SessionState::Failed
             } else {
@@ -1224,7 +1392,7 @@ impl WorkerPool {
             for rid in &ids {
                 s.inflight.remove(rid);
             }
-            (ids, closed, terminal)
+            (ids, closed, terminal, cause)
         };
         if let Some(tx) = terminal {
             tokio::spawn(async move {
@@ -1238,13 +1406,13 @@ impl WorkerPool {
                 if runtime.status == HandleStatus::Running {
                     runtime.finished_at = Some(finished_at);
                     runtime.status = HandleStatus::Error;
-                    runtime.cancelled = true;
-                    runtime.exit_cause = Some(ExitCause::Cancelled);
+                    runtime.cancelled = cause == ExitCause::Cancelled;
+                    runtime.exit_cause = Some(cause);
                     self.finalize_telemetry(
                         &mut runtime,
                         &row.state,
                         finished_at,
-                        ExitCause::Cancelled,
+                        cause,
                         &ResourceUsage::default(),
                     )
                     .await;
@@ -1279,10 +1447,11 @@ impl WorkerPool {
             let mut s = self.state.lock().await;
             if let Some(p) = s.inflight.remove(&result.request_id) {
                 if let Some(id) = p.session_id {
-                    if p.mode == SessionCommandMode::Stateful
-                        && let Some(rec) = s.sessions.get_mut(&id)
-                    {
-                        rec.stateful_count = rec.stateful_count.saturating_sub(1);
+                    if let Some(rec) = s.sessions.get_mut(&id) {
+                        rec.last_activity_at = SystemTime::now();
+                        if p.mode == SessionCommandMode::Stateful {
+                            rec.stateful_count = rec.stateful_count.saturating_sub(1);
+                        }
                     }
                 } else {
                     s.idle.push_back(WorkerEntry {
@@ -1298,7 +1467,6 @@ impl WorkerPool {
         if let Some(error) = &result.error {
             warn!(request_id = %result.request_id, "worker could not run the command: {error}");
         }
-        let (status, cause) = classify(&result);
         let finished_at = SystemTime::now();
         {
             let mut runtime = row.state.inner.lock().await;
@@ -1307,6 +1475,11 @@ impl WorkerPool {
             if runtime.status != HandleStatus::Running {
                 return;
             }
+            let (status, cause) = if runtime.spool_failed {
+                (HandleStatus::Error, ExitCause::OutputError)
+            } else {
+                classify(&result)
+            };
             runtime.finished_at = Some(finished_at);
             runtime.exit_code = result.exit_code;
             runtime.exit_signal = result.exit_signal;
@@ -1548,6 +1721,32 @@ impl WorkerPool {
                     _ => {}
                 }
             }
+            let expired_sessions: Vec<_> = {
+                let s = self.state.lock().await;
+                s.sessions
+                    .iter()
+                    .filter(|(id, rec)| {
+                        rec.state == shiitake_server_api::SessionState::Active
+                            && rec.terminal.is_none()
+                            && !s
+                                .inflight
+                                .values()
+                                .any(|p| p.session_id.as_ref() == Some(id))
+                            && now.duration_since(rec.last_activity_at).unwrap_or_default()
+                                > running_ttl
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            };
+            for id in expired_sessions {
+                warn!(%id, "idle session TTL reached; releasing worker");
+                if let Err(e) = self
+                    .close_session_inner(&id, Some((now, running_ttl)))
+                    .await
+                {
+                    warn!(%id, "could not close idle session: {e}");
+                }
+            }
             let mut s = self.state.lock().await;
             s.sessions.retain(|_, rec| {
                 rec.finished_at
@@ -1660,6 +1859,9 @@ fn classify(r: &ResultFrame) -> (HandleStatus, ExitCause) {
     if r.exit_signal.is_some() {
         return (HandleStatus::Error, ExitCause::Signal);
     }
+    if r.error.is_some() {
+        return (HandleStatus::Error, ExitCause::WorkerError);
+    }
     (HandleStatus::Completed, ExitCause::Normal)
 }
 
@@ -1739,5 +1941,60 @@ mod tests {
         assert!(
             open_capture_stream(&dir, &ExecId::new("../escape"), capture::Stream::Stdout).is_err()
         );
+    }
+
+    #[test]
+    fn capture_root_can_appear_after_pool_construction() {
+        let parent = TempDir::new().unwrap();
+        let root = parent.path().join("late-root");
+        let pool = WorkerPool::new(None, "server".into(), "test".into(), root.clone());
+        let id = ExecId::new(uuid::Uuid::new_v4().simple().to_string());
+        assert_eq!(pool.capture_len(&id, capture::Stream::Stdout), 0);
+        let dir = capture::handle_dir(&root, &id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stdout"), b"ready").unwrap();
+        assert_eq!(pool.capture_len(&id, capture::Stream::Stdout), 5);
+    }
+
+    #[tokio::test]
+    async fn wrong_session_cannot_refresh_a_handle() {
+        let pool = pool();
+        let handle = ExecId::new("one-handle");
+        let owner = SessionId::new("owner");
+        let before = SystemTime::UNIX_EPOCH;
+        let row = HandleRow {
+            state: Arc::new(HandleStateInner {
+                handle_id: handle.clone(),
+                session_id: Some(owner.clone()),
+                worker_id: WorkerId::new("worker"),
+                started_at: before,
+                inner: Mutex::new(HandleRuntime {
+                    last_polled_at: before,
+                    status: HandleStatus::Completed,
+                    finished_at: Some(before),
+                    exit_code: Some(0),
+                    exit_signal: None,
+                    exit_cause: Some(ExitCause::Normal),
+                    timed_out: false,
+                    cancelled: false,
+                    spool_failed: false,
+                    span: None,
+                }),
+                completion: Notify::new(),
+            }),
+        };
+        pool.state
+            .lock()
+            .await
+            .handles
+            .insert(handle.clone(), row.clone());
+        assert!(
+            pool.touch_session_handle(&SessionId::new("intruder"), &handle)
+                .await
+                .is_none()
+        );
+        assert_eq!(row.state.inner.lock().await.last_polled_at, before);
+        assert!(pool.touch_session_handle(&owner, &handle).await.is_some());
+        assert!(row.state.inner.lock().await.last_polled_at > before);
     }
 }

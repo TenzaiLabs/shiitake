@@ -63,6 +63,10 @@ Commands accept a shell `command` string, `timeout` in seconds (default 300),
 and `mode` (`stateful` by default or `parallel`). Identity is fixed for a
 session; callers cannot change it on a command. The worker clears its own
 environment before starting the shell, so include `PATH` for external programs.
+Release sessions explicitly. As a backstop for lost responses and abandoned
+clients, the server releases an idle session after one hour without a session-status
+request, command submission or completion, or terminal attachment. Running commands and
+attached terminals keep their session allocated until they finish or detach.
 
 Output is streamed from worker to server over the authenticated dispatch
 WebSocket. The server spools stdout and stderr locally for range reads. Workers

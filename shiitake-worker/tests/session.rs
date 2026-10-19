@@ -59,6 +59,7 @@ async fn one_session_runs_jobs_in_parallel_and_resets_only_after_release() {
     worker.kill().await.unwrap();
     let _ = worker.wait().await;
     result.unwrap();
+    assert_eq!(std::fs::read_dir(capture.path()).unwrap().count(), 0);
 }
 
 async fn next_frame(ws: &mut WebSocket) -> Frame {
@@ -243,5 +244,60 @@ async fn drive(mut ws: WebSocket, scratch: &str) -> anyhow::Result<()> {
         Frame::SessionClosed { error: None, .. }
     ));
     assert!(!std::path::Path::new(scratch).join("marker").exists());
+
+    let aborted = SessionId::new("session-b");
+    send(
+        &mut ws,
+        Frame::SessionOpen(SessionOpenFrame {
+            session_id: aborted.clone(),
+            working_dir: "/tmp".into(),
+            env: env.clone(),
+            drop_to: None,
+            cols: 80,
+            rows: 24,
+        }),
+    )
+    .await;
+    assert!(matches!(
+        next_frame(&mut ws).await,
+        Frame::SessionReady { error: None, .. }
+    ));
+    send(
+        &mut ws,
+        Frame::SessionRun {
+            session_id: aborted.clone(),
+            mode: SessionCommandMode::Stateful,
+            execute: ExecuteFrame {
+                request_id: ExecId::new("ignored-interrupt"),
+                command: "trap '' INT; sleep 5".into(),
+                working_dir: "/tmp".into(),
+                env,
+                timeout_secs: 0.2,
+                drop_to: None,
+            },
+        },
+    )
+    .await;
+    let mut saw_timeout = false;
+    loop {
+        match next_frame(&mut ws).await {
+            Frame::Result(result) if result.request_id.as_str() == "ignored-interrupt" => {
+                assert!(result.timed_out);
+                assert_eq!(
+                    result.error.as_deref(),
+                    Some("stateful command did not stop")
+                );
+                saw_timeout = true;
+            }
+            Frame::SessionClosed {
+                error: Some(error), ..
+            } => {
+                assert_eq!(error, "stateful command did not stop");
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_timeout);
     Ok(())
 }

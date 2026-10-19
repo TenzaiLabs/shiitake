@@ -23,12 +23,12 @@ use uuid::Uuid;
 
 type HttpError = (StatusCode, String);
 
-fn map_error(error: SessionError) -> HttpError {
+fn map_error(error: SessionError, action: &'static str) -> HttpError {
     if let SessionError::Worker(details) = error {
-        tracing::warn!(%details, "worker failed to prepare session");
+        tracing::warn!(%details, action, "worker request failed");
         return (
             StatusCode::BAD_GATEWAY,
-            "worker could not prepare session".into(),
+            format!("worker could not {action}"),
         );
     }
     let status = match error {
@@ -86,7 +86,7 @@ pub async fn create(
         .pool
         .create_session(req.profile, open)
         .await
-        .map_err(map_error)?;
+        .map_err(|e| map_error(e, "start session"))?;
     Ok((StatusCode::CREATED, Json(response(snap))))
 }
 
@@ -98,7 +98,7 @@ pub async fn status(
         .pool
         .session_snapshot(&id)
         .await
-        .ok_or_else(|| map_error(SessionError::NotFound))?;
+        .ok_or_else(|| map_error(SessionError::NotFound, "find session"))?;
     Ok(Json(response(snap)))
 }
 
@@ -106,7 +106,11 @@ pub async fn close(
     State(state): State<AppState>,
     Path(id): Path<SessionId>,
 ) -> Result<Json<SessionResponse>, HttpError> {
-    let snap = state.pool.close_session(&id).await.map_err(map_error)?;
+    let snap = state
+        .pool
+        .close_session(&id)
+        .await
+        .map_err(|e| map_error(e, "close session"))?;
     Ok(Json(response(snap)))
 }
 
@@ -123,7 +127,7 @@ pub async fn run(
         .pool
         .submit_session_command(&id, rid, req.command, req.timeout, req.mode)
         .await
-        .map_err(map_error)?;
+        .map_err(|e| map_error(e, "submit command"))?;
     Ok((
         StatusCode::ACCEPTED,
         Json(SpawnResponse {
@@ -136,12 +140,10 @@ pub async fn run(
 async fn check_handle(state: &AppState, id: &SessionId, handle: &ExecId) -> Result<(), HttpError> {
     let snap = state
         .pool
-        .touch_and_snapshot(handle)
+        .touch_session_handle(id, handle)
         .await
         .ok_or((StatusCode::NOT_FOUND, "unknown command".into()))?;
-    if snap.session_id.as_ref() != Some(id) {
-        return Err((StatusCode::NOT_FOUND, "unknown command".into()));
-    }
+    debug_assert_eq!(snap.session_id.as_ref(), Some(id));
     Ok(())
 }
 
@@ -188,7 +190,11 @@ pub async fn terminal(
     Path(id): Path<SessionId>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, HttpError> {
-    let attachment = state.pool.attach_terminal(&id).await.map_err(map_error)?;
+    let attachment = state
+        .pool
+        .attach_terminal(&id)
+        .await
+        .map_err(|e| map_error(e, "attach terminal"))?;
     Ok(ws.on_upgrade(move |socket| serve_terminal(state, socket, attachment)))
 }
 
@@ -243,4 +249,19 @@ async fn serve_terminal(state: AppState, socket: WebSocket, mut attachment: Term
         }
     }
     state.pool.detach_terminal(&id).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_errors_hide_details_and_name_the_failed_operation() {
+        let (status, body) = map_error(
+            SessionError::Worker("/private/path: permission denied".into()),
+            "submit command",
+        );
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body, "worker could not submit command");
+    }
 }
