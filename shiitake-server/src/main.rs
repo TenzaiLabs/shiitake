@@ -139,7 +139,7 @@ async fn main() -> Result<()> {
     };
     let api = build_api_router(state);
     let dispatch =
-        build_dispatch_router_with_profiles(pool.clone(), &cfg.dispatch_token, profile_tokens);
+        build_dispatch_router_with_profiles(pool.clone(), &cfg.dispatch_token, profile_tokens)?;
 
     let addrs = ListenAddrs {
         api: format!("{}:{}", cfg.host, cfg.port)

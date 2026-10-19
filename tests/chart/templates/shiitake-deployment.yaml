@@ -55,6 +55,10 @@ spec:
         {{- end }}
       volumes:
         {{- include "shiitake.captureVolume" (dict "root" .) | nindent 8 }}
-        {{- if and (ne .Values.topology "two-pod") .Values.worker.sharedFolder }}
+        {{- $needsSharedFolder := .Values.worker.sharedFolder }}
+        {{- range .Values.workerProfiles }}
+        {{- if .sharedFolder }}{{- $needsSharedFolder = true }}{{- end }}
+        {{- end }}
+        {{- if and (ne .Values.topology "two-pod") $needsSharedFolder }}
         {{- include "shiitake.sharedFolderVolume" (dict "root" .) | nindent 8 }}
         {{- end }}

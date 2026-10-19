@@ -113,7 +113,8 @@ async fn profiles_reserve_workers_and_output_is_spooled_on_server() {
             ("small".into(), "small-token".into()),
             ("root".into(), "root-token".into()),
         ]),
-    );
+    )
+    .unwrap();
     tokio::spawn(async move {
         axum::serve(dispatch, dispatch_app).await.unwrap();
     });
@@ -248,7 +249,8 @@ async fn dispatch_credential_cannot_claim_another_profile() {
         pool.clone(),
         "default-token",
         BTreeMap::from([("isolated".into(), "isolated-token".into())]),
-    );
+    )
+    .unwrap();
     tokio::spawn(async move {
         axum::serve(dispatch, router).await.unwrap();
     });
@@ -277,4 +279,22 @@ async fn dispatch_credential_cannot_claim_another_profile() {
         None | Some(Err(_)) | Some(Ok(Message::Close(_)))
     ));
     assert!(pool.profiles().await.is_empty());
+}
+
+#[tokio::test]
+async fn dispatch_rejects_ambiguous_profile_credentials() {
+    let capture = TempDir::new().unwrap();
+    let pool = Arc::new(WorkerPool::new(
+        None,
+        "server".into(),
+        "test".into(),
+        capture.path().into(),
+    ));
+    for extra in [
+        BTreeMap::from([("default".into(), "other-token".into())]),
+        BTreeMap::from([("isolated".into(), "default-token".into())]),
+        BTreeMap::from([("isolated".into(), String::new())]),
+    ] {
+        assert!(build_dispatch_router_with_profiles(pool.clone(), "default-token", extra).is_err());
+    }
 }

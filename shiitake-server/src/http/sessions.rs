@@ -24,11 +24,18 @@ use uuid::Uuid;
 type HttpError = (StatusCode, String);
 
 fn map_error(error: SessionError) -> HttpError {
+    if let SessionError::Worker(details) = error {
+        tracing::warn!(%details, "worker failed to prepare session");
+        return (
+            StatusCode::BAD_GATEWAY,
+            "worker could not prepare session".into(),
+        );
+    }
     let status = match error {
         SessionError::UnknownProfile | SessionError::NotFound => StatusCode::NOT_FOUND,
         SessionError::Busy => StatusCode::TOO_MANY_REQUESTS,
         SessionError::NotActive | SessionError::TerminalBusy => StatusCode::CONFLICT,
-        SessionError::Worker(_) => StatusCode::BAD_GATEWAY,
+        SessionError::Worker(_) => unreachable!(),
     };
     (status, error.to_string())
 }

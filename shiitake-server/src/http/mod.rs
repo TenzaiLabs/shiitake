@@ -12,7 +12,11 @@ use axum::{
     extract::DefaultBodyLimit,
     routing::{get, post},
 };
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+};
 use tower_http::validate_request::ValidateRequestHeaderLayer;
 
 /// Generic state for shiitake-server's built-in handlers.
@@ -89,6 +93,7 @@ pub fn build_api_router(state: AppState) -> Router {
 /// no longer what protects it.
 pub fn build_dispatch_router(pool: Arc<WorkerPool>, dispatch_token: &str) -> Router {
     build_dispatch_router_with_profiles(pool, dispatch_token, BTreeMap::new())
+        .expect("default dispatch token must be non-empty")
 }
 
 /// Dispatch router that binds each worker credential to one profile. Use this
@@ -97,13 +102,32 @@ pub fn build_dispatch_router_with_profiles(
     pool: Arc<WorkerPool>,
     default_token: &str,
     extra_tokens: BTreeMap<String, String>,
-) -> Router {
+) -> anyhow::Result<Router> {
+    anyhow::ensure!(
+        !default_token.is_empty(),
+        "default dispatch token is required"
+    );
+    let mut seen = HashSet::from([default_token]);
+    for (profile, token) in &extra_tokens {
+        anyhow::ensure!(
+            profile != "default"
+                && !profile.is_empty()
+                && profile
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "invalid additional profile name: {profile}"
+        );
+        anyhow::ensure!(
+            !token.is_empty() && seen.insert(token.as_str()),
+            "each profile needs a distinct non-empty dispatch token"
+        );
+    }
     let mut tokens = BTreeMap::from([("default".to_string(), default_token.to_string())]);
     tokens.extend(extra_tokens);
-    Router::new()
+    Ok(Router::new()
         .route("/dispatch", get(dispatch::connect_scoped))
         .with_state(dispatch::ProfileCredentials {
             pool,
             tokens: Arc::new(tokens),
-        })
+        }))
 }

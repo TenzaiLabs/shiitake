@@ -23,7 +23,6 @@ _RETRYABLE_EXC: tuple[type[Exception], ...] = (
     httpx.WriteError,
     httpx.ReadTimeout,
 )
-_RETRYABLE_STATUS: tuple[int, ...] = (429, 502, 503, 504)
 _API_PREFIX = "/api/v1"
 
 
@@ -363,22 +362,24 @@ class AsyncShiitakeClient(_Base):
         json: dict[str, Any] | None = None,
         extra_headers: dict[str, str] | None = None,
         retry_on_429: bool = False,
+        retry_transport: bool = True,
     ) -> httpx.Response:
         headers = self._headers()
         if extra_headers:
             headers.update(extra_headers)
         last_exc: Exception | None = None
-        for attempt in range(self._max_retries):
+        attempts = self._max_retries if (retry_transport or retry_on_429) else 1
+        for attempt in range(attempts):
             try:
                 resp = await self._http.request(method, url, headers=headers, json=json)
             except _RETRYABLE_EXC as exc:
                 last_exc = exc
-                if attempt + 1 >= self._max_retries:
+                if not retry_transport or attempt + 1 >= attempts:
                     break
                 await asyncio.sleep(self._backoff(attempt))
                 continue
-            if retry_on_429 and resp.status_code in _RETRYABLE_STATUS:
-                if attempt + 1 >= self._max_retries:
+            if retry_on_429 and resp.status_code == 429:
+                if attempt + 1 >= attempts:
                     return resp
                 await asyncio.sleep(self._backoff(attempt))
                 continue
@@ -434,7 +435,8 @@ class AsyncShiitakeClient(_Base):
         if drop_to is not None:
             body["drop_to"] = drop_to.to_json() if isinstance(drop_to, DropTo) else dict(drop_to)
         resp = await self._request(
-            "POST", self._url("/sessions"), json=body, retry_on_429=wait_for_worker
+            "POST", self._url("/sessions"), json=body,
+            retry_on_429=wait_for_worker, retry_transport=False,
         )
         if resp.status_code == 429:
             raise NoIdleWorkerError

@@ -1040,7 +1040,12 @@ impl WorkerPool {
     async fn route_output(&self, worker_id: &WorkerId, chunk: OutputChunk<'_>) {
         match chunk.stream {
             OutputStream::Stdout | OutputStream::Stderr => {
-                let id = ExecId::new(chunk.id);
+                // Output IDs on the wire are untrusted. Only canonical UUIDs
+                // issued by this server may address capture files.
+                let Ok(parsed) = uuid::Uuid::parse_str(chunk.id) else {
+                    return;
+                };
+                let id = ExecId::new(parsed.simple().to_string());
                 let authorized = {
                     let s = self.state.lock().await;
                     s.inflight
@@ -1112,7 +1117,7 @@ impl WorkerPool {
         error: Option<String>,
         reusable: bool,
     ) {
-        let (pending, closed): (Vec<ExecId>, Vec<oneshot::Sender<()>>) = {
+        let (pending, closed, terminal) = {
             let mut s = self.state.lock().await;
             let Some(rec) = s.sessions.get_mut(id) else {
                 return;
@@ -1126,9 +1131,7 @@ impl WorkerPool {
                 shiitake_server_api::SessionState::Closed
             };
             rec.finished_at = Some(SystemTime::now());
-            if let Some(tx) = rec.terminal.take() {
-                let _ = tx.try_send(TerminalEvent::Closed(error.clone()));
-            }
+            let terminal = rec.terminal.take();
             if let Some(tx) = rec.opened.take() {
                 let _ = tx.send(Err(error.clone().unwrap_or_else(|| "shell closed".into())));
             }
@@ -1152,8 +1155,13 @@ impl WorkerPool {
             for rid in &ids {
                 s.inflight.remove(rid);
             }
-            (ids, closed)
+            (ids, closed, terminal)
         };
+        if let Some(tx) = terminal {
+            tokio::spawn(async move {
+                let _ = tx.send(TerminalEvent::Closed(error)).await;
+            });
+        }
         for rid in pending {
             if let Some(row) = { self.state.lock().await.handles.get(&rid).cloned() } {
                 let finished_at = SystemTime::now();

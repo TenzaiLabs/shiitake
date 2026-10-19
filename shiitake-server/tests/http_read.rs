@@ -35,7 +35,8 @@ async fn reads_full_and_range_and_suffix() {
         pool.clone(),
         "default-token",
         BTreeMap::from([("isolated".into(), "isolated-token".into())]),
-    );
+    )
+    .unwrap();
     tokio::spawn(async move {
         axum::serve(dispatch, dispatch_app).await.unwrap();
     });

@@ -812,6 +812,9 @@ async fn run_session(
                         });
                     }
                     Err(e) => {
+                        if let Err(purge_error) = capture::purge(capture_root, &rid).await {
+                            warn!(%rid, "could not purge failed stateful setup: {purge_error}");
+                        }
                         let _ = send_worker_frame(
                             sink,
                             &Frame::Result(ResultFrame::errored(
@@ -1046,18 +1049,28 @@ async fn prepare_stateful_job(execute: &ExecuteFrame, root: &Path) -> Result<Str
     let env = dir.join("env");
     let status = dir.join("status");
     Ok(format!(
-        "source {} > {} 2> {}; __shiitake_rc=$?; \
+        "__shiitake_finish() {{ \
+         if [[ ! -e {} ]]; then \
          printf '%s' \"$PWD\" > {}; \
          while IFS= read -r __shiitake_name; do \
          printf '%s=%s\\0' \"$__shiitake_name\" \"${{!__shiitake_name}}\"; \
          done < <(compgen -e) > {}; \
-         printf '%s' \"$__shiitake_rc\" > {}\n",
-        shell_quote(&script),
-        shell_quote(&stdout),
-        shell_quote(&stderr),
+         printf '%s' \"$1\" > {}; \
+         fi; \
+         }}; \
+         __shiitake_interrupted=0; \
+         trap '__shiitake_interrupted=1; __shiitake_finish 130' INT; \
+         source {} > {} 2> {}; __shiitake_rc=$?; \
+         trap - INT; \
+         if [[ \"$__shiitake_interrupted\" == 1 ]]; then __shiitake_rc=130; fi; \
+         __shiitake_finish \"$__shiitake_rc\"\n",
+        shell_quote(&status),
         shell_quote(&cwd),
         shell_quote(&env),
         shell_quote(&status),
+        shell_quote(&script),
+        shell_quote(&stdout),
+        shell_quote(&stderr),
     ))
 }
 

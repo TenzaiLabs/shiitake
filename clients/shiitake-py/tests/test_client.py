@@ -64,6 +64,43 @@ async def test_profile_busy_raises() -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_session_retries_only_when_capacity_is_unavailable() -> None:
+    attempts = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(429, text="busy")
+        return httpx.Response(201, json=session_payload())
+
+    client = await with_mock(handler, max_retries=3, retry_initial_delay=0)
+    session = await client.create_session(wait_for_worker=True)
+    assert session.session_id == "s"
+    assert attempts == 2
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_create_session_does_not_repeat_ambiguous_failure() -> None:
+    for failure in (httpx.ReadTimeout("response lost"), httpx.Response(502, text="failed")):
+        attempts = 0
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if isinstance(failure, Exception):
+                raise failure
+            return failure
+
+        client = await with_mock(handler, max_retries=3, retry_initial_delay=0)
+        with pytest.raises((httpx.ReadTimeout, ShiitakeError)):
+            await client.create_session(wait_for_worker=True)
+        assert attempts == 1
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_session_command_modes_and_range_output() -> None:
     seen: list[tuple[str, str, dict[str, object] | None]] = []
 
