@@ -76,7 +76,6 @@ pub async fn status(
         .touch_and_snapshot(&handle)
         .await
         .ok_or((StatusCode::NOT_FOUND, "unknown handle".into()))?;
-    let root = state.pool.capture_root();
     Ok(Json(StatusResponse {
         handle: snap.handle_id.clone(),
         session_id: snap.session_id,
@@ -89,8 +88,8 @@ pub async fn status(
         exit_signal: snap.exit_signal,
         timed_out: snap.timed_out,
         cancelled: snap.cancelled,
-        stdout_bytes_written: capture::stream_len(root, &snap.handle_id, Stream::Stdout).await,
-        stderr_bytes_written: capture::stream_len(root, &snap.handle_id, Stream::Stderr).await,
+        stdout_bytes_written: state.pool.capture_len(&snap.handle_id, Stream::Stdout),
+        stderr_bytes_written: state.pool.capture_len(&snap.handle_id, Stream::Stderr),
     }))
 }
 

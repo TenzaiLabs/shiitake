@@ -378,6 +378,14 @@ impl WorkerPool {
         &self.capture_root
     }
 
+    pub fn capture_len(&self, id: &ExecId, stream: capture::Stream) -> u64 {
+        self.capture_dir
+            .as_ref()
+            .and_then(|dir| open_capture_stream(dir, id, stream).ok())
+            .and_then(|file| file.metadata().ok())
+            .map_or(0, |metadata| metadata.len())
+    }
+
     /// Drop capture files left by a previous server process.
     ///
     /// Handles live only in memory, so a restart orphans every capture
@@ -1327,18 +1335,8 @@ impl WorkerPool {
             .duration_since(state.started_at)
             .unwrap_or_default()
             .as_secs_f64();
-        let stdout_bytes = capture::stream_len(
-            &self.capture_root,
-            &state.handle_id,
-            capture::Stream::Stdout,
-        )
-        .await;
-        let stderr_bytes = capture::stream_len(
-            &self.capture_root,
-            &state.handle_id,
-            capture::Stream::Stderr,
-        )
-        .await;
+        let stdout_bytes = self.capture_len(&state.handle_id, capture::Stream::Stdout);
+        let stderr_bytes = self.capture_len(&state.handle_id, capture::Stream::Stderr);
         let cause_label: &'static str = cause.into();
         if let Some(span) = runtime.span.take() {
             span.record("exit_cause", cause_label);
