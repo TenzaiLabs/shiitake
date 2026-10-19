@@ -29,6 +29,8 @@ use shiitake_worker_api::{
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    ffi::CString,
+    os::fd::{AsRawFd, FromRawFd},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
@@ -284,6 +286,49 @@ async fn send_frame(sink: &SharedSink, frame: &Frame) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+fn open_capture_stream(
+    root: &std::fs::File,
+    id: &ExecId,
+    stream: capture::Stream,
+) -> std::io::Result<std::fs::File> {
+    if id.as_str().len() != 32 || !id.as_str().bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "capture handle must be a canonical UUID",
+        ));
+    }
+    let component = CString::new(id.as_str())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: root owns a live directory fd and component is NUL-terminated.
+    let dir_fd = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            component.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if dir_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a fresh owned descriptor above.
+    let dir = unsafe { std::fs::File::from_raw_fd(dir_fd) };
+    let name = CString::new(stream.file_name())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: dir owns a live directory fd and name is NUL-terminated.
+    let file_fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_APPEND | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if file_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a fresh owned descriptor above.
+    Ok(unsafe { std::fs::File::from_raw_fd(file_fd) })
+}
+
 #[derive(Clone)]
 pub struct WorkerPool {
     state: Arc<Mutex<PoolState>>,
@@ -291,6 +336,7 @@ pub struct WorkerPool {
     pod_name: String,
     namespace: String,
     capture_root: PathBuf,
+    capture_dir: Option<Arc<std::fs::File>>,
 }
 
 impl WorkerPool {
@@ -300,6 +346,16 @@ impl WorkerPool {
         namespace: String,
         capture_root: PathBuf,
     ) -> Self {
+        // Pin the configured spool directory before request processing. Output
+        // writes use relative openat calls against this descriptor, so a
+        // worker-supplied frame can never turn into an arbitrary path open.
+        let capture_dir = match std::fs::File::open(&capture_root) {
+            Ok(dir) => Some(Arc::new(dir)),
+            Err(e) => {
+                warn!(root = %capture_root.display(), "could not open capture root: {e}");
+                None
+            }
+        };
         Self {
             state: Arc::new(Mutex::new(PoolState {
                 idle: VecDeque::new(),
@@ -314,6 +370,7 @@ impl WorkerPool {
             pod_name,
             namespace,
             capture_root,
+            capture_dir,
         }
     }
 
@@ -1060,9 +1117,13 @@ impl WorkerPool {
                 } else {
                     capture::Stream::Stderr
                 };
-                let path = capture::stream_path(&self.capture_root, &id, which);
-                match tokio::fs::OpenOptions::new().append(true).open(&path).await {
-                    Ok(mut file) => {
+                let Some(dir) = self.capture_dir.as_ref() else {
+                    warn!(%id, "capture spool is unavailable");
+                    return;
+                };
+                match open_capture_stream(dir, &id, which) {
+                    Ok(file) => {
+                        let mut file = tokio::fs::File::from_std(file);
                         if let Err(e) = file.write_all(chunk.bytes).await {
                             warn!(%id, "could not spool command output: {e}");
                         }
@@ -1607,6 +1668,8 @@ fn classify(r: &ResultFrame) -> (HandleStatus, ExitCause) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{io::Write, os::unix::fs::symlink};
+    use tempfile::TempDir;
 
     fn pool() -> WorkerPool {
         WorkerPool::new(
@@ -1643,6 +1706,40 @@ mod tests {
         assert_eq!(
             pool.worker_location(&id, &None),
             ("shiitake-server-abc", "shiitake", "worker-3")
+        );
+    }
+
+    #[test]
+    fn output_spool_uses_only_real_files_under_the_pinned_root() {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let dir = std::fs::File::open(root.path()).unwrap();
+        let good = ExecId::new(uuid::Uuid::new_v4().simple().to_string());
+        let good_dir = capture::handle_dir(root.path(), &good);
+        std::fs::create_dir(&good_dir).unwrap();
+        std::fs::write(good_dir.join("stdout"), b"before").unwrap();
+        open_capture_stream(&dir, &good, capture::Stream::Stdout)
+            .unwrap()
+            .write_all(b" after")
+            .unwrap();
+        assert_eq!(
+            std::fs::read(good_dir.join("stdout")).unwrap(),
+            b"before after"
+        );
+
+        let forged = ExecId::new(uuid::Uuid::new_v4().simple().to_string());
+        symlink(outside.path(), capture::handle_dir(root.path(), &forged)).unwrap();
+        assert!(open_capture_stream(&dir, &forged, capture::Stream::Stdout).is_err());
+        let swapped = ExecId::new(uuid::Uuid::new_v4().simple().to_string());
+        let swapped_dir = capture::handle_dir(root.path(), &swapped);
+        std::fs::create_dir(&swapped_dir).unwrap();
+        let outside_file = outside.path().join("output");
+        std::fs::write(&outside_file, b"untouched").unwrap();
+        symlink(&outside_file, swapped_dir.join("stdout")).unwrap();
+        assert!(open_capture_stream(&dir, &swapped, capture::Stream::Stdout).is_err());
+        assert_eq!(std::fs::read(outside_file).unwrap(), b"untouched");
+        assert!(
+            open_capture_stream(&dir, &ExecId::new("../escape"), capture::Stream::Stdout).is_err()
         );
     }
 }
