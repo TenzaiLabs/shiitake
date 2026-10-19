@@ -48,6 +48,7 @@ use tokio_tungstenite::{
     },
 };
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Sink = SplitSink<Ws, Message>;
@@ -764,6 +765,43 @@ enum SessionEvent {
     },
 }
 
+/// The shell writes this private, per-command marker to its PTY only after the
+/// sourced script and state snapshot have finished. A status file alone is not
+/// completion evidence: the command can edit files in its capture directory.
+struct ShellCompletion {
+    marker: Vec<u8>,
+    pending: Vec<u8>,
+    complete: watch::Sender<bool>,
+    seen: bool,
+}
+
+impl ShellCompletion {
+    fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        if self.seen {
+            return bytes.to_vec();
+        }
+        self.pending.extend_from_slice(bytes);
+        if let Some(pos) = self
+            .pending
+            .windows(self.marker.len())
+            .position(|window| window == self.marker)
+        {
+            let mut output = self.pending[..pos].to_vec();
+            output.extend_from_slice(&self.pending[pos + self.marker.len()..]);
+            self.pending.clear();
+            self.seen = true;
+            let _ = self.complete.send(true);
+            return output;
+        }
+        let keep = (1..self.marker.len())
+            .rev()
+            .find(|&n| self.pending.ends_with(&self.marker[..n]))
+            .unwrap_or(0);
+        let ready = self.pending.len() - keep;
+        self.pending.drain(..ready).collect()
+    }
+}
+
 /// One worker hosts one session, but runs several jobs concurrently. The PTY
 /// shell stays alive across jobs and is only hung up when the session closes.
 /// The dispatch socket is the sole writer so output and results stay ordered.
@@ -823,6 +861,7 @@ async fn run_session(
     let mut running: HashMap<ExecId, watch::Sender<bool>> = HashMap::new();
     let mut queued: VecDeque<(ExecuteFrame, SessionCommandMode)> = VecDeque::new();
     let mut stateful_running: Option<ExecId> = None;
+    let mut shell_completion: Option<ShellCompletion> = None;
     let mut current_workdir = open.working_dir.clone();
     let mut current_env = open.env.clone();
     current_env.insert("TERM".into(), "xterm-256color".into());
@@ -848,17 +887,24 @@ async fn run_session(
             let (cancel_tx, cancel_rx) = watch::channel(false);
             if mode == SessionCommandMode::Stateful {
                 match prepare_stateful_job(&execute, capture_root).await {
-                    Ok(line) => {
+                    Ok((line, marker)) => {
                         if let Err(e) = pty.write_input(line.as_bytes()).await {
                             close_error = Some(format!("could not submit shell command: {e}"));
                             break;
                         }
+                        let (complete, completed) = watch::channel(false);
+                        shell_completion = Some(ShellCompletion {
+                            marker,
+                            pending: Vec::new(),
+                            complete,
+                            seen: false,
+                        });
                         stateful_running = Some(rid.clone());
                         running.insert(rid, cancel_tx);
                         let tx = event_tx.clone();
                         let root = capture_root.to_path_buf();
                         tasks.spawn(async move {
-                            watch_stateful_job(execute, cancel_rx, root, tx).await;
+                            watch_stateful_job(execute, cancel_rx, completed, root, tx).await;
                         });
                     }
                     Err(e) => {
@@ -891,10 +937,18 @@ async fn run_session(
             output = pty.read_output(&mut buf) => match output {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    let output = if let Some(completion) = shell_completion.as_mut() {
+                        completion.feed(&buf[..n])
+                    } else {
+                        buf[..n].to_vec()
+                    };
+                    if output.is_empty() {
+                        continue;
+                    }
                     let chunk = OutputChunk {
                         stream: OutputStream::Terminal,
                         id: session_id.as_str(),
-                        bytes: &buf[..n],
+                        bytes: &output,
                     };
                     if sink.send(Message::Binary(chunk.encode().into())).await.is_err() {
                         lost = true;
@@ -910,16 +964,26 @@ async fn run_session(
                         break;
                     }
                 }
-                SessionEvent::Result(result) => {
-                    running.remove(&result.request_id);
+                SessionEvent::Result(mut result) => {
                     if stateful_running.as_ref() == Some(&result.request_id) {
-                        if let Ok((cwd, env)) = read_shell_state(capture_root, &result.request_id).await {
-                            current_workdir = cwd;
-                            current_env = env;
+                        match read_shell_state(capture_root, &result.request_id).await {
+                            Ok((cwd, env)) => {
+                                current_workdir = cwd;
+                                current_env = env;
+                            }
+                            Err(e) => {
+                                let error = format!("could not read completed shell state: {e:#}");
+                                result.error = Some(error.clone());
+                                close_error = Some(error);
+                                let _ = send_worker_frame(sink, &Frame::Result(result)).await;
+                                break;
+                            }
                         }
                         stateful_running = None;
+                        shell_completion = None;
                         let _ = capture::purge(capture_root, &result.request_id).await;
                     }
+                    running.remove(&result.request_id);
                     if send_worker_frame(sink, &Frame::Result(result)).await.is_err() {
                         lost = true;
                         break;
@@ -1101,7 +1165,7 @@ fn give_to_session_user(path: &Path, execute: &ExecuteFrame) -> Result<()> {
 /// shell, so `cd` and `export` persist. Output is redirected to local files,
 /// tailed into the dispatch socket, and spooled by the server. The final
 /// status file is written only after the cwd and exported environment snapshot.
-async fn prepare_stateful_job(execute: &ExecuteFrame, root: &Path) -> Result<String> {
+async fn prepare_stateful_job(execute: &ExecuteFrame, root: &Path) -> Result<(String, Vec<u8>)> {
     let dir = capture::handle_dir(root, &execute.request_id);
     tokio::fs::create_dir_all(&dir).await?;
     give_to_session_user(&dir, execute)?;
@@ -1117,30 +1181,32 @@ async fn prepare_stateful_job(execute: &ExecuteFrame, root: &Path) -> Result<Str
     let cwd = dir.join("cwd");
     let env = dir.join("env");
     let status = dir.join("status");
-    Ok(format!(
+    let nonce = Uuid::new_v4();
+    let marker = format!("\x1b]shiitake-complete:{nonce}\x07").into_bytes();
+    let line = format!(
         "__shiitake_finish() {{ \
-         if [[ ! -e {} ]]; then \
          printf '%s' \"$PWD\" > {}; \
          while IFS= read -r __shiitake_name; do \
          printf '%s=%s\\0' \"$__shiitake_name\" \"${{!__shiitake_name}}\"; \
          done < <(compgen -e) > {}; \
          printf '%s' \"$1\" > {}; \
-         fi; \
          }}; \
          __shiitake_interrupted=0; \
-         trap '__shiitake_interrupted=1; __shiitake_finish 130' INT; \
+         trap '__shiitake_interrupted=1; return 130' INT; \
          source {} > {} 2> {}; __shiitake_rc=$?; \
          trap - INT; \
          if [[ \"$__shiitake_interrupted\" == 1 ]]; then __shiitake_rc=130; fi; \
-         __shiitake_finish \"$__shiitake_rc\"\n",
-        shell_quote(&status),
+         __shiitake_finish \"$__shiitake_rc\"; \
+         printf '\\033]shiitake-complete:{}\\007'\n",
         shell_quote(&cwd),
         shell_quote(&env),
         shell_quote(&status),
         shell_quote(&script),
         shell_quote(&stdout),
         shell_quote(&stderr),
-    ))
+        nonce,
+    );
+    Ok((line, marker))
 }
 
 async fn read_shell_state(root: &Path, rid: &ExecId) -> Result<(String, BTreeMap<String, String>)> {
@@ -1160,6 +1226,7 @@ async fn read_shell_state(root: &Path, rid: &ExecId) -> Result<(String, BTreeMap
 async fn watch_stateful_job(
     execute: ExecuteFrame,
     cancel: watch::Receiver<bool>,
+    completed: watch::Receiver<bool>,
     root: PathBuf,
     tx: mpsc::Sender<SessionEvent>,
 ) {
@@ -1188,8 +1255,11 @@ async fn watch_stateful_job(
     let mut timed_out = false;
     let mut cancelled = false;
     let exit_code = loop {
-        if let Ok(code) = tokio::fs::read_to_string(&status_path).await {
-            break code.trim().parse::<i32>().ok();
+        if *completed.borrow()
+            && let Ok(code) = tokio::fs::read_to_string(&status_path).await
+            && let Ok(parsed) = code.trim().parse::<i32>()
+        {
+            break Some(parsed);
         }
         if interrupted_at.is_none() && (*cancel.borrow() || started.elapsed() >= timeout) {
             cancelled = *cancel.borrow();

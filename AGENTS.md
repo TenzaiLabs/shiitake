@@ -47,6 +47,9 @@ At creation a session fixes its profile, working directory, environment,
 Bash process: shell state persists, and these jobs run in order. Parallel jobs
 run in child Bash processes and may overlap; they inherit the last recorded
 working directory and exported environment, but do not change parent state.
+Stateful completion requires the shell's per-command PTY marker after `source`
+returns and a valid cwd/environment/status snapshot; the capture status file
+alone is writable by the session user and is never proof of completion.
 A terminal attachment is detachable. It cannot overlap a stateful job, and at
 most one attachment is active at a time. Command strings use shell syntax.
 The worker clears the inherited environment; pass `PATH` for external tools.

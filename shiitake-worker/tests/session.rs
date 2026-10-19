@@ -23,14 +23,16 @@ async fn one_session_runs_jobs_in_parallel_and_resets_only_after_release() {
     let port = listener.local_addr().unwrap().port();
     let (tx, mut rx) = mpsc::channel(1);
     let scratch_path = scratch.path().to_string_lossy().into_owned();
+    let capture_path = capture.path().to_string_lossy().into_owned();
     let app = Router::new().route(
         "/dispatch",
         get(move |ws: WebSocketUpgrade| {
             let scratch_path = scratch_path.clone();
+            let capture_path = capture_path.clone();
             let tx = tx.clone();
             async move {
                 ws.on_upgrade(move |socket| async move {
-                    let result = drive(socket, &scratch_path).await;
+                    let result = drive(socket, &scratch_path, &capture_path).await;
                     let _ = tx.send(result).await;
                 })
             }
@@ -76,7 +78,7 @@ async fn send(ws: &mut WebSocket, frame: Frame) {
         .unwrap();
 }
 
-async fn drive(mut ws: WebSocket, scratch: &str) -> anyhow::Result<()> {
+async fn drive(mut ws: WebSocket, scratch: &str, capture: &str) -> anyhow::Result<()> {
     let Frame::Hello {
         worker_id, profile, ..
     } = next_frame(&mut ws).await
@@ -123,6 +125,38 @@ async fn drive(mut ws: WebSocket, scratch: &str) -> anyhow::Result<()> {
     loop {
         if let Frame::Result(result) = next_frame(&mut ws).await {
             assert_eq!(result.request_id.as_str(), "setup");
+            assert_eq!(result.exit_code, Some(0));
+            break;
+        }
+    }
+    send(
+        &mut ws,
+        Frame::SessionRun {
+            session_id: session.clone(),
+            mode: SessionCommandMode::Stateful,
+            execute: ExecuteFrame {
+                request_id: ExecId::new("forged"),
+                command: format!("printf 0 > {capture}/forged/status; sleep 0.4; echo finished"),
+                working_dir: "/tmp".into(),
+                env: env.clone(),
+                timeout_secs: 5.0,
+                drop_to: None,
+            },
+        },
+    )
+    .await;
+    let early = timeout(Duration::from_millis(150), async {
+        loop {
+            if let Frame::Result(result) = next_frame(&mut ws).await {
+                break result;
+            }
+        }
+    })
+    .await;
+    assert!(early.is_err(), "forged status completed a running command");
+    loop {
+        if let Frame::Result(result) = next_frame(&mut ws).await {
+            assert_eq!(result.request_id.as_str(), "forged");
             assert_eq!(result.exit_code, Some(0));
             break;
         }
