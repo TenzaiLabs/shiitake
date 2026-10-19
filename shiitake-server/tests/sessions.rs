@@ -1,3 +1,8 @@
+use axum::{
+    Router,
+    body::{Body, Bytes, to_bytes},
+    http::{Method, Request, StatusCode, header::CONTENT_TYPE},
+};
 use futures_util::{SinkExt, StreamExt};
 use shiitake_server::{
     http::{AppState, build_api_router, build_dispatch_router_with_profiles},
@@ -15,6 +20,28 @@ use tokio_tungstenite::tungstenite::{
     client::IntoClientRequest,
     http::header::{AUTHORIZATION, HeaderValue},
 };
+use tower::ServiceExt;
+
+async fn api_call(
+    app: &Router,
+    method: Method,
+    uri: String,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, Bytes) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(AUTHORIZATION, "Bearer api-token")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            body.map_or_else(String::new, |value| value.to_string()),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, bytes)
+}
 
 async fn fake_worker(port: u16, id: &'static str, profile: &'static str) {
     let mut req = format!("ws://127.0.0.1:{port}/dispatch")
@@ -118,8 +145,6 @@ async fn profiles_reserve_workers_and_output_is_spooled_on_server() {
     tokio::spawn(async move {
         axum::serve(dispatch, dispatch_app).await.unwrap();
     });
-    let api = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let api_port = api.local_addr().unwrap().port();
     let state = AppState {
         pool: pool.clone(),
         auth_token: Arc::new("api-token".into()),
@@ -128,13 +153,9 @@ async fn profiles_reserve_workers_and_output_is_spooled_on_server() {
         min_ready_workers: 1,
         pty_keepalive: Duration::from_secs(1),
     };
-    tokio::spawn(async move {
-        axum::serve(api, build_api_router(state)).await.unwrap();
-    });
+    let app = build_api_router(state);
     tokio::spawn(fake_worker(dispatch_port, "small-0", "small"));
     tokio::spawn(fake_worker(dispatch_port, "root-0", "root"));
-    let http = reqwest::Client::new();
-    let base = format!("http://127.0.0.1:{api_port}/api/v1");
     timeout(Duration::from_secs(5), async {
         while pool.profiles().await.len() != 2 {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -144,66 +165,54 @@ async fn profiles_reserve_workers_and_output_is_spooled_on_server() {
     .unwrap();
 
     for (profile, expected_worker) in [("small", "small-0"), ("root", "root-0")] {
-        let created = http
-            .post(format!("{base}/sessions"))
-            .bearer_auth("api-token")
-            .json(&CreateSessionRequest {
-                profile: profile.into(),
-                workdir: None,
-                env: BTreeMap::new(),
-                drop_to: None,
-                cols: 80,
-                rows: 24,
-            })
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(created.status(), 201);
-        let session: SessionResponse = created.json().await.unwrap();
+        let create = serde_json::to_value(CreateSessionRequest {
+            profile: profile.into(),
+            workdir: None,
+            env: BTreeMap::new(),
+            drop_to: None,
+            cols: 80,
+            rows: 24,
+        })
+        .unwrap();
+        let (status, body) = api_call(
+            &app,
+            Method::POST,
+            "/api/v1/sessions".into(),
+            Some(create.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let session: SessionResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(session.worker_id.as_str(), expected_worker);
-        let busy = http
-            .post(format!("{base}/sessions"))
-            .bearer_auth("api-token")
-            .json(&CreateSessionRequest {
-                profile: profile.into(),
-                workdir: None,
-                env: BTreeMap::new(),
-                drop_to: None,
-                cols: 80,
-                rows: 24,
-            })
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(busy.status(), 429);
-        let command = http
-            .post(format!("{base}/sessions/{}/commands", session.session_id))
-            .bearer_auth("api-token")
-            .json(&SessionCommandRequest {
-                command: "echo ignored by fake".into(),
-                timeout: 5.0,
-                mode: shiitake_server_api::SessionCommandMode::Parallel,
-            })
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(command.status(), 202);
-        let spawned: SpawnResponse = command.json().await.unwrap();
+        let (status, _) =
+            api_call(&app, Method::POST, "/api/v1/sessions".into(), Some(create)).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        let (status, body) = api_call(
+            &app,
+            Method::POST,
+            format!("/api/v1/sessions/{}/commands", session.session_id),
+            Some(
+                serde_json::to_value(SessionCommandRequest {
+                    command: "echo ignored by fake".into(),
+                    timeout: 5.0,
+                    mode: shiitake_server_api::SessionCommandMode::Parallel,
+                })
+                .unwrap(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let spawned: SpawnResponse = serde_json::from_slice(&body).unwrap();
         let status_url = format!(
-            "{base}/sessions/{}/commands/{}",
+            "/api/v1/sessions/{}/commands/{}",
             session.session_id, spawned.handle
         );
         timeout(Duration::from_secs(5), async {
             loop {
-                let status: StatusResponse = http
-                    .get(&status_url)
-                    .bearer_auth("api-token")
-                    .send()
-                    .await
-                    .unwrap()
-                    .json()
-                    .await
-                    .unwrap();
+                let (status_code, body) =
+                    api_call(&app, Method::GET, status_url.clone(), None).await;
+                assert_eq!(status_code, StatusCode::OK);
+                let status: StatusResponse = serde_json::from_slice(&body).unwrap();
                 if status.status != shiitake_server_api::HandleStatus::Running {
                     break;
                 }
@@ -212,24 +221,19 @@ async fn profiles_reserve_workers_and_output_is_spooled_on_server() {
         })
         .await
         .unwrap();
-        let body = http
-            .get(format!("{status_url}/stdout"))
-            .bearer_auth("api-token")
-            .send()
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
+        let (status, body) =
+            api_call(&app, Method::GET, format!("{status_url}/stdout"), None).await;
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(&body[..], b"profile-output\n");
-        let closed = http
-            .delete(format!("{base}/sessions/{}", session.session_id))
-            .bearer_auth("api-token")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(closed.status(), 200);
-        let closed: SessionResponse = closed.json().await.unwrap();
+        let (status, body) = api_call(
+            &app,
+            Method::DELETE,
+            format!("/api/v1/sessions/{}", session.session_id),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let closed: SessionResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(closed.state, shiitake_server_api::SessionState::Closed);
     }
 }
