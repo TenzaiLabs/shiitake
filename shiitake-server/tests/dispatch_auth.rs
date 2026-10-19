@@ -3,12 +3,15 @@
 //! protects the dispatcher. The token is checked on the upgrade, before a
 //! WebSocket exists, so an unauthenticated peer never sends a frame.
 
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use shiitake_server::{http::build_dispatch_router, pool::WorkerPool};
 use shiitake_worker_api::{Frame, WorkerId, WorkerLocation};
 use std::{sync::Arc, time::Duration};
 use tempfile::TempDir;
-use tokio::{net::TcpListener, time::sleep};
+use tokio::{
+    net::TcpListener,
+    time::{sleep, timeout},
+};
 use tokio_tungstenite::tungstenite::{
     Message,
     client::IntoClientRequest,
@@ -120,6 +123,12 @@ async fn rejects_a_pre_streaming_worker_before_pool_registration() {
     ))
     .await
     .unwrap();
-    sleep(Duration::from_millis(100)).await;
+    let closed = timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("server did not reject the legacy Hello");
+    assert!(matches!(
+        closed,
+        Some(Ok(Message::Close(_))) | None | Some(Err(_))
+    ));
     assert_eq!(pool.snapshot().await, (0, 0));
 }
