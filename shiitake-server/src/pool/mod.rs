@@ -1598,18 +1598,17 @@ impl WorkerPool {
         // path on a real disconnect (crash/eviction); on reconnect it Hellos
         // and registers afresh. Take the location on the way out — the OOM probe
         // needs it and the liveness entry is about to go.
-        let (location, closed) = {
+        let (location, closed, terminal) = {
             let mut s = self.state.lock().await;
             let mut closed = Vec::new();
+            let mut terminal = None;
             s.idle.retain(|w| w.worker_id != *worker_id);
             if let Some(id) = s.worker_sessions.remove(worker_id)
                 && let Some(rec) = s.sessions.get_mut(&id)
             {
                 rec.state = shiitake_server_api::SessionState::Failed;
                 rec.finished_at = Some(SystemTime::now());
-                if let Some(tx) = rec.terminal.take() {
-                    let _ = tx.try_send(TerminalEvent::Closed(Some("worker disconnected".into())));
-                }
+                terminal = rec.terminal.take();
                 if let Some(tx) = rec.opened.take() {
                     let _ = tx.send(Err("worker disconnected".into()));
                 }
@@ -1631,8 +1630,16 @@ impl WorkerPool {
             (
                 s.liveness.remove(worker_id).and_then(|l| l.location),
                 closed,
+                terminal,
             )
         };
+        if let Some(tx) = terminal {
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(TerminalEvent::Closed(Some("worker disconnected".into())))
+                    .await;
+            });
+        }
         self.report_occupancy().await;
         if pending.is_empty() {
             for tx in closed {

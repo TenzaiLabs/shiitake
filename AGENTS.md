@@ -110,6 +110,8 @@ version unless its scope needs a larger bump.
 - Session command timeouts are checked against `Duration` and timer range at
   the HTTP boundary and again on the worker. A terminal attachment owns its
   reservation and releases it on drop, including failed WebSocket upgrades.
+  Worker-drop closure is queued after any terminal output backlog so an
+  attached client always receives the close event.
 - `/health` is liveness and stays healthy for an empty pool. `/ready` needs
   `SHIITAKE_MIN_READY_WORKERS` registered workers, including allocated ones.
   The two-pod dispatch Service uses `publishNotReadyAddresses` so workers can

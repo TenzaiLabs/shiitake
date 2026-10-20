@@ -6,7 +6,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use shiitake_server::{
     http::{AppState, build_api_router, build_dispatch_router_with_profiles},
-    pool::{SessionError, WorkerPool},
+    pool::{SessionError, TerminalEvent, WorkerPool},
 };
 use shiitake_server_api::{
     CreateSessionRequest, SessionCommandRequest, SessionResponse, SpawnResponse, StatusResponse,
@@ -120,9 +120,86 @@ async fn fake_worker(port: u16, id: &'static str, profile: &'static str) {
                 .await
                 .unwrap();
             }
+            Frame::SessionResize {
+                session_id,
+                cols: 999,
+                ..
+            } => {
+                for _ in 0..64 {
+                    let chunk = OutputChunk {
+                        stream: OutputStream::Terminal,
+                        id: session_id.as_str(),
+                        bytes: b"x",
+                    };
+                    ws.send(Message::Binary(chunk.encode().into()))
+                        .await
+                        .unwrap();
+                }
+                break;
+            }
             _ => {}
         }
     }
+}
+
+#[tokio::test]
+async fn worker_drop_closes_terminal_after_full_output_backlog() {
+    let capture = TempDir::new().unwrap();
+    let pool = Arc::new(WorkerPool::new(
+        None,
+        "server".into(),
+        "test".into(),
+        capture.path().into(),
+    ));
+    let dispatch = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = dispatch.local_addr().unwrap().port();
+    let router =
+        build_dispatch_router_with_profiles(pool.clone(), "default-token", BTreeMap::new())
+            .unwrap();
+    tokio::spawn(async move {
+        axum::serve(dispatch, router).await.unwrap();
+    });
+    tokio::spawn(fake_worker(port, "backlog-worker", "default"));
+    timeout(Duration::from_secs(5), async {
+        while pool.profiles().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let id = SessionId::new("backlog-session");
+    pool.create_session(
+        "default".into(),
+        SessionOpenFrame {
+            session_id: id.clone(),
+            working_dir: "/tmp".into(),
+            env: BTreeMap::new(),
+            drop_to: None,
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    .unwrap();
+    let mut terminal = pool.attach_terminal(&id).await.unwrap();
+    terminal.resize(999, 999).await.unwrap();
+    timeout(Duration::from_secs(5), async {
+        while !pool.profiles().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for _ in 0..64 {
+        assert!(matches!(
+            terminal.recv().await,
+            Some(TerminalEvent::Output(_))
+        ));
+    }
+    assert!(matches!(
+        timeout(Duration::from_secs(2), terminal.recv()).await.unwrap(),
+        Some(TerminalEvent::Closed(Some(reason))) if reason == "worker disconnected"
+    ));
 }
 
 #[tokio::test]
