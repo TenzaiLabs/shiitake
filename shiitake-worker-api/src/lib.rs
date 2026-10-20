@@ -33,7 +33,7 @@ pub struct ExecId(String);
 
 impl ExecId {
     /// Mint a fresh id. Call only at the true origin of an execution — the
-    /// server's UUID mint — never to convert an arbitrary string mid-chain.
+    /// server's handle mint — never to convert an arbitrary string mid-chain.
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }

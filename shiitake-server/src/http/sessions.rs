@@ -23,6 +23,35 @@ use uuid::Uuid;
 
 type HttpError = (StatusCode, String);
 
+/// Public ids use 80 random bits in a short, unambiguous lowercase alphabet.
+/// UUID v4 supplies the random bytes; skip its version and variant bytes so
+/// every encoded bit comes from the random portion.
+fn new_public_id(kind: char) -> String {
+    let uuid = Uuid::new_v4();
+    let bytes = uuid.as_bytes();
+    encode_public_id(
+        kind,
+        [
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[7], bytes[9],
+            bytes[10], bytes[11],
+        ],
+    )
+}
+
+fn encode_public_id(kind: char, bytes: [u8; 10]) -> String {
+    const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
+    let value = bytes
+        .into_iter()
+        .fold(0u128, |value, byte| (value << 8) | u128::from(byte));
+    let mut id = String::with_capacity(18);
+    id.push(kind);
+    id.push('-');
+    for shift in (0..16).rev().map(|n| n * 5) {
+        id.push(ALPHABET[((value >> shift) & 31) as usize] as char);
+    }
+    id
+}
+
 fn map_error(error: SessionError, action: &'static str) -> HttpError {
     if let SessionError::Worker(details) = error {
         tracing::warn!(%details, action, "worker request failed");
@@ -71,7 +100,7 @@ pub async fn create(
             "invalid profile or terminal size".into(),
         ));
     }
-    let id = SessionId::new(Uuid::new_v4().simple().to_string());
+    let id = SessionId::new(new_public_id('s'));
     let open = SessionOpenFrame {
         session_id: id,
         working_dir: req
@@ -122,7 +151,7 @@ pub async fn run(
     if !req.timeout.is_finite() || req.timeout <= 0.0 {
         return Err((StatusCode::BAD_REQUEST, "timeout must be positive".into()));
     }
-    let rid = ExecId::new(Uuid::new_v4().simple().to_string());
+    let rid = ExecId::new(new_public_id('c'));
     let snap = state
         .pool
         .submit_session_command(&id, rid, req.command, req.timeout, req.mode)
@@ -254,6 +283,22 @@ async fn serve_terminal(state: AppState, socket: WebSocket, mut attachment: Term
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_ids_are_short_and_unambiguous() {
+        assert_eq!(encode_public_id('s', [0; 10]), "s-0000000000000000");
+        assert_eq!(encode_public_id('c', [255; 10]), "c-zzzzzzzzzzzzzzzz");
+        for kind in ['s', 'c'] {
+            let id = new_public_id(kind);
+            assert_eq!(id.len(), 18);
+            assert!(id.starts_with(&format!("{kind}-")));
+            assert!(
+                id[2..]
+                    .bytes()
+                    .all(|byte| b"0123456789abcdefghjkmnpqrstvwxyz".contains(&byte))
+            );
+        }
+    }
 
     #[test]
     fn worker_errors_hide_details_and_name_the_failed_operation() {

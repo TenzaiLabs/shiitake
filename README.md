@@ -27,7 +27,7 @@ The public API lives under `/api/v1`. All routes except `/health` and `/ready`
 require `SHIITAKE_AUTH_TOKEN`. `/dispatch` is a separate worker-only listener
 protected by `SHIITAKE_DISPATCH_TOKEN`.
 
-| Method | Path | Purpose |
+| Method | Path | What it does |
 | --- | --- | --- |
 | `GET` | `/profiles` | Connected profiles and their idle/allocated worker counts. |
 | `POST` | `/sessions` | Allocate a worker and start its shell. Returns `201` or `429` when that profile is busy. |
@@ -73,6 +73,8 @@ curl -fsS -X DELETE -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
 Session creation accepts `profile` (default `default`), `workdir`, `env`,
 `drop_to`, `cols`, and `rows`. `drop_to` accepts `uid`, `gid`,
 `supplementary_gids`, `umask`, and optionally `name` and `create_home`.
+Session IDs have the form `s-` plus 16 lowercase letters or digits; command
+handles use `c-` plus the same short alphabet. Both are opaque random IDs.
 Commands accept a shell `command` string, `timeout` in seconds (default 300),
 and `mode` (`stateful` by default or `parallel`). Identity is fixed for a
 session; callers cannot change it on a command. The worker clears its own

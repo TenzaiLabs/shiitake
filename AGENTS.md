@@ -103,6 +103,10 @@ version unless its scope needs a larger bump.
   `SHIITAKE_RESET_PATHS` is supplied by the embedding deployment.
 - The pool selects idle workers in FIFO order within each profile. Keep this
   least-recently-used rotation when returning released workers.
+- Public session IDs (`s-...`) and command handles (`c-...`) each encode 80
+  random bits in 16 lowercase base32 characters without visually ambiguous
+  letters. Keep them compact and opaque; the bearer token provides access
+  control, and callers must not infer meaning from an ID.
 - `/health` is liveness and stays healthy for an empty pool. `/ready` needs
   `SHIITAKE_MIN_READY_WORKERS` registered workers, including allocated ones.
   The two-pod dispatch Service uses `publishNotReadyAddresses` so workers can

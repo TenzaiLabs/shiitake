@@ -187,6 +187,8 @@ async fn profiles_reserve_workers_and_output_is_spooled_on_server() {
         assert_eq!(status, StatusCode::CREATED);
         let session: SessionResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(session.worker_id.as_str(), expected_worker);
+        assert_eq!(session.session_id.as_str().len(), 18);
+        assert!(session.session_id.as_str().starts_with("s-"));
         let (status, _) =
             api_call(&app, Method::POST, "/api/v1/sessions".into(), Some(create)).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
@@ -206,6 +208,8 @@ async fn profiles_reserve_workers_and_output_is_spooled_on_server() {
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
         let spawned: SpawnResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(spawned.handle.as_str().len(), 18);
+        assert!(spawned.handle.as_str().starts_with("c-"));
         let status_url = format!(
             "/api/v1/sessions/{}/commands/{}",
             session.session_id, spawned.handle
