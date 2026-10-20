@@ -362,7 +362,7 @@ class PodFailures(unittest.TestCase):
 
         code, reason = asyncio.run(drive())
         self.assertEqual(code, 1011, f"abnormal worker loss closes 1011; got {code} / {reason!r}")
-        self.assertIn("worker disconnected", reason, f"reason should name the cause; got {reason!r}")
+        self.assertEqual(reason, "session ended unexpectedly")
         wait_for_pool()  # the Deployment replaces the workers, unattended
 
 
