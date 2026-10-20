@@ -136,6 +136,26 @@ async fn fake_worker(port: u16, id: &'static str, profile: &'static str) {
                 }
                 break;
             }
+            Frame::SessionResize {
+                session_id,
+                cols: 998,
+                ..
+            } => {
+                for _ in 0..1024 {
+                    let chunk = OutputChunk {
+                        stream: OutputStream::Terminal,
+                        id: session_id.as_str(),
+                        bytes: &[b'x'; 32 * 1024],
+                    };
+                    if ws
+                        .send(Message::Binary(chunk.encode().into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -202,7 +222,7 @@ async fn worker_drop_closes_terminal_after_full_output_backlog() {
 }
 
 #[tokio::test]
-async fn silent_terminal_client_releases_attachment() {
+async fn silent_or_stalled_terminal_client_releases_attachment() {
     let capture = TempDir::new().unwrap();
     let pool = Arc::new(WorkerPool::new(
         None,
@@ -252,40 +272,50 @@ async fn silent_terminal_client_releases_attachment() {
         .json()
         .await
         .unwrap();
-    let mut req = format!(
-        "ws://127.0.0.1:{api_port}/api/v1/sessions/{}/terminal",
-        session.session_id
-    )
-    .into_client_request()
-    .unwrap();
-    req.headers_mut()
-        .insert(AUTHORIZATION, HeaderValue::from_static("Bearer api-token"));
-    let (_silent_client, _) = tokio_tungstenite::connect_async(req).await.unwrap();
-    assert!(matches!(
-        pool.attach_terminal(&session.session_id).await,
-        Err(SessionError::TerminalBusy)
-    ));
-    let mut replacement = timeout(Duration::from_secs(6), async {
-        loop {
-            match pool.attach_terminal(&session.session_id).await {
-                Ok(attachment) => break attachment,
-                Err(SessionError::TerminalBusy) => {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                Err(e) => panic!("unexpected terminal error: {e}"),
-            }
+    for flood_output in [false, true] {
+        let mut req = format!(
+            "ws://127.0.0.1:{api_port}/api/v1/sessions/{}/terminal",
+            session.session_id
+        )
+        .into_client_request()
+        .unwrap();
+        req.headers_mut()
+            .insert(AUTHORIZATION, HeaderValue::from_static("Bearer api-token"));
+        let (mut silent_client, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        if flood_output {
+            silent_client
+                .send(Message::Text(
+                    r#"{"op":"resize","cols":998,"rows":24}"#.into(),
+                ))
+                .await
+                .unwrap();
         }
-    })
-    .await
-    .unwrap();
-    replacement.detach().await;
-    assert_eq!(
-        pool.session_snapshot(&session.session_id)
-            .await
-            .unwrap()
-            .state,
-        shiitake_server_api::SessionState::Active
-    );
+        assert!(matches!(
+            pool.attach_terminal(&session.session_id).await,
+            Err(SessionError::TerminalBusy)
+        ));
+        let mut replacement = timeout(Duration::from_secs(7), async {
+            loop {
+                match pool.attach_terminal(&session.session_id).await {
+                    Ok(attachment) => break attachment,
+                    Err(SessionError::TerminalBusy) => {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    Err(e) => panic!("unexpected terminal error: {e}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        replacement.detach().await;
+        assert_eq!(
+            pool.session_snapshot(&session.session_id)
+                .await
+                .unwrap()
+                .state,
+            shiitake_server_api::SessionState::Active
+        );
+    }
     pool.close_session(&session.session_id).await.unwrap();
 }
 

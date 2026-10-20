@@ -12,7 +12,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use serde::Deserialize;
 use shiitake_server_api::{
     CreateSessionRequest, HandleSnapshotJson, ProfileResponse, SessionCommandRequest,
@@ -276,6 +276,17 @@ fn terminal_resize(text: &str) -> Result<(u16, u16), ()> {
     }
 }
 
+async fn send_terminal_client(
+    client: &mut SplitSink<WebSocket, Message>,
+    frame: Message,
+    limit: Duration,
+) -> bool {
+    matches!(
+        tokio::time::timeout(limit, client.send(frame)).await,
+        Ok(Ok(()))
+    )
+}
+
 async fn serve_terminal(
     socket: WebSocket,
     mut attachment: TerminalAttachment,
@@ -294,12 +305,12 @@ async fn serve_terminal(
             _ = ping.tick() => {
                 if last_client_frame.elapsed() >= max_silence {
                     tracing::warn!(%id, "terminal client stopped responding");
-                    let _ = client_tx.send(Message::Close(Some(CloseFrame {
+                    let _ = send_terminal_client(&mut client_tx, Message::Close(Some(CloseFrame {
                         code: 1001, reason: "terminal connection timed out".into(),
-                    }))).await;
+                    })), max_silence).await;
                     break;
                 }
-                if client_tx.send(Message::Ping(Vec::new().into())).await.is_err() { break; }
+                if !send_terminal_client(&mut client_tx, Message::Ping(Vec::new().into()), max_silence).await { break; }
             }
             msg = client_rx.next() => match msg {
                 Some(Ok(Message::Binary(b))) => {
@@ -314,9 +325,9 @@ async fn serve_terminal(
                         Ok(size) => size,
                         Err(()) => {
                             tracing::warn!("invalid terminal control frame");
-                            let _ = client_tx.send(Message::Close(Some(CloseFrame {
+                            let _ = send_terminal_client(&mut client_tx, Message::Close(Some(CloseFrame {
                                 code: 1007, reason: "invalid terminal control".into(),
-                            }))).await;
+                            })), max_silence).await;
                             break;
                         }
                     };
@@ -329,9 +340,9 @@ async fn serve_terminal(
                         }
                         Err(error) => {
                             tracing::error!(%error, "could not encode terminal resize frame");
-                            let _ = client_tx.send(Message::Close(Some(CloseFrame {
+                            let _ = send_terminal_client(&mut client_tx, Message::Close(Some(CloseFrame {
                                 code: 1011, reason: "terminal control failed".into(),
-                            }))).await;
+                            })), max_silence).await;
                             break;
                         }
                     }
@@ -343,16 +354,16 @@ async fn serve_terminal(
             },
             data = attachment.recv() => match data {
                 Some(TerminalEvent::Output(bytes)) => {
-                    if client_tx.send(Message::Binary(bytes.into())).await.is_err() { break; }
+                    if !send_terminal_client(&mut client_tx, Message::Binary(bytes.into()), max_silence).await { break; }
                 }
                 Some(TerminalEvent::Closed(error)) => {
-                    let _ = client_tx.send(Message::Close(Some(terminal_close(error)))).await;
+                    let _ = send_terminal_client(&mut client_tx, Message::Close(Some(terminal_close(error))), max_silence).await;
                     break;
                 }
                 None => {
-                    let _ = client_tx.send(Message::Close(Some(CloseFrame {
+                    let _ = send_terminal_client(&mut client_tx, Message::Close(Some(CloseFrame {
                         code: 1011, reason: "worker disconnected".into(),
-                    }))).await;
+                    })), max_silence).await;
                     break;
                 },
             }

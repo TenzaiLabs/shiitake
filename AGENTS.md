@@ -123,6 +123,8 @@ version unless its scope needs a larger bump.
   must use a fixed public message when the worker reports an internal error.
   Attached clients must answer server pings; a silent connection is detached
   after three keepalive intervals so it cannot pin a worker indefinitely.
+  Sends to a client use the same deadline, so a client that stops reading
+  cannot block terminal output forwarding and pin the worker either.
 - `/health` is liveness and stays healthy for an empty pool. `/ready` needs
   `SHIITAKE_MIN_READY_WORKERS` registered workers, including allocated ones.
   The two-pod dispatch Service uses `publishNotReadyAddresses` so workers can
