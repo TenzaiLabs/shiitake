@@ -247,11 +247,10 @@ enum TerminalControl {
     Resize { cols: u16, rows: u16 },
 }
 
-fn terminal_resize(text: &str) -> Result<(u16, u16), String> {
+fn terminal_resize(text: &str) -> Result<(u16, u16), ()> {
     match serde_json::from_str::<TerminalControl>(text) {
         Ok(TerminalControl::Resize { cols, rows }) if cols > 0 && rows > 0 => Ok((cols, rows)),
-        Ok(_) => Err("terminal dimensions must be nonzero".into()),
-        Err(error) => Err(error.to_string()),
+        Ok(_) | Err(_) => Err(()),
     }
 }
 
@@ -270,8 +269,8 @@ async fn serve_terminal(socket: WebSocket, mut attachment: TerminalAttachment) {
                 Some(Ok(Message::Text(t))) => {
                     let (cols, rows) = match terminal_resize(&t) {
                         Ok(size) => size,
-                        Err(error) => {
-                            tracing::warn!(%error, "invalid terminal control frame");
+                        Err(()) => {
+                            tracing::warn!("invalid terminal control frame");
                             let _ = client_tx.send(Message::Close(Some(CloseFrame {
                                 code: 1007, reason: "invalid terminal control".into(),
                             }))).await;

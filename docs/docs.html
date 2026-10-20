@@ -235,7 +235,7 @@ curl -fsS -X DELETE -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
     <p>All public routes are under <code>/api/v1</code>. Only <code>/health</code> and <code>/ready</code> are unauthenticated.</p>
     <div class="table-wrap"><table><thead><tr><th>Method</th><th>Path</th><th>What it does</th></tr></thead><tbody>
       <tr><td>GET</td><td><code>/profiles</code></td><td>Connected profiles and idle/allocated counts.</td></tr>
-      <tr><td>POST</td><td><code>/sessions</code></td><td>Allocate a worker and start its shell. Returns 201, or 429 when the selected profile is busy.</td></tr>
+      <tr><td>POST</td><td><code>/sessions</code></td><td>Allocate a worker and start its shell. Returns 201 on success, 429 when the selected profile is busy, or 502 if the worker fails during creation.</td></tr>
       <tr><td>GET, DELETE</td><td><code>/sessions/{id}</code></td><td>Inspect or release a session.</td></tr>
       <tr><td>POST</td><td><code>/sessions/{id}/commands</code></td><td>Submit a stateful or parallel command. Returns a handle.</td></tr>
       <tr><td>GET</td><td><code>/sessions/{id}/commands</code></td><td>List retained commands in the session, oldest first, with status and output byte counts.</td></tr>
