@@ -6,7 +6,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use shiitake_server::{
     http::{AppState, build_api_router, build_dispatch_router_with_profiles},
-    pool::WorkerPool,
+    pool::{SessionError, WorkerPool},
 };
 use shiitake_server_api::{
     CreateSessionRequest, SessionCommandRequest, SessionResponse, SpawnResponse, StatusResponse,
@@ -189,6 +189,14 @@ async fn profiles_reserve_workers_and_output_is_spooled_on_server() {
         assert_eq!(session.worker_id.as_str(), expected_worker);
         assert_eq!(session.session_id.as_str().len(), 18);
         assert!(session.session_id.as_str().starts_with("s-"));
+        let (status, _) = api_call(
+            &app,
+            Method::POST,
+            format!("/api/v1/sessions/{}/commands", session.session_id),
+            Some(serde_json::json!({"command":"echo never", "timeout":1e100})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         let (status, _) =
             api_call(&app, Method::POST, "/api/v1/sessions".into(), Some(create)).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
@@ -232,6 +240,26 @@ async fn profiles_reserve_workers_and_output_is_spooled_on_server() {
             api_call(&app, Method::GET, format!("{status_url}/stdout"), None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(&body[..], b"profile-output\n");
+        let attachment = pool.attach_terminal(&session.session_id).await.unwrap();
+        assert!(matches!(
+            pool.attach_terminal(&session.session_id).await,
+            Err(SessionError::TerminalBusy)
+        ));
+        drop(attachment); // A failed HTTP upgrade drops its captured attachment.
+        let mut replacement = timeout(Duration::from_secs(2), async {
+            loop {
+                match pool.attach_terminal(&session.session_id).await {
+                    Ok(attachment) => break attachment,
+                    Err(SessionError::TerminalBusy) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(e) => panic!("unexpected terminal error: {e}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        replacement.detach().await;
         let (status, body) = api_call(
             &app,
             Method::DELETE,

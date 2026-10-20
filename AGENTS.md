@@ -107,6 +107,9 @@ version unless its scope needs a larger bump.
   random bits in 16 lowercase base32 characters without visually ambiguous
   letters. Keep them compact and opaque; the bearer token provides access
   control, and callers must not infer meaning from an ID.
+- Session command timeouts are checked against `Duration` and timer range at
+  the HTTP boundary and again on the worker. A terminal attachment owns its
+  reservation and releases it on drop, including failed WebSocket upgrades.
 - `/health` is liveness and stays healthy for an empty pool. `/ready` needs
   `SHIITAKE_MIN_READY_WORKERS` registered workers, including allocated ones.
   The two-pod dispatch Service uses `publishNotReadyAddresses` so workers can

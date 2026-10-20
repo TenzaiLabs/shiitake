@@ -113,6 +113,35 @@ async fn drive(mut ws: WebSocket, scratch: &str, capture: &str) -> anyhow::Resul
         next_frame(&mut ws).await,
         Frame::SessionReady { error: None, .. }
     ));
+    for mode in [SessionCommandMode::Stateful, SessionCommandMode::Parallel] {
+        let id = ExecId::new(format!("invalid-{mode:?}"));
+        send(
+            &mut ws,
+            Frame::SessionRun {
+                session_id: session.clone(),
+                mode,
+                execute: ExecuteFrame {
+                    request_id: id.clone(),
+                    command: format!("echo must-not-run > {scratch}/invalid-timeout"),
+                    working_dir: "/tmp".into(),
+                    env: env.clone(),
+                    timeout_secs: 1e100,
+                    drop_to: None,
+                },
+            },
+        )
+        .await;
+        let Frame::Result(result) = next_frame(&mut ws).await else {
+            panic!("expected an error Result for invalid timeout");
+        };
+        assert_eq!(result.request_id, id);
+        assert!(result.error.unwrap().contains("invalid timeout"));
+        assert!(
+            !std::path::Path::new(scratch)
+                .join("invalid-timeout")
+                .exists()
+        );
+    }
     send(
         &mut ws,
         Frame::SessionRun {

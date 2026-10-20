@@ -148,8 +148,13 @@ pub async fn run(
     Path(id): Path<SessionId>,
     Json(req): Json<SessionCommandRequest>,
 ) -> Result<(StatusCode, Json<SpawnResponse>), HttpError> {
-    if !req.timeout.is_finite() || req.timeout <= 0.0 {
-        return Err((StatusCode::BAD_REQUEST, "timeout must be positive".into()));
+    let valid_timeout = std::time::Duration::try_from_secs_f64(req.timeout)
+        .is_ok_and(|duration| std::time::Instant::now().checked_add(duration).is_some());
+    if req.timeout <= 0.0 || !valid_timeout {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "timeout must be positive and representable".into(),
+        ));
     }
     let rid = ExecId::new(new_public_id('c'));
     let snap = state
@@ -224,7 +229,7 @@ pub async fn terminal(
         .attach_terminal(&id)
         .await
         .map_err(|e| map_error(e, "attach terminal"))?;
-    Ok(ws.on_upgrade(move |socket| serve_terminal(state, socket, attachment)))
+    Ok(ws.on_upgrade(move |socket| serve_terminal(socket, attachment)))
 }
 
 #[derive(Deserialize)]
@@ -233,7 +238,7 @@ enum TerminalControl {
     Resize { cols: u16, rows: u16 },
 }
 
-async fn serve_terminal(state: AppState, socket: WebSocket, mut attachment: TerminalAttachment) {
+async fn serve_terminal(socket: WebSocket, mut attachment: TerminalAttachment) {
     let id = attachment.session_id.clone();
     let writer = attachment.writer();
     let (mut client_tx, mut client_rx) = socket.split();
@@ -277,7 +282,7 @@ async fn serve_terminal(state: AppState, socket: WebSocket, mut attachment: Term
             }
         }
     }
-    state.pool.detach_terminal(&id).await;
+    attachment.detach().await;
 }
 
 #[cfg(test)]

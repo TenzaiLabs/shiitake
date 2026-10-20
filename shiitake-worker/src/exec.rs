@@ -36,11 +36,23 @@ pub struct Outcome {
     pub result: ResultFrame,
 }
 
+pub(crate) fn command_timeout(seconds: f64) -> Result<Duration> {
+    anyhow::ensure!(seconds > 0.0, "timeout must be positive");
+    let duration =
+        Duration::try_from_secs_f64(seconds.max(0.001)).context("timeout is out of range")?;
+    anyhow::ensure!(
+        std::time::Instant::now().checked_add(duration).is_some(),
+        "timeout is out of range"
+    );
+    Ok(duration)
+}
+
 pub async fn run(
     execute: &ExecuteFrame,
     cancel: watch::Receiver<bool>,
     capture_root: &Path,
 ) -> Result<Outcome> {
+    let dur = command_timeout(execute.timeout_secs)?;
     let cpu_before = read_cpu_times().await;
 
     let env = execute.env.clone();
@@ -91,7 +103,6 @@ pub async fn run(
     let raw_pid = child.id().context("child has no pid")?;
     let pid = Pid::from_raw(i32::try_from(raw_pid).context("pid out of range for pid_t")?);
 
-    let dur = Duration::from_secs_f64(execute.timeout_secs.max(0.001));
     let (cancelled, timed_out, exit_status) = wait_with_signals(&mut child, pid, dur, cancel).await;
 
     if timed_out {
@@ -298,6 +309,17 @@ mod tests {
             timeout_secs: 120.0,
             drop_to: None,
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_timeout_is_rejected_before_spawning() {
+        let root = TempDir::new().unwrap();
+        let id = ExecId::new("oversized-timeout");
+        let mut frame = exec_frame(&id, "echo must-not-run".into());
+        frame.timeout_secs = 1e100;
+        let (_tx, rx) = watch::channel(false);
+        assert!(run(&frame, rx, root.path()).await.is_err());
+        assert!(!shiitake_worker_api::capture::handle_dir(root.path(), &id).exists());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

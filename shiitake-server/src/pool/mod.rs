@@ -243,8 +243,11 @@ impl PinnedSession {
 
 pub struct TerminalAttachment {
     pub session_id: SessionId,
+    pool: Arc<WorkerPool>,
     sink: SharedSink,
     output: mpsc::Receiver<TerminalEvent>,
+    reservation: mpsc::Sender<TerminalEvent>,
+    detached: bool,
 }
 
 pub enum TerminalEvent {
@@ -258,6 +261,12 @@ impl TerminalAttachment {
     }
     pub async fn recv(&mut self) -> Option<TerminalEvent> {
         self.output.recv().await
+    }
+    pub async fn detach(&mut self) {
+        self.pool
+            .detach_terminal_if(&self.session_id, &self.reservation)
+            .await;
+        self.detached = true;
     }
     pub async fn send(&self, bytes: &[u8]) -> Result<(), String> {
         let chunk = OutputChunk {
@@ -279,6 +288,24 @@ impl TerminalAttachment {
             rows,
         };
         send_frame(&self.sink, &frame).await
+    }
+}
+
+// The WebSocket upgrade callback may be dropped before it starts. Releasing on
+// drop also covers an aborted handler; the channel check fences a later attach.
+impl Drop for TerminalAttachment {
+    fn drop(&mut self) {
+        if self.detached {
+            return;
+        }
+        let pool = self.pool.clone();
+        let id = self.session_id.clone();
+        let reservation = self.reservation.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                pool.detach_terminal_if(&id, &reservation).await;
+            });
+        }
     }
 }
 
@@ -847,7 +874,7 @@ impl WorkerPool {
     }
 
     pub async fn attach_terminal(
-        &self,
+        self: &Arc<Self>,
         id: &SessionId,
     ) -> Result<TerminalAttachment, SessionError> {
         let mut s = self.state.lock().await;
@@ -862,18 +889,26 @@ impl WorkerPool {
             return Err(SessionError::TerminalBusy);
         }
         let (tx, rx) = mpsc::channel(64);
-        rec.terminal = Some(tx);
+        rec.terminal = Some(tx.clone());
         rec.last_activity_at = SystemTime::now();
         Ok(TerminalAttachment {
             session_id: id.clone(),
+            pool: self.clone(),
             sink: rec.sink.clone(),
             output: rx,
+            reservation: tx,
+            detached: false,
         })
     }
 
-    pub async fn detach_terminal(&self, id: &SessionId) {
+    async fn detach_terminal_if(&self, id: &SessionId, reservation: &mpsc::Sender<TerminalEvent>) {
         let mut s = self.state.lock().await;
-        if let Some(rec) = s.sessions.get_mut(id) {
+        if let Some(rec) = s.sessions.get_mut(id)
+            && rec
+                .terminal
+                .as_ref()
+                .is_some_and(|current| current.same_channel(reservation))
+        {
             rec.terminal = None;
             rec.last_activity_at = SystemTime::now();
         }

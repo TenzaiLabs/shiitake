@@ -920,6 +920,17 @@ async fn run_session(
             execute.working_dir = current_workdir.clone();
             execute.env = current_env.clone();
             execute.drop_to = open.drop_to.clone();
+            let timeout = match crate::exec::command_timeout(execute.timeout_secs) {
+                Ok(timeout) => timeout,
+                Err(e) => {
+                    let _ = send_worker_frame(
+                        sink,
+                        &Frame::Result(ResultFrame::errored(rid, format!("invalid timeout: {e}"))),
+                    )
+                    .await;
+                    continue;
+                }
+            };
             let (cancel_tx, cancel_rx) = watch::channel(false);
             if mode == SessionCommandMode::Stateful {
                 match prepare_stateful_job(&execute, capture_root).await {
@@ -940,7 +951,8 @@ async fn run_session(
                         let tx = event_tx.clone();
                         let root = capture_root.to_path_buf();
                         tasks.spawn(async move {
-                            watch_stateful_job(execute, cancel_rx, completed, root, tx).await;
+                            watch_stateful_job(execute, timeout, cancel_rx, completed, root, tx)
+                                .await;
                         });
                     }
                     Err(e) => {
@@ -1261,6 +1273,7 @@ async fn read_shell_state(root: &Path, rid: &ExecId) -> Result<(String, BTreeMap
 
 async fn watch_stateful_job(
     execute: ExecuteFrame,
+    timeout: Duration,
     cancel: watch::Receiver<bool>,
     completed: watch::Receiver<bool>,
     root: PathBuf,
@@ -1286,7 +1299,6 @@ async fn watch_stateful_job(
     ));
     let status_path = capture::handle_dir(&root, &rid).join("status");
     let started = tokio::time::Instant::now();
-    let timeout = Duration::from_secs_f64(execute.timeout_secs.max(0.001));
     let mut interrupted_at = None;
     let mut timed_out = false;
     let mut cancelled = false;
