@@ -64,7 +64,6 @@ async fn worker_honors_cancel_mid_exec() {
     child.kill().await.expect("kill worker");
     let _ = child.wait().await;
     assert_eq!(result["cancelled"], true);
-    assert_eq!(result["timed_out"], false);
 
     let body = String::from_utf8(stderr).unwrap();
     assert!(
@@ -77,7 +76,7 @@ async fn handle(socket: WebSocket, result_tx: mpsc::Sender<(serde_json::Value, V
     let (mut sink, mut stream) = socket.split();
     let _hello = stream.next().await;
     sink.send(Message::Text(
-        r#"{"kind":"hello_ack","protocol_version":2}"#.into(),
+        r#"{"kind":"hello_ack","protocol_version":3}"#.into(),
     ))
     .await
     .unwrap();
@@ -94,7 +93,6 @@ async fn handle(socket: WebSocket, result_tx: mpsc::Sender<(serde_json::Value, V
         "command": "sleep 30",
         "working_dir": std::env::temp_dir(),
         "env": env,
-        "timeout_secs": 60.0,
     });
 
     sink.send(Message::Text(exec_frame.to_string().into()))

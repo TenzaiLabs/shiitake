@@ -154,7 +154,7 @@ def api(path, method="GET", body=None, token=TOKEN, timeout=10, raw=False):
         return None, str(exc)
 
 
-def spawn(command, timeout=300.0, deadline=120.0):
+def spawn(command, deadline=120.0):
     """Create a session and command, waiting out a recovering server."""
     end = time.monotonic() + deadline
     while time.monotonic() < end:
@@ -162,7 +162,7 @@ def spawn(command, timeout=300.0, deadline=120.0):
         if status == 201:
             sid = payload["session_id"]
             status, payload = api(f"/sessions/{sid}/commands", method="POST", body={
-                "command": command, "timeout": timeout, "mode": "parallel",
+                "command": command, "mode": "parallel",
             })
             if status == 202:
                 _SESSIONS[payload["handle"]] = sid
@@ -205,7 +205,7 @@ def wait_for_terminal(handle, deadline=180.0):
 def running_handle(command="sleep 120"):
     """Spawn `command` and return `(handle, worker_pod)` once it is really
     running on a worker — so a delete lands mid-command, not in the gap."""
-    handle = spawn(command, timeout=600.0)
+    handle = spawn(command)
     end = time.monotonic() + 60.0
     while time.monotonic() < end:
         status, snap = api(f"/sessions/{_SESSIONS[handle]}/commands/{handle}")

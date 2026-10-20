@@ -87,7 +87,7 @@ async fn accepts_a_worker_presenting_the_token() {
             .expect("upgrade with the right token must succeed");
     // A Hello from another pod, the shape the split topology sends.
     let hello = serde_json::to_string(&Frame::Hello {
-        protocol_version: 2,
+        protocol_version: 3,
         worker_id: WorkerId::new("shiitake-workers-xyz"),
         profile: "default".into(),
         location: Some(WorkerLocation {
@@ -110,7 +110,7 @@ async fn accepts_a_worker_presenting_the_token() {
     assert!(matches!(
         serde_json::from_str::<Frame>(&ack).unwrap(),
         Frame::HelloAck {
-            protocol_version: 2
+            protocol_version: 3
         }
     ));
 

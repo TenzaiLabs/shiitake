@@ -67,7 +67,7 @@ async fn dispatch_with_one_fake_worker_marks_handle_completed() {
     let worker_task = tokio::spawn(async move {
         let mut ws = connect_worker(addr.port()).await;
         let hello = serde_json::to_string(&Frame::Hello {
-            protocol_version: 2,
+            protocol_version: 3,
             location: None,
             worker_id: WorkerId::new("fake-0"),
             profile: "default".into(),
@@ -80,7 +80,7 @@ async fn dispatch_with_one_fake_worker_marks_handle_completed() {
         assert!(matches!(
             ack,
             Frame::HelloAck {
-                protocol_version: 2
+                protocol_version: 3
             }
         ));
 
@@ -108,7 +108,6 @@ async fn dispatch_with_one_fake_worker_marks_handle_completed() {
             request_id: exec.request_id,
             exit_code: Some(0),
             exit_signal: None,
-            timed_out: false,
             cancelled: false,
             usage: Default::default(),
             error: None,
@@ -133,7 +132,6 @@ async fn dispatch_with_one_fake_worker_marks_handle_completed() {
             command: "echo hi".into(),
             working_dir: "/tmp".into(),
             env,
-            timeout_secs: 5.0,
             drop_to: None,
         })
         .await
@@ -187,7 +185,7 @@ async fn failed_spool_write_does_not_report_success() {
         let mut ws = connect_worker(port).await;
         ws.send(Message::Text(
             serde_json::to_string(&Frame::Hello {
-                protocol_version: 2,
+                protocol_version: 3,
                 worker_id: WorkerId::new("spool-fail"),
                 profile: "default".into(),
                 location: None,
@@ -222,7 +220,6 @@ async fn failed_spool_write_does_not_report_success() {
                 request_id: execute.request_id,
                 exit_code: Some(0),
                 exit_signal: None,
-                timed_out: false,
                 cancelled: false,
                 usage: Default::default(),
                 error: None,
@@ -240,7 +237,6 @@ async fn failed_spool_write_does_not_report_success() {
             command: "echo lost bytes".into(),
             working_dir: "/tmp".into(),
             env: BTreeMap::new(),
-            timeout_secs: 5.0,
             drop_to: None,
         })
         .await
@@ -289,7 +285,7 @@ async fn worker_drop_marks_handle_worker_died() {
     let worker_task = tokio::spawn(async move {
         let mut ws = connect_worker(addr.port()).await;
         let hello = serde_json::to_string(&Frame::Hello {
-            protocol_version: 2,
+            protocol_version: 3,
             location: None,
             worker_id: WorkerId::new("doomed"),
             profile: "default".into(),
@@ -309,7 +305,6 @@ async fn worker_drop_marks_handle_worker_died() {
             command: "sleep 99".into(),
             working_dir: "/tmp".into(),
             env: BTreeMap::new(),
-            timeout_secs: 60.0,
             drop_to: None,
         })
         .await
@@ -346,7 +341,6 @@ async fn dispatch_without_idle_worker_returns_no_idle() {
             command: "echo".into(),
             working_dir: "/tmp".into(),
             env: BTreeMap::new(),
-            timeout_secs: 1.0,
             drop_to: None,
         })
         .await
@@ -387,7 +381,7 @@ async fn serial_dispatch_rotates_through_idle_workers() {
         // each before starting the next, so the idle order is deterministic.
         let mut ws = connect_worker(addr.port()).await;
         let hello = serde_json::to_string(&Frame::Hello {
-            protocol_version: 2,
+            protocol_version: 3,
             worker_id: WorkerId::new(*id),
             profile: "default".into(),
             location: None,
@@ -406,7 +400,6 @@ async fn serial_dispatch_rotates_through_idle_workers() {
                     request_id: exec.request_id,
                     exit_code: Some(0),
                     exit_signal: None,
-                    timed_out: false,
                     cancelled: false,
                     usage: Default::default(),
                     error: None,
@@ -440,7 +433,6 @@ async fn serial_dispatch_rotates_through_idle_workers() {
                 command: "echo hi".into(),
                 working_dir: "/tmp".into(),
                 env: BTreeMap::new(),
-                timeout_secs: 5.0,
                 drop_to: None,
             })
             .await

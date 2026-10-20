@@ -75,14 +75,41 @@ Session creation accepts `profile` (default `default`), `workdir`, `env`,
 `supplementary_gids`, `umask`, and optionally `name` and `create_home`.
 Session IDs have the form `s-` plus 16 lowercase letters or digits; command
 handles use `c-` plus the same short alphabet. Both are opaque random IDs.
-Commands accept a shell `command` string, `timeout` in seconds (default 300),
-and `mode` (`stateful` by default or `parallel`). Identity is fixed for a
+Commands accept a shell `command` string and `mode` (`stateful` by default or
+`parallel`). There is no command deadline: poll the handle, read output while
+it runs, or cancel it with `DELETE`. Identity is fixed for a
 session; callers cannot change it on a command. The worker clears its own
 environment before starting the shell, so include `PATH` for external programs.
 Release sessions explicitly. As a backstop for lost responses and abandoned
 clients, the server releases an idle session after one hour without a session-status
 request, command submission or completion, or terminal attachment. Running commands and
 attached terminals keep their session allocated until they finish or detach.
+
+For a job whose wall time is unknown, keep the same session and handle. For
+example, after creating `sid` as above:
+
+```bash
+handle=$(curl -fsS -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"command":"echo started; sleep 3600; echo finished","mode":"parallel"}' \
+  "$base/sessions/$sid/commands" |
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["handle"])')
+curl -fsS -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
+  "$base/sessions/$sid/commands/$handle"                 # status: running
+curl -fsS -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
+  "$base/sessions/$sid/commands/$handle/stdout"          # output so far
+curl -fsS -X DELETE -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
+  "$base/sessions/$sid/commands/$handle"                 # cancel this command
+curl -fsS -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
+  "$base/sessions/$sid/commands/$handle"                 # poll for cancelled
+curl -fsS -X DELETE -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
+  "$base/sessions/$sid"                                  # release the worker
+```
+
+Cancellation sends SIGTERM to a parallel command's process group, then
+SIGKILL after a two-second grace period. A stateful command receives an
+interrupt; if it does not stop, the worker closes that session. Status and
+output remain available through the handle until the server's retention period.
 
 Output is streamed from worker to server over the authenticated dispatch
 WebSocket. The server spools stdout and stderr locally for range reads. Workers

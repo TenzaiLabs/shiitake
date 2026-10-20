@@ -52,7 +52,6 @@ def probe_tcp(host, port, connect_timeout=4.0):
     snap, out, err = run(
         f"python3 -c {shlex.quote(script)}",
         env=PATH_ENV,
-        timeout=30.0,
         wait_deadline=60.0,
     )
     assert snap["exit_code"] == 0, f"probe failed to run: {snap} {err!r}"
@@ -68,7 +67,7 @@ class Topology(unittest.TestCase):
         # together, not serially: a resident worker returns straight to idle, so
         # sequential commands could both land on the same one.
         wait_for_idle(2)
-        handles = [spawn("sleep 2", env=PATH_ENV, timeout=30.0) for _ in range(2)]
+        handles = [spawn("sleep 2", env=PATH_ENV) for _ in range(2)]
         snaps = [wait(h, deadline=60.0) for h in handles]
         for snap in snaps:
             self.assertTrue(

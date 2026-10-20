@@ -179,7 +179,7 @@ struct HandleRuntime {
     exit_code: Option<i32>,
     exit_signal: Option<i32>,
     exit_cause: Option<ExitCause>,
-    timed_out: bool,
+    cancel_requested: bool,
     cancelled: bool,
     spool_failed: bool,
     /// The exec span, opened at dispatch and dropped at completion so its
@@ -200,7 +200,6 @@ pub struct HandleSnapshot {
     pub exit_code: Option<i32>,
     pub exit_signal: Option<i32>,
     pub exit_cause: Option<ExitCause>,
-    pub timed_out: bool,
     pub cancelled: bool,
 }
 
@@ -724,7 +723,6 @@ impl WorkerPool {
         id: &SessionId,
         request_id: ExecId,
         command: String,
-        timeout: f64,
         mode: SessionCommandMode,
     ) -> Result<HandleSnapshot, SessionError> {
         if !valid_capture_id(request_id.as_str()) {
@@ -793,7 +791,7 @@ impl WorkerPool {
                     exit_code: None,
                     exit_signal: None,
                     exit_cause: None,
-                    timed_out: false,
+                    cancel_requested: false,
                     cancelled: false,
                     spool_failed: false,
                     span: Some(span),
@@ -848,7 +846,6 @@ impl WorkerPool {
             command,
             working_dir,
             env,
-            timeout_secs: timeout,
             drop_to,
         };
         if let Err(e) = tokio::time::timeout(
@@ -1011,7 +1008,7 @@ impl WorkerPool {
             exit_code: None,
             exit_signal: None,
             exit_cause: None,
-            timed_out: false,
+            cancel_requested: false,
             cancelled: false,
             spool_failed: false,
             span: Some(span),
@@ -1072,7 +1069,6 @@ impl WorkerPool {
             exit_code: None,
             exit_signal: None,
             exit_cause: None,
-            timed_out: false,
             cancelled: false,
         })
     }
@@ -1107,23 +1103,33 @@ impl WorkerPool {
         Some(snapshot_from(&row.state, &runtime))
     }
 
-    /// Cancel a handle: signal the worker to SIGKILL the command, then mark the
-    /// handle `Cancelled` immediately without waiting for a Result. The resident
-    /// worker SIGKILLs the command, resets its sandbox, and sends a
-    /// `Result(cancelled)`; we keep the inflight slot so that Result re-idles
-    /// the worker (see `complete_request`) rather than stranding it. Idempotent
-    /// on terminal handles. Returns None if the handle is unknown.
+    /// Request cancellation and leave the handle running until the worker's
+    /// Result confirms termination. The worker interrupts a stateful command or sends SIGTERM then
+    /// SIGKILL to a parallel command's process group. Keep the inflight slot
+    /// until Result returns; release or recycle the worker after its cleanup.
+    /// Idempotent on terminal handles. Returns None if the handle is unknown.
     pub async fn cancel(&self, handle_id: &ExecId) -> Option<HandleSnapshot> {
         let row = {
             let s = self.state.lock().await;
             s.handles.get(handle_id).cloned()
         }?;
+        let send_cancel = {
+            let mut runtime = row.state.inner.lock().await;
+            if runtime.status == HandleStatus::Running && !runtime.cancel_requested {
+                runtime.cancel_requested = true;
+                true
+            } else {
+                false
+            }
+        };
         // Clone the worker's sink (shared) to send Cancel, but leave the
         // inflight slot in place: the worker is still running and will report a
         // Result once it has killed the command and reset.
-        let sink = {
+        let sink = if send_cancel {
             let s = self.state.lock().await;
             s.inflight.get(handle_id).map(|p| p.sink.clone())
+        } else {
+            None
         };
         if let Some(sink) = sink {
             let frame = Frame::Cancel {
@@ -1139,25 +1145,6 @@ impl WorkerPool {
                 warn!(%handle_id, error = %e, "cancel send failed");
             }
         }
-        let finished_at = SystemTime::now();
-        {
-            let mut runtime = row.state.inner.lock().await;
-            if runtime.status == HandleStatus::Running {
-                runtime.finished_at = Some(finished_at);
-                runtime.cancelled = true;
-                runtime.status = HandleStatus::Error;
-                runtime.exit_cause = Some(ExitCause::Cancelled);
-                self.finalize_telemetry(
-                    &mut runtime,
-                    &row.state,
-                    finished_at,
-                    ExitCause::Cancelled,
-                    &ResourceUsage::default(),
-                )
-                .await;
-            }
-        }
-        row.state.completion.notify_waiters();
         let runtime = row.state.inner.lock().await;
         Some(snapshot_from(&row.state, &runtime))
     }
@@ -1518,7 +1505,6 @@ impl WorkerPool {
             runtime.finished_at = Some(finished_at);
             runtime.exit_code = result.exit_code;
             runtime.exit_signal = result.exit_signal;
-            runtime.timed_out = result.timed_out;
             runtime.cancelled = result.cancelled;
             runtime.status = status;
             runtime.exit_cause = Some(cause);
@@ -1750,10 +1736,7 @@ impl WorkerPool {
                               "idle TTL reached; cancelling");
                         self.cancel(&snap.handle_id).await;
                     }
-                    HandleStatus::Completed
-                    | HandleStatus::Timeout
-                    | HandleStatus::Oomkilled
-                    | HandleStatus::Error
+                    HandleStatus::Completed | HandleStatus::Oomkilled | HandleStatus::Error
                         if idle > terminal_ttl =>
                     {
                         info!(handle_id = %snap.handle_id, idle_s = idle.as_secs(),
@@ -1886,7 +1869,6 @@ fn snapshot_from(state: &HandleStateInner, runtime: &HandleRuntime) -> HandleSna
         exit_code: runtime.exit_code,
         exit_signal: runtime.exit_signal,
         exit_cause: runtime.exit_cause,
-        timed_out: runtime.timed_out,
         cancelled: runtime.cancelled,
     }
 }
@@ -1894,9 +1876,6 @@ fn snapshot_from(state: &HandleStateInner, runtime: &HandleRuntime) -> HandleSna
 fn classify(r: &ResultFrame) -> (HandleStatus, ExitCause) {
     if r.cancelled {
         return (HandleStatus::Error, ExitCause::Cancelled);
-    }
-    if r.timed_out {
-        return (HandleStatus::Timeout, ExitCause::Timeout);
     }
     if r.exit_signal.is_some() {
         return (HandleStatus::Error, ExitCause::Signal);
@@ -2017,7 +1996,7 @@ mod tests {
                     exit_code: Some(0),
                     exit_signal: None,
                     exit_cause: Some(ExitCause::Normal),
-                    timed_out: false,
+                    cancel_requested: false,
                     cancelled: false,
                     spool_failed: false,
                     span: None,
@@ -2038,5 +2017,46 @@ mod tests {
         assert_eq!(row.state.inner.lock().await.last_polled_at, before);
         assert!(pool.touch_session_handle(&owner, &handle).await.is_some());
         assert!(row.state.inner.lock().await.last_polled_at > before);
+    }
+
+    #[tokio::test]
+    async fn cancellation_remains_running_until_worker_confirms_exit() {
+        let pool = pool();
+        let handle = ExecId::new("running-handle");
+        let row = HandleRow {
+            state: Arc::new(HandleStateInner {
+                handle_id: handle.clone(),
+                session_id: Some(SessionId::new("owner")),
+                worker_id: WorkerId::new("worker"),
+                started_at: SystemTime::now(),
+                inner: Mutex::new(HandleRuntime {
+                    last_polled_at: SystemTime::now(),
+                    status: HandleStatus::Running,
+                    finished_at: None,
+                    exit_code: None,
+                    exit_signal: None,
+                    exit_cause: None,
+                    cancel_requested: false,
+                    cancelled: false,
+                    spool_failed: false,
+                    span: None,
+                }),
+                completion: Notify::new(),
+            }),
+        };
+        pool.state
+            .lock()
+            .await
+            .handles
+            .insert(handle.clone(), row.clone());
+        let snap = pool.cancel(&handle).await.unwrap();
+        assert_eq!(snap.status, HandleStatus::Running);
+        assert!(!snap.cancelled);
+        assert!(snap.finished_at.is_none());
+        assert!(row.state.inner.lock().await.cancel_requested);
+        assert_eq!(
+            pool.cancel(&handle).await.unwrap().status,
+            HandleStatus::Running
+        );
     }
 }

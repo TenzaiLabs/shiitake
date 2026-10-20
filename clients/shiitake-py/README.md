@@ -37,5 +37,18 @@ external programs.
 closing it leaves the session and shell running. Install `shiitake-py[pty]`
 for terminal support. `session.run()` collects a bounded amount of output;
 use a handle's `read("stdout", from_=offset, max_=size)` for large streams.
-The synchronous `ShiitakeClient` also provides `create_session()` and a
-context-managed `Session` with `run()`.
+For a short command, use `await session.run("echo hello")`. For a command
+whose wall time is unknown, retain its handle and decide when to cancel:
+
+```python
+job = await session.spawn("echo started; sleep 3600; echo finished", mode="parallel")
+print((await job.poll()).status)        # running
+print((await job.read("stdout")).content)  # output so far
+await job.kill()                         # cancel this command
+print((await job.wait()).exit_cause)     # cancelled
+```
+
+Commands have no wall-time deadline. `AsyncHandle.wait()` polls until a
+terminal status. The synchronous `ShiitakeClient` has the same `Session.run()`,
+`Session.spawn()`, and `Handle.poll()`, `read()`, `kill()`, and `wait()` methods.
+Release the session after the command ends, or use a context manager.

@@ -112,9 +112,9 @@ pub struct WorkerLocation {
     pub container: String,
 }
 
-/// Dispatch wire version. Version 2 streams command output before Result;
-/// version 1 required a capture volume shared by server and worker.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// Dispatch wire version. Version 3 removes command deadlines; version 2
+/// streams command output, and version 1 required a shared capture volume.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -142,9 +142,9 @@ pub enum Frame {
     },
     /// Server → worker: a command to run.
     Execute(ExecuteFrame),
-    /// Server → worker: cancel the in-flight command. Worker SIGKILLs the
-    /// process group and follows up with a Result frame whose `cancelled`
-    /// flag is set.
+    /// Server → worker: cancel the in-flight command. Parallel jobs receive
+    /// SIGTERM then SIGKILL; a stateful shell command receives an interrupt.
+    /// The worker follows up with a Result frame whose `cancelled` flag is set.
     Cancel {
         request_id: ExecId,
     },
@@ -299,15 +299,14 @@ pub struct ExecuteFrame {
     pub command: String,
     pub working_dir: String,
     pub env: BTreeMap<String, String>,
-    pub timeout_secs: f64,
     /// Optional privilege-drop directive. `None` means run as the worker uid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drop_to: Option<DropTo>,
 }
 
 /// Parameters for an interactive PTY session (`Frame::PtyOpen`). Mirrors
-/// `ExecuteFrame`'s identity/cwd/env handling; there is no `timeout_secs` — a
-/// terminal lives until the shell exits or the client disconnects.
+/// `ExecuteFrame`'s identity/cwd/env handling. A terminal lives until the shell
+/// exits or the client disconnects.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PtyOpenFrame {
     pub session_id: ExecId,
@@ -344,7 +343,6 @@ pub struct ResultFrame {
     pub request_id: ExecId,
     pub exit_code: Option<i32>,
     pub exit_signal: Option<i32>,
-    pub timed_out: bool,
     pub cancelled: bool,
     #[serde(default)]
     pub usage: ResourceUsage,
@@ -361,7 +359,6 @@ impl ResultFrame {
             request_id,
             exit_code: None,
             exit_signal: None,
-            timed_out: false,
             cancelled: false,
             usage: ResourceUsage::default(),
             error: Some(message.into()),
@@ -380,7 +377,7 @@ mod tests {
     #[test]
     fn worker_id_is_wire_transparent() {
         let frame = Frame::Hello {
-            protocol_version: 2,
+            protocol_version: 3,
             worker_id: WorkerId::new("worker-0"),
             profile: default_profile(),
             location: None,
@@ -388,7 +385,7 @@ mod tests {
         let json = serde_json::to_string(&frame).unwrap();
         assert_eq!(
             json,
-            r#"{"kind":"hello","worker_id":"worker-0","protocol_version":2}"#
+            r#"{"kind":"hello","worker_id":"worker-0","protocol_version":3}"#
         );
 
         // The pre-newtype payload (a bare string) still deserializes.
@@ -413,7 +410,7 @@ mod tests {
     #[test]
     fn hello_carries_an_optional_worker_location() {
         let frame = Frame::Hello {
-            protocol_version: 2,
+            protocol_version: 3,
             worker_id: WorkerId::new("worker-0"),
             profile: default_profile(),
             location: Some(WorkerLocation {
@@ -425,7 +422,7 @@ mod tests {
         let json = serde_json::to_string(&frame).unwrap();
         assert_eq!(
             json,
-            r#"{"kind":"hello","worker_id":"worker-0","protocol_version":2,"location":{"pod":"shiitake-workers-abc","namespace":"shiitake","container":"worker"}}"#
+            r#"{"kind":"hello","worker_id":"worker-0","protocol_version":3,"location":{"pod":"shiitake-workers-abc","namespace":"shiitake","container":"worker"}}"#
         );
 
         let parsed: Frame = serde_json::from_str(&json).unwrap();
@@ -477,7 +474,7 @@ mod documented_frames {
         let f: Frame = serde_json::from_str(
             r#"{"kind": "hello",
                 "worker_id": "shiitake-workers-6d4b8f9c7-x2k9p",
-                "protocol_version": 2,
+                "protocol_version": 3,
                 "location": {"pod": "shiitake-workers-6d4b8f9c7-x2k9p",
                              "namespace": "shiitake",
                              "container": "worker"}}"#,
@@ -505,7 +502,6 @@ mod documented_frames {
                 "command": "echo hi",
                 "working_dir": "/tmp",
                 "env": {"PATH": "/usr/bin:/bin"},
-                "timeout_secs": 300.0,
                 "drop_to": {"uid": 1000, "gid": 1000, "supplementary_gids": [], "umask": 7}}"#,
         )
         .expect("documented execute frame must deserialize");
@@ -513,7 +509,6 @@ mod documented_frames {
             panic!("expected Execute")
         };
         assert_eq!(e.command, "echo hi");
-        assert_eq!(e.timeout_secs, 300.0);
         assert_eq!(e.drop_to.expect("drop_to").uid, 1000);
     }
 
@@ -534,7 +529,6 @@ mod documented_frames {
                 "request_id": "0f3c",
                 "exit_code": 0,
                 "exit_signal": null,
-                "timed_out": false,
                 "cancelled": false,
                 "usage": {"memory_peak_bytes": 1048576, "memory_limit_bytes": 536870912,
                           "cpu_user_seconds": 0.01, "cpu_system_seconds": 0.00},

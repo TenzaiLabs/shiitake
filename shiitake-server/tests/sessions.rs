@@ -56,7 +56,7 @@ async fn fake_worker(port: u16, id: &'static str, profile: &'static str) {
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
     ws.send(Message::Text(
         serde_json::to_string(&Frame::Hello {
-            protocol_version: 2,
+            protocol_version: 3,
             worker_id: WorkerId::new(id),
             profile: profile.into(),
             location: None,
@@ -96,7 +96,6 @@ async fn fake_worker(port: u16, id: &'static str, profile: &'static str) {
                         request_id: execute.request_id,
                         exit_code: Some(0),
                         exit_signal: None,
-                        timed_out: false,
                         cancelled: false,
                         usage: Default::default(),
                         error: None,
@@ -273,7 +272,7 @@ async fn profiles_reserve_workers_and_output_is_spooled_on_server() {
             Some(serde_json::json!({"command":"echo never", "timeout":1e100})),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         let (status, _) =
             api_call(&app, Method::POST, "/api/v1/sessions".into(), Some(create)).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
@@ -284,7 +283,6 @@ async fn profiles_reserve_workers_and_output_is_spooled_on_server() {
             Some(
                 serde_json::to_value(SessionCommandRequest {
                     command: "echo ignored by fake".into(),
-                    timeout: 5.0,
                     mode: shiitake_server_api::SessionCommandMode::Parallel,
                 })
                 .unwrap(),
@@ -380,7 +378,7 @@ async fn dispatch_credential_cannot_claim_another_profile() {
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
     ws.send(Message::Text(
         serde_json::to_string(&Frame::Hello {
-            protocol_version: 2,
+            protocol_version: 3,
             worker_id: WorkerId::new("spoof"),
             profile: "default".into(),
             location: None,

@@ -7,6 +7,7 @@ import contextlib
 import dataclasses
 import json
 import random
+import time
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -103,7 +104,6 @@ class StatusResponse:
     exit_code: int | None = None
     exit_cause: str | None = None
     exit_signal: int | None = None
-    timed_out: bool = False
     cancelled: bool = False
     stdout_bytes_written: int = 0
     stderr_bytes_written: int = 0
@@ -292,10 +292,9 @@ class AsyncSession:
         return await self._client.session_status(self.session_id)
 
     async def spawn(
-        self, command: str, *, timeout: float = 300.0,
-        mode: CommandMode = "stateful",
+        self, command: str, *, mode: CommandMode = "stateful",
     ) -> AsyncHandle:
-        body = {"command": command, "timeout": timeout, "mode": mode}
+        body = {"command": command, "mode": mode}
         resp = await self._client._request(
             "POST", self._client._url(f"/sessions/{self.session_id}/commands"),
             json=body, retry_transport=False,
@@ -305,10 +304,10 @@ class AsyncSession:
         return AsyncHandle(self._client, self.session_id, d["handle"], d["started_at"])
 
     async def run(
-        self, command: str, *, timeout: float = 300.0,
+        self, command: str, *,
         mode: CommandMode = "stateful", max_inline_bytes: int = 64 * 1024
     ) -> RunResult:
-        handle = await self.spawn(command, timeout=timeout, mode=mode)
+        handle = await self.spawn(command, mode=mode)
         try:
             status = await handle.wait()
             stdout, _ = await handle.slurp("stdout", max_bytes=max_inline_bytes)
@@ -504,6 +503,52 @@ class AsyncShiitakeClient(_Base):
 
 
 
+class Handle:
+    """Synchronous reference to a command that can be polled, read, or cancelled."""
+
+    def __init__(self, client: ShiitakeClient, session_id: str, handle: str, started_at: float) -> None:
+        self._client = client
+        self.session_id = session_id
+        self.handle = handle
+        self.started_at = started_at
+
+    def _url(self) -> str:
+        return self._client._url(f"/sessions/{self.session_id}/commands/{self.handle}")
+
+    def poll(self) -> StatusResponse:
+        resp = self._client._http.get(self._url(), headers=self._client._headers())
+        _raise_for_status(resp)
+        return StatusResponse.from_dict(resp.json())
+
+    def wait(self, poll_interval: float = 0.2) -> StatusResponse:
+        delay = poll_interval
+        while True:
+            status = self.poll()
+            if status.status != "running":
+                return status
+            time.sleep(delay)
+            delay = min(delay * 1.5, 2.0)
+
+    def kill(self) -> None:
+        resp = self._client._http.delete(self._url(), headers=self._client._headers())
+        _raise_for_status(resp)
+
+    def read(self, stream: StreamName, *, from_: int = 0, max_: int | None = None) -> ReadChunk:
+        headers = self._client._headers()
+        if from_ or max_ is not None:
+            end = "" if max_ is None else str(from_ + max_ - 1)
+            headers["Range"] = f"bytes={from_}-{end}"
+        resp = self._client._http.get(f"{self._url()}/{stream}", headers=headers)
+        if resp.status_code == 416:
+            return ReadChunk("", from_, _total_from_content_range(resp.headers.get("content-range")), True)
+        _raise_for_status(resp)
+        body = resp.content
+        cr = resp.headers.get("content-range")
+        total = _total_from_content_range(cr) if (resp.status_code == 206 and cr) else from_ + len(body)
+        next_offset = from_ + len(body)
+        return ReadChunk(body.decode("utf-8", errors="replace"), next_offset, total, next_offset >= total)
+
+
 class ShiitakeClient(_Base):
     """Synchronous client. Commands run through an explicitly created session."""
 
@@ -556,39 +601,15 @@ class Session:
         return SessionResponse(**resp.json())
 
     def run(
-        self, command: str, *, timeout: float = 300.0,
+        self, command: str, *,
         mode: CommandMode = "stateful", max_inline_bytes: int = 64 * 1024
     ) -> RunResult:
-        base = self._client._url(f"/sessions/{self.session_id}/commands")
-        resp = self._client._http.post(
-            base, headers=self._client._headers(),
-            json={"command": command, "timeout": timeout, "mode": mode}
-        )
-        _raise_for_status(resp)
-        handle = resp.json()["handle"]
-        status_url = f"{base}/{handle}"
-        delay = 0.2
-        while True:
-            resp = self._client._http.get(status_url, headers=self._client._headers())
-            _raise_for_status(resp)
-            status = StatusResponse.from_dict(resp.json())
-            if status.status != "running":
-                break
-            import time
-
-            time.sleep(delay)
-            delay = min(delay * 1.5, 2.0)
-        streams: dict[str, str] = {}
-        for stream in ("stdout", "stderr"):
-            resp = self._client._http.get(
-                f"{status_url}/{stream}",
-                headers={**self._client._headers(), "Range": f"bytes=0-{max_inline_bytes - 1}"},
-            )
-            if resp.status_code == 416:
-                streams[stream] = ""
-            else:
-                _raise_for_status(resp)
-                streams[stream] = resp.content.decode("utf-8", errors="replace")
+        handle = self.spawn(command, mode=mode)
+        status = handle.wait()
+        streams = {
+            stream: handle.read(stream, max_=max_inline_bytes).content
+            for stream in ("stdout", "stderr")
+        }
         return RunResult(
             stdout=streams["stdout"], stderr=streams["stderr"],
             exit_code=status.exit_code if status.exit_code is not None else -1,
@@ -596,6 +617,16 @@ class Session:
             stdout_bytes_written=status.stdout_bytes_written,
             stderr_bytes_written=status.stderr_bytes_written,
         )
+
+    def spawn(self, command: str, *, mode: CommandMode = "stateful") -> Handle:
+        base = self._client._url(f"/sessions/{self.session_id}/commands")
+        resp = self._client._http.post(
+            base, headers=self._client._headers(),
+            json={"command": command, "mode": mode}
+        )
+        _raise_for_status(resp)
+        payload = resp.json()
+        return Handle(self._client, self.session_id, payload["handle"], payload["started_at"])
 
     def __enter__(self) -> Session:
         return self

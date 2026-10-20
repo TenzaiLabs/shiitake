@@ -794,11 +794,7 @@ enum SessionEvent {
     Output(ExecId, OutputStream, Vec<u8>),
     Result(ResultFrame),
     Interrupt,
-    Abort {
-        request_id: ExecId,
-        timed_out: bool,
-        cancelled: bool,
-    },
+    Abort { request_id: ExecId },
 }
 
 /// The shell writes this private, per-command marker to its PTY only after the
@@ -920,17 +916,6 @@ async fn run_session(
             execute.working_dir = current_workdir.clone();
             execute.env = current_env.clone();
             execute.drop_to = open.drop_to.clone();
-            let timeout = match crate::exec::command_timeout(execute.timeout_secs) {
-                Ok(timeout) => timeout,
-                Err(e) => {
-                    let _ = send_worker_frame(
-                        sink,
-                        &Frame::Result(ResultFrame::errored(rid, format!("invalid timeout: {e}"))),
-                    )
-                    .await;
-                    continue;
-                }
-            };
             let (cancel_tx, cancel_rx) = watch::channel(false);
             if mode == SessionCommandMode::Stateful {
                 match prepare_stateful_job(&execute, capture_root).await {
@@ -951,8 +936,7 @@ async fn run_session(
                         let tx = event_tx.clone();
                         let root = capture_root.to_path_buf();
                         tasks.spawn(async move {
-                            watch_stateful_job(execute, timeout, cancel_rx, completed, root, tx)
-                                .await;
+                            watch_stateful_job(execute, cancel_rx, completed, root, tx).await;
                         });
                     }
                     Err(e) => {
@@ -1040,13 +1024,12 @@ async fn run_session(
                 SessionEvent::Interrupt => {
                     let _ = pty.write_input(b"\x03").await;
                 }
-                SessionEvent::Abort { request_id, timed_out, cancelled } => {
+                SessionEvent::Abort { request_id } => {
                     let _ = send_worker_frame(sink, &Frame::Result(ResultFrame {
                         request_id,
                         exit_code: None,
                         exit_signal: None,
-                        timed_out,
-                        cancelled,
+                        cancelled: true,
                         usage: ResourceUsage::default(),
                         error: Some("stateful command did not stop".into()),
                     })).await;
@@ -1273,7 +1256,6 @@ async fn read_shell_state(root: &Path, rid: &ExecId) -> Result<(String, BTreeMap
 
 async fn watch_stateful_job(
     execute: ExecuteFrame,
-    timeout: Duration,
     cancel: watch::Receiver<bool>,
     completed: watch::Receiver<bool>,
     root: PathBuf,
@@ -1298,9 +1280,7 @@ async fn watch_stateful_job(
         done_rx,
     ));
     let status_path = capture::handle_dir(&root, &rid).join("status");
-    let started = tokio::time::Instant::now();
     let mut interrupted_at = None;
-    let mut timed_out = false;
     let mut cancelled = false;
     let exit_code = loop {
         if *completed.borrow()
@@ -1309,9 +1289,8 @@ async fn watch_stateful_job(
         {
             break Some(parsed);
         }
-        if interrupted_at.is_none() && (*cancel.borrow() || started.elapsed() >= timeout) {
-            cancelled = *cancel.borrow();
-            timed_out = !cancelled;
+        if interrupted_at.is_none() && *cancel.borrow() {
+            cancelled = true;
             interrupted_at = Some(tokio::time::Instant::now());
             if tx.send(SessionEvent::Interrupt).await.is_err() {
                 abandon_stateful_job(done_tx, out, err, &root, &rid).await;
@@ -1320,13 +1299,7 @@ async fn watch_stateful_job(
         }
         if interrupted_at.is_some_and(|at| at.elapsed() > Duration::from_secs(2)) {
             abandon_stateful_job(done_tx, out, err, &root, &rid).await;
-            let _ = tx
-                .send(SessionEvent::Abort {
-                    request_id: rid,
-                    timed_out,
-                    cancelled,
-                })
-                .await;
+            let _ = tx.send(SessionEvent::Abort { request_id: rid }).await;
             return;
         }
         sleep(Duration::from_millis(10)).await;
@@ -1339,7 +1312,6 @@ async fn watch_stateful_job(
             request_id: rid,
             exit_code,
             exit_signal: None,
-            timed_out,
             cancelled,
             usage: ResourceUsage::default(),
             error: None,

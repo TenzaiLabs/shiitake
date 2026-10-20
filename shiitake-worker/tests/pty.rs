@@ -162,7 +162,7 @@ async fn drive(
         other => panic!("expected Hello, got {other:?}"),
     }
     sink.send(Message::Text(
-        r#"{"kind":"hello_ack","protocol_version":2}"#.into(),
+        r#"{"kind":"hello_ack","protocol_version":3}"#.into(),
     ))
     .await
     .unwrap();

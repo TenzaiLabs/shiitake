@@ -29,7 +29,7 @@ can register before server readiness succeeds. The server ServiceAccount has a
 pod-reader Role with `get` permission for OOM detection.
 
 `test_exec.py` covers profile allocation, environment, working directory,
-stateful and parallel commands, streamed/ranged output, cancellation, timeout,
+stateful and parallel commands, streamed/ranged output, cancellation, unbounded command duration,
 OOM, and readiness. `test_two_pod.py` checks the split deployment and network
 policy. The shiitake-py tests cover the client and detachable terminal,
 including terminal signals, resize, byte transparency, named-user drops, and

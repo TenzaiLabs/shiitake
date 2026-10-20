@@ -90,7 +90,7 @@ async fn drive(mut ws: WebSocket, scratch: &str, capture: &str) -> anyhow::Resul
     send(
         &mut ws,
         Frame::HelloAck {
-            protocol_version: 2,
+            protocol_version: 3,
         },
     )
     .await;
@@ -113,35 +113,6 @@ async fn drive(mut ws: WebSocket, scratch: &str, capture: &str) -> anyhow::Resul
         next_frame(&mut ws).await,
         Frame::SessionReady { error: None, .. }
     ));
-    for mode in [SessionCommandMode::Stateful, SessionCommandMode::Parallel] {
-        let id = ExecId::new(format!("invalid-{mode:?}"));
-        send(
-            &mut ws,
-            Frame::SessionRun {
-                session_id: session.clone(),
-                mode,
-                execute: ExecuteFrame {
-                    request_id: id.clone(),
-                    command: format!("echo must-not-run > {scratch}/invalid-timeout"),
-                    working_dir: "/tmp".into(),
-                    env: env.clone(),
-                    timeout_secs: 1e100,
-                    drop_to: None,
-                },
-            },
-        )
-        .await;
-        let Frame::Result(result) = next_frame(&mut ws).await else {
-            panic!("expected an error Result for invalid timeout");
-        };
-        assert_eq!(result.request_id, id);
-        assert!(result.error.unwrap().contains("invalid timeout"));
-        assert!(
-            !std::path::Path::new(scratch)
-                .join("invalid-timeout")
-                .exists()
-        );
-    }
     send(
         &mut ws,
         Frame::SessionRun {
@@ -152,7 +123,6 @@ async fn drive(mut ws: WebSocket, scratch: &str, capture: &str) -> anyhow::Resul
                 command: format!("cd {scratch}; export SESSION_VALUE=kept"),
                 working_dir: "/tmp".into(),
                 env: env.clone(),
-                timeout_secs: 10.0,
                 drop_to: None,
             },
         },
@@ -175,7 +145,6 @@ async fn drive(mut ws: WebSocket, scratch: &str, capture: &str) -> anyhow::Resul
                 command: format!("printf 0 > {capture}/forged/status; sleep 0.4; echo finished"),
                 working_dir: "/tmp".into(),
                 env: env.clone(),
-                timeout_secs: 5.0,
                 drop_to: None,
             },
         },
@@ -215,7 +184,6 @@ async fn drive(mut ws: WebSocket, scratch: &str, capture: &str) -> anyhow::Resul
                     command: cmd,
                     working_dir: "/tmp".into(),
                     env: env.clone(),
-                    timeout_secs: 10.0,
                     drop_to: None,
                 },
             },
@@ -257,24 +225,36 @@ async fn drive(mut ws: WebSocket, scratch: &str, capture: &str) -> anyhow::Resul
             session_id: session.clone(),
             mode: SessionCommandMode::Stateful,
             execute: ExecuteFrame {
-                request_id: ExecId::new("timed"),
+                request_id: ExecId::new("long-running"),
                 command: "sleep 30".into(),
                 working_dir: "/tmp".into(),
                 env: env.clone(),
-                timeout_secs: 0.2,
                 drop_to: None,
             },
         },
     )
     .await;
+    // A command with unknown wall time stays running until the caller cancels it.
+    assert!(
+        timeout(Duration::from_millis(350), next_frame(&mut ws))
+            .await
+            .is_err()
+    );
+    send(
+        &mut ws,
+        Frame::Cancel {
+            request_id: ExecId::new("long-running"),
+        },
+    )
+    .await;
     loop {
         match next_frame(&mut ws).await {
-            Frame::Result(result) if result.request_id.as_str() == "timed" => {
-                assert!(result.timed_out);
+            Frame::Result(result) if result.request_id.as_str() == "long-running" => {
+                assert!(result.cancelled);
                 break;
             }
             Frame::SessionClosed { error, .. } => {
-                anyhow::bail!("session closed after timeout: {error:?}")
+                anyhow::bail!("session closed after cancellation: {error:?}")
             }
             _ => {}
         }
@@ -285,11 +265,10 @@ async fn drive(mut ws: WebSocket, scratch: &str, capture: &str) -> anyhow::Resul
             session_id: session.clone(),
             mode: SessionCommandMode::Stateful,
             execute: ExecuteFrame {
-                request_id: ExecId::new("after-timeout"),
+                request_id: ExecId::new("after-cancel"),
                 command: "test \"$SESSION_VALUE\" = kept".into(),
                 working_dir: "/tmp".into(),
                 env: env.clone(),
-                timeout_secs: 10.0,
                 drop_to: None,
             },
         },
@@ -297,7 +276,7 @@ async fn drive(mut ws: WebSocket, scratch: &str, capture: &str) -> anyhow::Resul
     .await;
     loop {
         if let Frame::Result(result) = next_frame(&mut ws).await {
-            assert_eq!(result.request_id.as_str(), "after-timeout");
+            assert_eq!(result.request_id.as_str(), "after-cancel");
             assert_eq!(result.exit_code, Some(0));
             break;
         }
@@ -342,22 +321,29 @@ async fn drive(mut ws: WebSocket, scratch: &str, capture: &str) -> anyhow::Resul
                 command: "trap '' INT; sleep 5".into(),
                 working_dir: "/tmp".into(),
                 env,
-                timeout_secs: 0.2,
                 drop_to: None,
             },
         },
     )
     .await;
-    let mut saw_timeout = false;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    send(
+        &mut ws,
+        Frame::Cancel {
+            request_id: ExecId::new("ignored-interrupt"),
+        },
+    )
+    .await;
+    let mut saw_result = false;
     loop {
         match next_frame(&mut ws).await {
             Frame::Result(result) if result.request_id.as_str() == "ignored-interrupt" => {
-                assert!(result.timed_out);
+                assert!(result.cancelled);
                 assert_eq!(
                     result.error.as_deref(),
                     Some("stateful command did not stop")
                 );
-                saw_timeout = true;
+                saw_result = true;
             }
             Frame::SessionClosed {
                 error: Some(error), ..
@@ -368,6 +354,6 @@ async fn drive(mut ws: WebSocket, scratch: &str, capture: &str) -> anyhow::Resul
             _ => {}
         }
     }
-    assert!(saw_timeout);
+    assert!(saw_result);
     Ok(())
 }

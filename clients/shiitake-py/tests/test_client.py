@@ -144,7 +144,7 @@ async def test_session_command_modes_and_range_output() -> None:
     client = await with_mock(handler)
     session = await client.create_session(profile="isolated")
     handle = await session.spawn("echo hi", mode="parallel")
-    assert seen[-1][2] == {"command": "echo hi", "timeout": 300.0, "mode": "parallel"}
+    assert seen[-1][2] == {"command": "echo hi", "mode": "parallel"}
     status = await handle.wait()
     assert status.session_id == "s"
     chunk = await handle.read("stdout", max_=10)
@@ -207,7 +207,9 @@ async def test_profiles_readiness_and_error() -> None:
 
 
 def test_sync_client_requires_session() -> None:
+    seen: list[tuple[str, str]] = []
     def handler(req: httpx.Request) -> httpx.Response:
+        seen.append((req.method, req.url.path))
         if req.url.path == "/api/v1/sessions" and req.method == "POST":
             return httpx.Response(201, json=session_payload())
         if req.url.path.endswith("/commands"):
@@ -230,4 +232,9 @@ def test_sync_client_requires_session() -> None:
         result = session.run("echo ok")
         assert result.stdout == "ok\n"
         assert result.exit_code == 0
+        handle = session.spawn("sleep 100", mode="parallel")
+        assert handle.poll().status == "completed"
+        assert handle.read("stdout", max_=10).content == "ok\n"
+        handle.kill()
+    assert ("DELETE", "/api/v1/sessions/s/commands/h") in seen
     client.close()

@@ -62,7 +62,7 @@ _SESSIONS = {}  # handle -> session id
 _RELEASED = set()
 
 
-def spawn(command, env=None, timeout=300.0, workdir=None, busy_deadline=90.0,
+def spawn(command, env=None, workdir=None, busy_deadline=90.0,
           profile="default", mode="parallel"):
     """Reserve a worker, submit a command, and remember its session for release."""
     global _TOTAL_429
@@ -77,7 +77,7 @@ def spawn(command, env=None, timeout=300.0, workdir=None, busy_deadline=90.0,
             sid = payload["session_id"]
             status, command_payload = _request(
                 "POST", f"/sessions/{sid}/commands",
-                {"command": command, "timeout": timeout, "mode": mode},
+                {"command": command, "mode": mode},
             )
             if status != 202:
                 _request("DELETE", f"/sessions/{sid}")
@@ -108,13 +108,8 @@ def command_path(handle):
 def wait_for_idle(count, deadline=60.0):
     """Block until at least `count` workers are idle (connected and free).
 
-    Workers are one-shot: each runs a single command and exits, then the
-    deployment restarts it and it reconnects fresh. So the pool drains as
-    earlier tests run and replenishes asynchronously. The concurrency check
-    dispatches several commands expecting them to overlap; if it starts before
-    the pool has refilled, some dispatches hit 429 (no idle worker) and retry
-    on a backoff that spreads them out past the commands' own runtime, so they
-    never overlap. Gate on idle capacity first to make the check deterministic."""
+    Each new session reserves a worker. Gate concurrent session allocation on
+    idle capacity so the commands can overlap instead of retrying after 429."""
     end = time.monotonic() + deadline
     while True:
         _, health = _request("GET", "/health", token=None)
@@ -177,9 +172,9 @@ def read_all(handle, stream):
     return body.decode(errors="replace")
 
 
-def run(command, env=None, timeout=300.0, workdir=None, wait_deadline=90.0,
+def run(command, env=None, workdir=None, wait_deadline=90.0,
         profile="default", mode="parallel"):
-    handle = spawn(command, env=env, timeout=timeout, workdir=workdir,
+    handle = spawn(command, env=env, workdir=workdir,
                    profile=profile, mode=mode)
     snap = wait(handle, deadline=wait_deadline)
     return snap, read_all(handle, "stdout"), read_all(handle, "stderr")
@@ -302,15 +297,29 @@ class OutputCapture(unittest.TestCase):
 
 
 class Lifecycle(unittest.TestCase):
-    def test_30_timeout(self):
-        handle = spawn("sleep 30", env=PATH_ENV, timeout=2.0)
+    def test_30_unpredictable_long_command_can_be_observed_and_cancelled(self):
+        # The caller does not predict wall time. Read output and poll while it runs.
+        handle = spawn("echo started; sleep 30; echo finished", env=PATH_ENV)
+        end = time.monotonic() + 10
+        while True:
+            snap = get_status(handle)
+            status, body = read_stream(handle, "stdout")
+            if b"started\n" in body:
+                break
+            self.assertLess(time.monotonic(), end, "command did not start")
+            time.sleep(0.1)
+        self.assertEqual(status, 200)
+        self.assertEqual(snap["status"], "running")
+        self.assertNotIn("timed_out", snap)
+        status, payload = _request("DELETE", command_path(handle))
+        self.assertEqual(status, 200, msg=payload)
         snap = wait(handle, deadline=20.0)
-        self.assertEqual(snap["status"], "timeout")
-        self.assertTrue(snap["timed_out"])
-        self.assertEqual(snap["exit_cause"], "timeout")
+        self.assertTrue(snap["cancelled"])
+        self.assertEqual(snap["exit_cause"], "cancelled")
+        self.assertNotIn("finished", read_all(handle, "stdout"))
 
     def test_31_cancel(self):
-        handle = spawn("sleep 30", env=PATH_ENV, timeout=60.0)
+        handle = spawn("sleep 30", env=PATH_ENV)
         # Give the worker a moment to actually start the command.
         time.sleep(1.0)
         status, payload = _request("DELETE", command_path(handle))
@@ -326,7 +335,7 @@ class Lifecycle(unittest.TestCase):
         # probe reports `oom_container`. Without oom-group the offending
         # subprocess alone is killed and the worker reports `signal` instead —
         # accept either, but it must never look like a clean exit.
-        handle = spawn("python3 -c 'bytearray(2_000_000_000)'", env=PATH_ENV, timeout=60.0)
+        handle = spawn("python3 -c 'bytearray(2_000_000_000)'", env=PATH_ENV)
         snap = wait(handle, deadline=60.0)
         self.assertNotEqual(snap["status"], "completed", msg=snap)
         self.assertIn(snap["exit_cause"], ("oom_container", "signal"), msg=snap)
@@ -338,11 +347,10 @@ class Concurrency(unittest.TestCase):
         # Fewer than the pool size so every command should find an idle worker
         # without waiting; they overlap, so the server reports them inflight.
         n = max(2, min(POOL_SIZE - 1, 6))
-        # Earlier tests cycled one-shot workers out of the pool; wait for it to
-        # refill so all n commands dispatch back-to-back (no 429 backoff) and
-        # actually run concurrently.
+        # Wait for idle capacity so all n sessions allocate back-to-back and
+        # their commands actually overlap.
         wait_for_idle(n)
-        handles = [spawn("sleep 2", env=PATH_ENV, timeout=30.0) for _ in range(n)]
+        handles = [spawn("sleep 2", env=PATH_ENV) for _ in range(n)]
         # Sample health across the run window — the peak inflight is the
         # parallelism we're proving. (A single sample can land in the gap
         # between dispatches or after the first command has already finished.)
@@ -371,7 +379,7 @@ class Readiness(unittest.TestCase):
         handles = []
         for profile in profiles:
             for _ in range(profile["idle"]):
-                handles.append(spawn("sleep 3", env=PATH_ENV, timeout=30.0,
+                handles.append(spawn("sleep 3", env=PATH_ENV,
                                      profile=profile["name"]))
         try:
             # Poll across the busy window: every sample must be ready, and at

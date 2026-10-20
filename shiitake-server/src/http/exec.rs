@@ -38,7 +38,6 @@ pub async fn exec(
         command: req.command,
         working_dir: workdir,
         env: req.env,
-        timeout_secs: req.timeout,
         drop_to: req.drop_to,
     };
     let snap = dispatch(&state, frame).await?;
@@ -86,7 +85,6 @@ pub async fn status(
         exit_code: snap.exit_code,
         exit_cause: snap.exit_cause,
         exit_signal: snap.exit_signal,
-        timed_out: snap.timed_out,
         cancelled: snap.cancelled,
         stdout_bytes_written: state.pool.capture_len(&snap.handle_id, Stream::Stdout),
         stderr_bytes_written: state.pool.capture_len(&snap.handle_id, Stream::Stderr),

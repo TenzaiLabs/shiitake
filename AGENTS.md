@@ -41,8 +41,8 @@ All authenticated public routes are under `/api/v1`: `GET /profiles`,
 unauthenticated. Legacy `/exec` and `/pty` public routes were removed in the
 0.5.0 session API. The internal `/dispatch` listener has a separate bearer
 credential from the public API.
-Dispatch protocol version 2 streams command output: the worker sends
-`Hello.protocol_version = 2`, waits for the server's `HelloAck`, and only then
+Dispatch protocol version 3 streams command output: the worker sends
+`Hello.protocol_version = 3`, waits for the server's `HelloAck`, and only then
 accepts work. The server rejects older Hello frames before pool registration.
 This deliberately fences mixed-version rollouts that would otherwise lose
 output when one side expects a shared capture volume.
@@ -107,8 +107,9 @@ version unless its scope needs a larger bump.
   random bits in 16 lowercase base32 characters without visually ambiguous
   letters. Keep them compact and opaque; the bearer token provides access
   control, and callers must not infer meaning from an ID.
-- Session command timeouts are checked against `Duration` and timer range at
-  the HTTP boundary and again on the worker. A terminal attachment owns its
+- Commands have no wall-time deadline. Callers poll status, read output during
+  execution, and cancel by handle; parallel cancellation sends SIGTERM then
+  SIGKILL to the process group. A terminal attachment owns its
   reservation and releases it on drop, including failed WebSocket upgrades.
   Worker-drop closure is queued after any terminal output backlog so an
   attached client always receives the close event.

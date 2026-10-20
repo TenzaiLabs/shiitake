@@ -59,7 +59,6 @@ fn frame(id: &str) -> ExecuteFrame {
         command: "sleep 600".into(),
         working_dir: "/tmp".into(),
         env: BTreeMap::new(),
-        timeout_secs: 600.0,
         drop_to: None,
     }
 }
@@ -77,7 +76,7 @@ async fn an_inflight_worker_is_pinged() {
     let mut ws = connect_worker(port).await;
 
     let hello = serde_json::to_string(&Frame::Hello {
-        protocol_version: 2,
+        protocol_version: 3,
         worker_id: WorkerId::new("busy-0"),
         profile: "default".into(),
         location: None,
@@ -125,7 +124,7 @@ async fn an_inflight_worker_that_stops_answering_is_evicted() {
     let mut ws = connect_worker(port).await;
 
     let hello = serde_json::to_string(&Frame::Hello {
-        protocol_version: 2,
+        protocol_version: 3,
         worker_id: WorkerId::new("wedged-0"),
         profile: "default".into(),
         location: None,

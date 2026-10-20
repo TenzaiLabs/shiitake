@@ -81,7 +81,7 @@ async fn drive(socket: WebSocket, result_tx: mpsc::Sender<serde_json::Value>) {
         other => panic!("expected Hello, got {other:?}"),
     }
     sink.send(Message::Text(
-        r#"{"kind":"hello_ack","protocol_version":2}"#.into(),
+        r#"{"kind":"hello_ack","protocol_version":3}"#.into(),
     ))
     .await
     .unwrap();
@@ -99,7 +99,6 @@ async fn drive(socket: WebSocket, result_tx: mpsc::Sender<serde_json::Value>) {
             "command": "echo hi",
             "working_dir": std::env::temp_dir(),
             "env": env,
-            "timeout_secs": 10.0,
         });
         if sink
             .send(Message::Text(frame.to_string().into()))

@@ -99,7 +99,7 @@ async fn drive(
         other => panic!("expected Hello, got {other:?}"),
     }
     sink.send(Message::Text(
-        r#"{"kind":"hello_ack","protocol_version":2}"#.into(),
+        r#"{"kind":"hello_ack","protocol_version":3}"#.into(),
     ))
     .await
     .unwrap();
@@ -144,7 +144,6 @@ async fn send_execute(
         "command": command,
         "working_dir": std::env::temp_dir(),
         "env": env,
-        "timeout_secs": 10.0,
     });
     sink.send(Message::Text(frame.to_string().into()))
         .await

@@ -148,18 +148,10 @@ pub async fn run(
     Path(id): Path<SessionId>,
     Json(req): Json<SessionCommandRequest>,
 ) -> Result<(StatusCode, Json<SpawnResponse>), HttpError> {
-    let valid_timeout = std::time::Duration::try_from_secs_f64(req.timeout)
-        .is_ok_and(|duration| std::time::Instant::now().checked_add(duration).is_some());
-    if req.timeout <= 0.0 || !valid_timeout {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "timeout must be positive and representable".into(),
-        ));
-    }
     let rid = ExecId::new(new_public_id('c'));
     let snap = state
         .pool
-        .submit_session_command(&id, rid, req.command, req.timeout, req.mode)
+        .submit_session_command(&id, rid, req.command, req.mode)
         .await
         .map_err(|e| map_error(e, "submit command"))?;
     Ok((

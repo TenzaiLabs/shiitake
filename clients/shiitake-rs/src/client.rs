@@ -60,11 +60,10 @@ impl Session<'_> {
     pub async fn submit(
         &self,
         command: impl Into<String>,
-        timeout: f64,
         mode: SessionCommandMode,
     ) -> Result<SpawnResponse, ClientError> {
         self.client
-            .submit(&self.details.session_id, command, timeout, mode)
+            .submit(&self.details.session_id, command, mode)
             .await
     }
 
@@ -175,12 +174,10 @@ impl Client {
         &self,
         id: &SessionId,
         command: impl Into<String>,
-        timeout: f64,
         mode: SessionCommandMode,
     ) -> Result<SpawnResponse, ClientError> {
         let body = SessionCommandRequest {
             command: command.into(),
-            timeout,
             mode,
         };
         let resp = self

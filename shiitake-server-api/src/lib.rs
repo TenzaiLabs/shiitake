@@ -10,10 +10,6 @@ pub use shiitake_worker_api::{DropTo, ExecId, SessionCommandMode, SessionId, Wor
 use std::collections::BTreeMap;
 use strum::IntoStaticStr;
 
-fn default_timeout() -> f64 {
-    300.0
-}
-
 /// Legacy internal request type for the removed `/exec` route.
 #[doc(hidden)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,8 +17,6 @@ pub struct ExecRequest {
     pub command: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
-    #[serde(default = "default_timeout")]
-    pub timeout: f64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -76,10 +70,9 @@ pub enum SessionState {
 /// Submit one job to a session. Jobs inherit its identity and initial
 /// environment/directory; several jobs may run simultaneously.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionCommandRequest {
     pub command: String,
-    #[serde(default = "default_timeout")]
-    pub timeout: f64,
     #[serde(default)]
     pub mode: SessionCommandMode,
 }
@@ -105,7 +98,6 @@ pub struct SpawnResponse {
 pub enum HandleStatus {
     Running,
     Completed,
-    Timeout,
     Oomkilled,
     Error,
 }
@@ -120,7 +112,6 @@ pub enum ExitCause {
     Normal,
     Signal,
     OomContainer,
-    Timeout,
     WorkerDied,
     WorkerError,
     OutputError,
@@ -145,8 +136,6 @@ pub struct StatusResponse {
     pub exit_cause: Option<ExitCause>,
     #[serde(default)]
     pub exit_signal: Option<i32>,
-    #[serde(default)]
-    pub timed_out: bool,
     #[serde(default)]
     pub cancelled: bool,
     #[serde(default)]

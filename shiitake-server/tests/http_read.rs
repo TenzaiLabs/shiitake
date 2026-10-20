@@ -64,7 +64,7 @@ async fn reads_full_and_range_and_suffix() {
         let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
         ws.send(Message::Text(
             serde_json::to_string(&Frame::Hello {
-                protocol_version: 2,
+                protocol_version: 3,
                 worker_id: WorkerId::new("fake"),
                 profile: "isolated".into(),
                 location: None,
@@ -105,7 +105,6 @@ async fn reads_full_and_range_and_suffix() {
                             request_id: execute.request_id,
                             exit_code: Some(0),
                             exit_signal: None,
-                            timed_out: false,
                             cancelled: false,
                             usage: Default::default(),
                             error: None,
