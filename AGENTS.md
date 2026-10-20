@@ -77,6 +77,8 @@ dispatch before Result, then purges its local files.
 No capture volume is shared between server and worker pods. The server purges
 orphaned spool files on startup and old handles by TTL; storage is unbounded.
 The server-side spool must therefore have enough capacity for expected output.
+In two-pod deployments, mount the spool only on the server and keep worker
+temporary capture on worker-local storage; workers deliver bytes over dispatch.
 
 ## Build and test
 
@@ -119,6 +121,8 @@ version unless its scope needs a larger bump.
   Worker-drop closure is queued after any terminal output backlog so an
   attached client always receives the close event. The WebSocket close reason
   must use a fixed public message when the worker reports an internal error.
+  Attached clients must answer server pings; a silent connection is detached
+  after three keepalive intervals so it cannot pin a worker indefinitely.
 - `/health` is liveness and stays healthy for an empty pool. `/ready` needs
   `SHIITAKE_MIN_READY_WORKERS` registered workers, including allocated ones.
   The two-pod dispatch Service uses `publishNotReadyAddresses` so workers can

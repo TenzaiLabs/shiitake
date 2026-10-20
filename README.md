@@ -30,7 +30,7 @@ protected by `SHIITAKE_DISPATCH_TOKEN`.
 | Method | Path | What it does |
 | --- | --- | --- |
 | `GET` | `/profiles` | Connected profiles and their idle/allocated worker counts. |
-| `POST` | `/sessions` | Allocate a worker and start its shell. Returns `201` or `429` when that profile is busy. |
+| `POST` | `/sessions` | Allocate a worker and start its shell. Returns `201`, or `400` for invalid input, `404` for an unknown profile, `429` when that profile is busy, and `502` if the worker fails during creation. |
 | `GET` | `/sessions/{id}` | Session state and assigned worker. |
 | `DELETE` | `/sessions/{id}` | Close the shell, cancel its jobs, reset the worker, and release it. |
 | `POST` | `/sessions/{id}/commands` | Submit a stateful or parallel command; returns a handle (`202`). |
@@ -45,7 +45,9 @@ protected by `SHIITAKE_DISPATCH_TOKEN`.
 Create a session, wait for a command, read its output, and release the worker:
 
 ```bash
+set -e
 base=http://localhost:8080/api/v1
+until curl -fsS "$base/ready" >/dev/null 2>&1; do sleep 1; done
 sid=$(curl -fsS -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
   -H 'Content-Type: application/json' -d '{"profile":"default","env":{"PATH":"/usr/bin:/bin"}}' \
   "$base/sessions" | python3 -c 'import json,sys; print(json.load(sys.stdin)["session_id"])')
@@ -74,6 +76,8 @@ curl -fsS -X DELETE -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
 Session creation accepts `profile` (default `default`), `workdir`, `env`,
 `drop_to`, `cols`, and `rows`. `drop_to` accepts `uid`, `gid`,
 `supplementary_gids`, `umask`, and optionally `name` and `create_home`.
+The environment may contain at most 128 entries and 64 KiB of key/value data;
+`workdir` may be at most 4096 bytes.
 Session IDs have the form `s-` plus 16 lowercase letters or digits; command
 handles use `c-` plus the same short alphabet. Both are opaque random IDs.
 Commands accept a shell `command` string and `mode` (`stateful` by default or

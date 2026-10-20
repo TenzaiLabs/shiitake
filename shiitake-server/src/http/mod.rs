@@ -39,8 +39,8 @@ pub struct AppState {
     /// reports ready. `1` is the useful minimum; raise it to keep a large
     /// deployment out of rotation until some fraction of its pool is back.
     pub min_ready_workers: usize,
-    /// How often the `/pty` handler pings a pinned worker to keep its session
-    /// lease fresh while a client is attached (below the worker's lease).
+    /// How often a terminal attachment pings its client; the legacy `/pty`
+    /// handler also uses this for its pinned worker lease.
     pub pty_keepalive: std::time::Duration,
 }
 

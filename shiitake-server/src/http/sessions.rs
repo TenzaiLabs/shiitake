@@ -19,9 +19,42 @@ use shiitake_server_api::{
     SessionResponse, SpawnResponse, StatusResponse,
 };
 use shiitake_worker_api::{ExecId, Frame, OutputChunk, OutputStream, SessionId, SessionOpenFrame};
+use std::time::{Duration, Instant};
+use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
 type HttpError = (StatusCode, String);
+const MAX_SESSION_ENV_ENTRIES: usize = 128;
+const MAX_SESSION_ENV_BYTES: usize = 64 * 1024;
+const MAX_SESSION_WORKDIR_BYTES: usize = 4096;
+
+fn validate_session_request(req: &CreateSessionRequest) -> Result<(), HttpError> {
+    if req.profile.is_empty()
+        || !req
+            .profile
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        || req.cols == 0
+        || req.rows == 0
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid profile or terminal size".into(),
+        ));
+    }
+    if req.env.len() > MAX_SESSION_ENV_ENTRIES
+        || req.env.iter().fold(0usize, |size, (key, value)| {
+            size.saturating_add(key.len()).saturating_add(value.len())
+        }) > MAX_SESSION_ENV_BYTES
+        || req
+            .workdir
+            .as_ref()
+            .is_some_and(|path| path.len() > MAX_SESSION_WORKDIR_BYTES)
+    {
+        return Err((StatusCode::BAD_REQUEST, "session input is too large".into()));
+    }
+    Ok(())
+}
 
 /// Public ids use 80 random bits in a short, unambiguous lowercase alphabet.
 /// UUID v4 supplies the random bytes; skip its version and variant bytes so
@@ -87,19 +120,7 @@ pub async fn create(
     State(state): State<AppState>,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<SessionResponse>), HttpError> {
-    if req.profile.is_empty()
-        || !req
-            .profile
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        || req.cols == 0
-        || req.rows == 0
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "invalid profile or terminal size".into(),
-        ));
-    }
+    validate_session_request(&req)?;
     let id = SessionId::new(new_public_id('s'));
     let open = SessionOpenFrame {
         session_id: id,
@@ -233,12 +254,13 @@ pub async fn terminal(
     Path(id): Path<SessionId>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, HttpError> {
+    let keepalive = state.pty_keepalive;
     let attachment = state
         .pool
         .attach_terminal(&id)
         .await
         .map_err(|e| map_error(e, "attach terminal"))?;
-    Ok(ws.on_upgrade(move |socket| serve_terminal(socket, attachment)))
+    Ok(ws.on_upgrade(move |socket| serve_terminal(socket, attachment, keepalive)))
 }
 
 #[derive(Deserialize)]
@@ -254,19 +276,40 @@ fn terminal_resize(text: &str) -> Result<(u16, u16), ()> {
     }
 }
 
-async fn serve_terminal(socket: WebSocket, mut attachment: TerminalAttachment) {
+async fn serve_terminal(
+    socket: WebSocket,
+    mut attachment: TerminalAttachment,
+    keepalive: Duration,
+) {
     let id = attachment.session_id.clone();
     let writer = attachment.writer();
     let (mut client_tx, mut client_rx) = socket.split();
+    let ping_every = keepalive.max(Duration::from_secs(1));
+    let max_silence = ping_every.saturating_mul(3);
+    let mut ping = tokio::time::interval(ping_every);
+    ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut last_client_frame = Instant::now();
     loop {
         tokio::select! {
+            _ = ping.tick() => {
+                if last_client_frame.elapsed() >= max_silence {
+                    tracing::warn!(%id, "terminal client stopped responding");
+                    let _ = client_tx.send(Message::Close(Some(CloseFrame {
+                        code: 1001, reason: "terminal connection timed out".into(),
+                    }))).await;
+                    break;
+                }
+                if client_tx.send(Message::Ping(Vec::new().into())).await.is_err() { break; }
+            }
             msg = client_rx.next() => match msg {
                 Some(Ok(Message::Binary(b))) => {
+                    last_client_frame = Instant::now();
                     let chunk = OutputChunk { stream: OutputStream::Stdin,
                         id: id.as_str(), bytes: &b };
                     if writer.lock().await.send(Message::Binary(chunk.encode().into())).await.is_err() { break; }
                 }
                 Some(Ok(Message::Text(t))) => {
+                    last_client_frame = Instant::now();
                     let (cols, rows) = match terminal_resize(&t) {
                         Ok(size) => size,
                         Err(()) => {
@@ -293,7 +336,9 @@ async fn serve_terminal(socket: WebSocket, mut attachment: TerminalAttachment) {
                         }
                     }
                 }
-                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
+                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {
+                    last_client_frame = Instant::now();
+                }
                 _ => break,
             },
             data = attachment.recv() => match data {
@@ -335,6 +380,38 @@ fn terminal_close(error: Option<String>) -> CloseFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_request_bounds_retained_input() {
+        let mut req = CreateSessionRequest {
+            profile: "default".into(),
+            workdir: None,
+            env: Default::default(),
+            drop_to: None,
+            cols: 80,
+            rows: 24,
+        };
+        req.env
+            .insert("ONE".into(), "x".repeat(MAX_SESSION_ENV_BYTES));
+        assert_eq!(
+            validate_session_request(&req).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+        req.env.clear();
+        for index in 0..=MAX_SESSION_ENV_ENTRIES {
+            req.env.insert(format!("KEY_{index}"), "x".into());
+        }
+        assert_eq!(
+            validate_session_request(&req).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+        req.env.clear();
+        req.workdir = Some("/".repeat(MAX_SESSION_WORKDIR_BYTES + 1));
+        assert_eq!(
+            validate_session_request(&req).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+    }
 
     #[test]
     fn terminal_close_hides_worker_error_details() {

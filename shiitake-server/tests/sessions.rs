@@ -202,6 +202,94 @@ async fn worker_drop_closes_terminal_after_full_output_backlog() {
 }
 
 #[tokio::test]
+async fn silent_terminal_client_releases_attachment() {
+    let capture = TempDir::new().unwrap();
+    let pool = Arc::new(WorkerPool::new(
+        None,
+        "server".into(),
+        "test".into(),
+        capture.path().into(),
+    ));
+    let dispatch = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dispatch_port = dispatch.local_addr().unwrap().port();
+    let dispatch_app =
+        build_dispatch_router_with_profiles(pool.clone(), "default-token", BTreeMap::new())
+            .unwrap();
+    tokio::spawn(async move { axum::serve(dispatch, dispatch_app).await.unwrap() });
+    tokio::spawn(fake_worker(
+        dispatch_port,
+        "silent-client-worker",
+        "default",
+    ));
+    timeout(Duration::from_secs(5), async {
+        while pool.profiles().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let api = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_port = api.local_addr().unwrap().port();
+    let app = build_api_router(AppState {
+        pool: pool.clone(),
+        auth_token: Arc::new("api-token".into()),
+        default_workdir: "/tmp".into(),
+        max_body_bytes: 1024 * 1024,
+        min_ready_workers: 1,
+        pty_keepalive: Duration::from_secs(1),
+    });
+    tokio::spawn(async move { axum::serve(api, app).await.unwrap() });
+    let session: SessionResponse = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{api_port}/api/v1/sessions"))
+        .bearer_auth("api-token")
+        .json(&serde_json::json!({"profile":"default"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut req = format!(
+        "ws://127.0.0.1:{api_port}/api/v1/sessions/{}/terminal",
+        session.session_id
+    )
+    .into_client_request()
+    .unwrap();
+    req.headers_mut()
+        .insert(AUTHORIZATION, HeaderValue::from_static("Bearer api-token"));
+    let (_silent_client, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    assert!(matches!(
+        pool.attach_terminal(&session.session_id).await,
+        Err(SessionError::TerminalBusy)
+    ));
+    let mut replacement = timeout(Duration::from_secs(6), async {
+        loop {
+            match pool.attach_terminal(&session.session_id).await {
+                Ok(attachment) => break attachment,
+                Err(SessionError::TerminalBusy) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("unexpected terminal error: {e}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    replacement.detach().await;
+    assert_eq!(
+        pool.session_snapshot(&session.session_id)
+            .await
+            .unwrap()
+            .state,
+        shiitake_server_api::SessionState::Active
+    );
+    pool.close_session(&session.session_id).await.unwrap();
+}
+
+#[tokio::test]
 async fn profiles_reserve_workers_and_output_is_spooled_on_server() {
     let capture = TempDir::new().unwrap();
     let pool = Arc::new(WorkerPool::new(

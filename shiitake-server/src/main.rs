@@ -69,9 +69,8 @@ struct Config {
     /// Registered workers the pool needs before `/ready` reports ready.
     #[arg(long, env = "SHIITAKE_MIN_READY_WORKERS", default_value_t = 1)]
     min_ready_workers: usize,
-    /// How often the `/pty` handler pings a pinned worker to keep its session
-    /// lease alive while a client is attached. Must stay below the worker's
-    /// `SHIITAKE_LEASE_TIMEOUT`.
+    /// Terminal client ping interval (and legacy `/pty` worker keepalive).
+    /// Must stay below the worker's `SHIITAKE_LEASE_TIMEOUT`.
     #[arg(long, env = "SHIITAKE_PTY_KEEPALIVE_SECS", default_value_t = 10)]
     pty_keepalive_secs: u64,
     #[arg(long, env = "POD_NAME", default_value = "shiitake")]

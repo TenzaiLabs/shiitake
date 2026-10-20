@@ -106,6 +106,16 @@ struct SessionRecord {
     stateful_count: usize,
 }
 
+impl SessionRecord {
+    /// Keep terminal status metadata but release request-controlled input as
+    /// soon as this session can no longer run commands.
+    fn clear_inputs(&mut self) {
+        self.working_dir = String::new();
+        self.env.clear();
+        self.drop_to = None;
+    }
+}
+
 #[derive(Clone)]
 pub struct SessionSnapshot {
     pub session_id: SessionId,
@@ -1411,6 +1421,7 @@ impl WorkerPool {
             };
             if error.is_some() {
                 rec.finished_at = Some(SystemTime::now());
+                rec.clear_inputs();
             }
         }
         if let Some(tx) = rec.opened.take() {
@@ -1445,6 +1456,7 @@ impl WorkerPool {
                 shiitake_server_api::SessionState::Closed
             };
             rec.finished_at = Some(SystemTime::now());
+            rec.clear_inputs();
             let terminal = rec.terminal.take();
             if let Some(tx) = rec.opened.take() {
                 let _ = tx.send(Err(error.clone().unwrap_or_else(|| "shell closed".into())));
@@ -1649,6 +1661,7 @@ impl WorkerPool {
             {
                 rec.state = shiitake_server_api::SessionState::Failed;
                 rec.finished_at = Some(SystemTime::now());
+                rec.clear_inputs();
                 terminal = rec.terminal.take();
                 if let Some(tx) = rec.opened.take() {
                     let _ = tx.send(Err("worker disconnected".into()));
