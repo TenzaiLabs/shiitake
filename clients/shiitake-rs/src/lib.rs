@@ -4,8 +4,9 @@
 //! here so callers need only depend on this one crate.
 
 mod client;
-pub use client::{Client, ClientError, ReadChunk, Stream};
+pub use client::{Client, ClientError, ReadChunk, Session, Stream};
 pub use shiitake_server_api::{
-    DropTo, ExecRequest, ExitCause, HandleSnapshotJson, HandleStatus, HealthResponse,
-    ReadyResponse, SpawnResponse, StatusResponse,
+    CreateSessionRequest, DropTo, ExitCause, HandleSnapshotJson, HandleStatus, HealthResponse,
+    ProfileResponse, ReadyResponse, SessionCommandMode, SessionCommandRequest, SessionId,
+    SessionResponse, SessionState, SpawnResponse, StatusResponse,
 };

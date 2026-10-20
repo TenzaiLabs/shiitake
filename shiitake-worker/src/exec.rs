@@ -2,7 +2,7 @@
 //! stdout/stderr straight into per-stream capture files. The worker never
 //! copies output bytes — the kernel writes the child's fds to disk. Supports
 //! cancellation: the caller can flip a `watch::Receiver<bool>` to `true` to
-//! SIGKILL the process group mid-command.
+//! SIGTERM the process group, then SIGKILL it after a grace period.
 //!
 //! Memory/CPU bounds are not enforced here: the worker container's k8s
 //! resource limits bound it, and OOM is detected externally from the kubelet's
@@ -78,7 +78,7 @@ pub async fn run(
     }
     unsafe {
         cmd.pre_exec(move || {
-            // Own process group so a timeout/cancel can killpg the whole tree.
+            // Own process group so cancellation can signal the whole tree.
             setsid().map_err(io_err)?;
             if let Some(d) = drop_to.as_ref() {
                 apply_drop_to(d)?;
@@ -91,15 +91,7 @@ pub async fn run(
     let raw_pid = child.id().context("child has no pid")?;
     let pid = Pid::from_raw(i32::try_from(raw_pid).context("pid out of range for pid_t")?);
 
-    let dur = Duration::from_secs_f64(execute.timeout_secs.max(0.001));
-    let (cancelled, timed_out, exit_status) = wait_with_signals(&mut child, pid, dur, cancel).await;
-
-    if timed_out {
-        append_marker(
-            &stderr_path,
-            &format!("\nCommand timed out after {}s\n", execute.timeout_secs),
-        );
-    }
+    let (cancelled, exit_status) = wait_with_signals(&mut child, pid, cancel).await;
     if cancelled {
         append_marker(&stderr_path, "\nCommand cancelled by server\n");
     }
@@ -124,7 +116,6 @@ pub async fn run(
             request_id: execute.request_id.clone(),
             exit_code,
             exit_signal,
-            timed_out,
             cancelled,
             usage: usage(cpu_before).await,
             error: None,
@@ -159,26 +150,23 @@ async fn usage(cpu_before: Option<CpuTimes>) -> ResourceUsage {
 async fn wait_with_signals(
     child: &mut Child,
     pid: Pid,
-    timeout: Duration,
     mut cancel: watch::Receiver<bool>,
-) -> (bool, bool, Option<std::process::ExitStatus>) {
+) -> (bool, Option<std::process::ExitStatus>) {
     tokio::select! {
         biased;
         _ = cancel.changed() => {
             if *cancel.borrow() {
-                kill_group(pid, "cancel");
-                return (true, false, reap(child).await);
+                signal_group(pid, Signal::SIGTERM, "cancel");
+                sleep(Duration::from_secs(2)).await;
+                signal_group(pid, Signal::SIGKILL, "cancel grace elapsed");
+                return (true, reap(child).await);
             }
             // false transition — fall through to wait again. In practice the
             // channel only flips to true once.
-            (false, false, reap(child).await)
-        }
-        _ = sleep(timeout) => {
-            kill_group(pid, "timeout");
-            (false, true, reap(child).await)
+            (false, reap(child).await)
         }
         res = child.wait() => {
-            (false, false, match res {
+            (false, match res {
                 Ok(s) => Some(s),
                 Err(e) => {
                     warn!("waiting on the command failed; exit status unavailable: {e}");
@@ -189,8 +177,8 @@ async fn wait_with_signals(
     }
 }
 
-/// Append a server-generated notice to the stderr capture file (timeout /
-/// cancel). Best-effort: the child has already exited and released its fd.
+/// Append a cancellation notice to stderr. Best-effort: the child has already
+/// exited and released its fd.
 fn append_marker(path: &PathBuf, marker: &str) {
     match std::fs::OpenOptions::new().append(true).open(path) {
         Ok(mut f) => {
@@ -208,12 +196,12 @@ fn append_marker(path: &PathBuf, marker: &str) {
     }
 }
 
-/// SIGKILL the command's process group. `ESRCH` means it already exited, which
-/// is the common race; anything else means the kill genuinely failed.
-fn kill_group(pid: Pid, reason: &str) {
-    match killpg(pid, Signal::SIGKILL) {
+/// Signal the command's process group. `ESRCH` means it already exited, which
+/// is the common race; anything else means the signal genuinely failed.
+fn signal_group(pid: Pid, signal: Signal, reason: &str) {
+    match killpg(pid, signal) {
         Ok(()) | Err(Errno::ESRCH) => {}
-        Err(e) => warn!(pid = pid.as_raw(), "SIGKILL on {reason} failed: {e}"),
+        Err(e) => warn!(pid = pid.as_raw(), %signal, "signal on {reason} failed: {e}"),
     }
 }
 
@@ -295,7 +283,6 @@ mod tests {
             command,
             working_dir: std::env::temp_dir().to_string_lossy().into_owned(),
             env,
-            timeout_secs: 120.0,
             drop_to: None,
         }
     }
@@ -318,7 +305,6 @@ mod tests {
                 let (_tx, rx) = watch::channel(false);
                 let outcome = run(&frame, rx, &root_path).await.expect("exec run");
                 assert_eq!(outcome.result.exit_code, Some(0), "stream {i} exit code");
-                assert!(!outcome.result.timed_out);
 
                 let stdout_len = stream_len(&root_path, &request_id, Stream::Stdout).await;
                 assert_eq!(

@@ -24,13 +24,21 @@ use futures_util::{
     stream::{SplitSink, SplitStream},
 };
 use shiitake_worker_api::{
-    ExecuteFrame, Frame, PtyOpenFrame, ResultFrame, WorkerId, WorkerLocation,
+    ExecId, ExecuteFrame, Frame, OutputChunk, OutputStream, PtyOpenFrame, ResourceUsage,
+    ResultFrame, SessionCommandMode, SessionOpenFrame, WorkerId, WorkerLocation, capture,
 };
 use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
     path::{Path, PathBuf},
     time::Duration,
 };
-use tokio::{net::TcpStream, sync::watch, time::sleep};
+use tokio::{
+    io::AsyncReadExt,
+    net::TcpStream,
+    sync::{mpsc, watch},
+    task::JoinSet,
+    time::sleep,
+};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
     tungstenite::{
@@ -40,6 +48,7 @@ use tokio_tungstenite::{
     },
 };
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Sink = SplitSink<Ws, Message>;
@@ -65,6 +74,7 @@ enum Work {
     Execute(ExecuteFrame),
     /// An interactive PTY session — persistent, bidirectional, pinned.
     Pty(PtyOpenFrame),
+    Session(SessionOpenFrame),
 }
 
 /// One PTY session's outcome on the live session.
@@ -108,6 +118,9 @@ enum SessionEnd {
 pub struct ClientConfig {
     #[arg(long, env = "SHIITAKE_WORKER_ID", default_value = "worker-unknown")]
     pub worker_id: String,
+    /// Pool this worker advertises to the server.
+    #[arg(long, env = "SHIITAKE_PROFILE", default_value = "default")]
+    pub profile: String,
     /// Full WebSocket URL of the server's dispatch endpoint. Defaults to the
     /// single-pod case; point it at a Service to split the two apart.
     #[arg(
@@ -236,6 +249,7 @@ async fn serve_session(
 ) -> Result<SessionEnd> {
     let ClientConfig {
         worker_id,
+        profile,
         dispatch_url,
         dispatch_token,
         capture_root,
@@ -272,12 +286,53 @@ async fn serve_session(
     let (mut sink, mut stream) = ws.split();
 
     let hello = serde_json::to_string(&Frame::Hello {
+        protocol_version: shiitake_worker_api::PROTOCOL_VERSION,
         worker_id: WorkerId::new(worker_id.as_str()),
+        profile: profile.clone(),
         location,
     })?;
     sink.send(Message::Text(hello.into()))
         .await
         .context("send Hello")?;
+
+    // An older server ignores Hello's new field and may still dispatch a
+    // command. Refuse that command before running it so its output cannot be
+    // silently lost; only a matching HelloAck makes this connection usable.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match stream.next().await {
+                Some(Ok(Message::Text(t))) => match serde_json::from_str::<Frame>(&t)? {
+                    Frame::HelloAck { protocol_version }
+                        if protocol_version == shiitake_worker_api::PROTOCOL_VERSION =>
+                    {
+                        return Ok(());
+                    }
+                    Frame::Execute(execute) => {
+                        let error = ResultFrame::errored(
+                            execute.request_id,
+                            "incompatible dispatcher protocol; command was not run",
+                        );
+                        // Pre-v3 dispatchers require this removed field when
+                        // parsing Result. Include it only on the compatibility
+                        // rejection so they can report the protocol error.
+                        let mut frame = serde_json::to_value(Frame::Result(error))?;
+                        frame["timed_out"] = serde_json::Value::Bool(false);
+                        sink.send(Message::Text(serde_json::to_string(&frame)?.into()))
+                            .await?;
+                        anyhow::bail!("dispatcher did not acknowledge protocol version");
+                    }
+                    other => anyhow::bail!("unexpected dispatcher handshake frame: {other:?}"),
+                },
+                Some(Ok(Message::Ping(p))) => sink.send(Message::Pong(p)).await?,
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
+                    anyhow::bail!("dispatcher closed before protocol acknowledgement")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .context("dispatcher protocol acknowledgement timed out")??;
 
     loop {
         // Phase 1: wait for the next command (or session end).
@@ -308,6 +363,16 @@ async fn serve_session(
                 match run_pty(open, &mut sink, &mut stream, lease).await {
                     PtyOutcome::Done(exit) => {
                         pty_exit = Some(*exit);
+                        None
+                    }
+                    PtyOutcome::SessionLost => return Ok(SessionEnd::LostMidCommand),
+                }
+            }
+            Work::Session(open) => {
+                info!(session_id = %open.session_id, "session opened");
+                match run_session(open, &mut sink, &mut stream, capture_root, lease).await {
+                    PtyOutcome::Done(closed) => {
+                        pty_exit = Some(*closed);
                         None
                     }
                     PtyOutcome::SessionLost => return Ok(SessionEnd::LostMidCommand),
@@ -386,6 +451,20 @@ async fn serve_session(
         // A PTY session's terminal frame, sent after the reset for the same
         // reason: the server frees the pinned worker only once it is clean.
         if let Some(exit) = pty_exit {
+            let exit = match exit {
+                Frame::SessionClosed {
+                    session_id, error, ..
+                } => Frame::SessionClosed {
+                    session_id,
+                    error: if reset_failed {
+                        Some("sandbox reset failed".into())
+                    } else {
+                        error
+                    },
+                    reusable: !reset_failed && !exiting,
+                },
+                other => other,
+            };
             let exit_json = serde_json::to_string(&exit)?;
             if let Err(e) = sink.send(Message::Text(exit_json.into())).await {
                 warn!("send PtyExit failed: {e}; ending session");
@@ -431,10 +510,19 @@ async fn next_execute(
             Some(Ok(Message::Text(t))) => match serde_json::from_str::<Frame>(&t)? {
                 Frame::Execute(e) => return Ok(Some(Work::Execute(e))),
                 Frame::PtyOpen(o) => return Ok(Some(Work::Pty(o))),
+                Frame::SessionOpen(o) => return Ok(Some(Work::Session(o))),
                 Frame::Cancel { .. } | Frame::PtyResize { .. } | Frame::PtyClose { .. } => {
                     warn!("control frame with nothing in flight; ignoring")
                 }
-                Frame::Hello { .. } | Frame::Result(_) | Frame::PtyExit { .. } => {
+                Frame::Hello { .. }
+                | Frame::HelloAck { .. }
+                | Frame::Result(_)
+                | Frame::PtyExit { .. }
+                | Frame::SessionReady { .. }
+                | Frame::SessionClosed { .. }
+                | Frame::SessionRun { .. }
+                | Frame::SessionClose { .. }
+                | Frame::SessionResize { .. } => {
                     warn!("unexpected frame; ignoring")
                 }
             },
@@ -469,7 +557,7 @@ async fn run_command(
     // message, so a merely slow command never trips it.
     let mut deadline = std::pin::pin!(tokio::time::sleep(lease));
 
-    let result = loop {
+    let mut result = loop {
         if session_lost {
             // Cancel already signalled; just let exec wind down so we don't
             // leak the child, then end the session.
@@ -533,6 +621,52 @@ async fn run_command(
             }
         }
     };
+    // The legacy Execute frame still uses a worker-local capture while the
+    // process runs. Send its completed streams over dispatch before Result so
+    // the server can spool them without a shared volume.
+    for (stream_kind, wire_kind) in [
+        (capture::Stream::Stdout, OutputStream::Stdout),
+        (capture::Stream::Stderr, OutputStream::Stderr),
+    ] {
+        let path = capture::stream_path(capture_root, &request_id, stream_kind);
+        let mut file = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                result.error = Some(format!("could not read command output: {e}"));
+                break;
+            }
+        };
+        let mut buf = vec![0u8; 32 * 1024];
+        loop {
+            let n = match file.read(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    result.error = Some(format!("could not read command output: {e}"));
+                    break;
+                }
+            };
+            if n == 0 {
+                break;
+            }
+            let chunk = OutputChunk {
+                stream: wire_kind,
+                id: request_id.as_str(),
+                bytes: &buf[..n],
+            };
+            if !matches!(
+                tokio::time::timeout(lease, sink.send(Message::Binary(chunk.encode().into())))
+                    .await,
+                Ok(Ok(()))
+            ) {
+                let _ = capture::purge(capture_root, &request_id).await;
+                return CmdOutcome::SessionLost;
+            }
+        }
+    }
+    if let Err(e) = capture::purge(capture_root, &request_id).await {
+        warn!(%request_id, "could not purge legacy command capture: {e}");
+    }
     CmdOutcome::Done(result)
 }
 
@@ -659,4 +793,588 @@ async fn run_pty(
         exit_signal,
         error,
     }))
+}
+
+enum SessionEvent {
+    Output(ExecId, OutputStream, Vec<u8>),
+    Result(ResultFrame),
+    Interrupt,
+    Abort { request_id: ExecId },
+}
+
+/// The shell writes this private, per-command marker to its PTY only after the
+/// sourced script and state snapshot have finished. A status file alone is not
+/// completion evidence: the command can edit files in its capture directory.
+struct ShellCompletion {
+    marker: Vec<u8>,
+    pending: Vec<u8>,
+    complete: watch::Sender<bool>,
+    seen: bool,
+}
+
+impl ShellCompletion {
+    fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        if self.seen {
+            return bytes.to_vec();
+        }
+        self.pending.extend_from_slice(bytes);
+        if let Some(pos) = self
+            .pending
+            .windows(self.marker.len())
+            .position(|window| window == self.marker)
+        {
+            let mut output = self.pending[..pos].to_vec();
+            output.extend_from_slice(&self.pending[pos + self.marker.len()..]);
+            self.pending.clear();
+            self.seen = true;
+            let _ = self.complete.send(true);
+            return output;
+        }
+        let keep = (1..self.marker.len())
+            .rev()
+            .find(|&n| self.pending.ends_with(&self.marker[..n]))
+            .unwrap_or(0);
+        let ready = self.pending.len() - keep;
+        self.pending.drain(..ready).collect()
+    }
+}
+
+/// One worker hosts one session, but runs several jobs concurrently. The PTY
+/// shell stays alive across jobs and is only hung up when the session closes.
+/// The dispatch socket is the sole writer so output and results stay ordered.
+async fn run_session(
+    open: SessionOpenFrame,
+    sink: &mut Sink,
+    stream: &mut Stream,
+    capture_root: &Path,
+    lease: Duration,
+) -> PtyOutcome {
+    let session_id = open.session_id.clone();
+    let shell = PtyOpenFrame {
+        session_id: ExecId::new(session_id.as_str()),
+        // Stateful commands source scripts into this process; the session
+        // shell must be Bash even if legacy PTY's default is overridden.
+        command: vec!["bash".into(), "-i".into()],
+        working_dir: open.working_dir.clone(),
+        env: open.env.clone(),
+        cols: open.cols,
+        rows: open.rows,
+        drop_to: open.drop_to.clone(),
+    };
+    let mut pty = match pty::PtySession::spawn(&shell) {
+        Ok(pty) => pty,
+        Err(e) => {
+            let error = format!("could not start session shell: {e:#}");
+            let _ = send_worker_frame(
+                sink,
+                &Frame::SessionReady {
+                    session_id: session_id.clone(),
+                    error: Some(error.clone()),
+                },
+            )
+            .await;
+            return PtyOutcome::Done(Box::new(Frame::SessionClosed {
+                session_id,
+                error: Some(error),
+                reusable: true,
+            }));
+        }
+    };
+    if send_worker_frame(
+        sink,
+        &Frame::SessionReady {
+            session_id: session_id.clone(),
+            error: None,
+        },
+    )
+    .await
+    .is_err()
+    {
+        pty.shutdown().await;
+        return PtyOutcome::SessionLost;
+    }
+
+    let (event_tx, mut event_rx) = mpsc::channel::<SessionEvent>(64);
+    let mut running: HashMap<ExecId, watch::Sender<bool>> = HashMap::new();
+    let mut queued: VecDeque<(ExecuteFrame, SessionCommandMode)> = VecDeque::new();
+    let mut stateful_running: Option<ExecId> = None;
+    let mut shell_completion: Option<ShellCompletion> = None;
+    let mut current_workdir = open.working_dir.clone();
+    let mut current_env = open.env.clone();
+    current_env.insert("TERM".into(), "xterm-256color".into());
+    if let Some(drop_to) = open.drop_to.as_ref()
+        && let Ok(Some(home)) = crate::account::ensure(drop_to)
+    {
+        current_env.insert("HOME".into(), home.to_string_lossy().into_owned());
+    }
+    let mut tasks = JoinSet::new();
+    let mut buf = vec![0u8; 32 * 1024];
+    let mut deadline = std::pin::pin!(tokio::time::sleep(lease));
+    let mut lost = false;
+    let mut close_error = None;
+    loop {
+        while stateful_running.is_none() && running.len() < 32 {
+            let Some((mut execute, mode)) = queued.pop_front() else {
+                break;
+            };
+            let rid = execute.request_id.clone();
+            execute.working_dir = current_workdir.clone();
+            execute.env = current_env.clone();
+            execute.drop_to = open.drop_to.clone();
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+            if mode == SessionCommandMode::Stateful {
+                match prepare_stateful_job(&execute, capture_root).await {
+                    Ok((line, marker)) => {
+                        if let Err(e) = pty.write_input(line.as_bytes()).await {
+                            close_error = Some(format!("could not submit shell command: {e}"));
+                            break;
+                        }
+                        let (complete, completed) = watch::channel(false);
+                        shell_completion = Some(ShellCompletion {
+                            marker,
+                            pending: Vec::new(),
+                            complete,
+                            seen: false,
+                        });
+                        stateful_running = Some(rid.clone());
+                        running.insert(rid, cancel_tx);
+                        let tx = event_tx.clone();
+                        let root = capture_root.to_path_buf();
+                        tasks.spawn(async move {
+                            watch_stateful_job(execute, cancel_rx, completed, root, tx).await;
+                        });
+                    }
+                    Err(e) => {
+                        if let Err(purge_error) = capture::purge(capture_root, &rid).await {
+                            warn!(%rid, "could not purge failed stateful setup: {purge_error}");
+                        }
+                        let _ = send_worker_frame(
+                            sink,
+                            &Frame::Result(ResultFrame::errored(
+                                rid,
+                                format!("stateful command setup: {e:#}"),
+                            )),
+                        )
+                        .await;
+                    }
+                }
+                break;
+            }
+            running.insert(rid, cancel_tx);
+            let tx = event_tx.clone();
+            let root = capture_root.to_path_buf();
+            tasks.spawn(async move {
+                run_session_job(execute, cancel_rx, root, tx).await;
+            });
+        }
+        if close_error.is_some() {
+            break;
+        }
+        tokio::select! {
+            output = pty.read_output(&mut buf) => match output {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let output = if let Some(completion) = shell_completion.as_mut() {
+                        completion.feed(&buf[..n])
+                    } else {
+                        buf[..n].to_vec()
+                    };
+                    if output.is_empty() {
+                        continue;
+                    }
+                    let chunk = OutputChunk {
+                        stream: OutputStream::Terminal,
+                        id: session_id.as_str(),
+                        bytes: &output,
+                    };
+                    if sink.send(Message::Binary(chunk.encode().into())).await.is_err() {
+                        lost = true;
+                        break;
+                    }
+                }
+            },
+            Some(event) = event_rx.recv() => match event {
+                SessionEvent::Output(id, which, bytes) => {
+                    let chunk = OutputChunk { stream: which, id: id.as_str(), bytes: &bytes };
+                    if sink.send(Message::Binary(chunk.encode().into())).await.is_err() {
+                        lost = true;
+                        break;
+                    }
+                }
+                SessionEvent::Result(mut result) => {
+                    if stateful_running.as_ref() == Some(&result.request_id) {
+                        match read_shell_state(capture_root, &result.request_id).await {
+                            Ok((cwd, env)) => {
+                                current_workdir = cwd;
+                                current_env = env;
+                            }
+                            Err(e) => {
+                                let error = format!("could not read completed shell state: {e:#}");
+                                result.error = Some(error.clone());
+                                close_error = Some(error);
+                                let _ = send_worker_frame(sink, &Frame::Result(result)).await;
+                                break;
+                            }
+                        }
+                        stateful_running = None;
+                        shell_completion = None;
+                        let _ = capture::purge(capture_root, &result.request_id).await;
+                    }
+                    running.remove(&result.request_id);
+                    if send_worker_frame(sink, &Frame::Result(result)).await.is_err() {
+                        lost = true;
+                        break;
+                    }
+                }
+                SessionEvent::Interrupt => {
+                    let _ = pty.write_input(b"\x03").await;
+                }
+                SessionEvent::Abort { request_id } => {
+                    let _ = send_worker_frame(sink, &Frame::Result(ResultFrame {
+                        request_id,
+                        exit_code: None,
+                        exit_signal: None,
+                        cancelled: true,
+                        usage: ResourceUsage::default(),
+                        error: Some("stateful command did not stop".into()),
+                    })).await;
+                    close_error = Some("stateful command did not stop".into());
+                    break;
+                }
+            },
+            () = &mut deadline => {
+                warn!(%session_id, "server lease lapsed during session");
+                lost = true;
+                break;
+            }
+            msg = stream.next() => {
+                deadline.as_mut().reset(tokio::time::Instant::now() + lease);
+                match msg {
+                    Some(Ok(Message::Text(t))) => match serde_json::from_str::<Frame>(&t) {
+                        Ok(Frame::SessionRun { session_id: id, execute, mode }) if id == session_id => {
+                            let rid = execute.request_id.clone();
+                            if running.contains_key(&rid)
+                                || queued.iter().any(|(e, _)| e.request_id == rid)
+                                || running.len() + queued.len() >= 32 {
+                                let _ = send_worker_frame(sink, &Frame::Result(
+                                    ResultFrame::errored(rid, "duplicate job or session concurrency limit reached")
+                                )).await;
+                                continue;
+                            }
+                            queued.push_back((execute, mode));
+                        }
+                        Ok(Frame::Cancel { request_id }) => {
+                            if let Some(cancel) = running.get(&request_id) {
+                                let _ = cancel.send(true);
+                            } else if let Some(pos) = queued.iter().position(|(e, _)| e.request_id == request_id) {
+                                queued.remove(pos);
+                                let mut result = ResultFrame::errored(request_id, "cancelled before start");
+                                result.cancelled = true;
+                                let _ = send_worker_frame(sink, &Frame::Result(result)).await;
+                            }
+                        }
+                        Ok(Frame::SessionResize { session_id: id, cols, rows }) if id == session_id => {
+                            let _ = pty.resize(cols, rows);
+                        }
+                        Ok(Frame::SessionClose { session_id: id }) if id == session_id => break,
+                        _ => {}
+                    },
+                    Some(Ok(Message::Binary(data))) => {
+                        if let Ok(chunk) = OutputChunk::decode(&data)
+                            && chunk.stream == OutputStream::Stdin
+                            && chunk.id == session_id.as_str()
+                        {
+                            let _ = pty.write_input(chunk.bytes).await;
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        if sink.send(Message::Pong(p)).await.is_err() {
+                            lost = true;
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
+                        lost = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    drop(event_rx);
+    for cancel in running.values() {
+        let _ = cancel.send(true);
+    }
+    pty.shutdown().await;
+    // A command may need a moment to reap its process group. Reset runs after
+    // this method returns and sweeps every remaining process in the namespace.
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
+    tasks.abort_all();
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
+    for rid in running.keys() {
+        if let Err(e) = capture::purge(capture_root, rid).await {
+            warn!(%rid, "could not purge session capture after close: {e}");
+        }
+    }
+    if lost {
+        PtyOutcome::SessionLost
+    } else {
+        PtyOutcome::Done(Box::new(Frame::SessionClosed {
+            session_id,
+            error: close_error,
+            reusable: true,
+        }))
+    }
+}
+
+async fn send_worker_frame(sink: &mut Sink, frame: &Frame) -> Result<()> {
+    sink.send(Message::Text(serde_json::to_string(frame)?.into()))
+        .await
+        .context("send session frame")
+}
+
+async fn run_session_job(
+    execute: ExecuteFrame,
+    cancel: watch::Receiver<bool>,
+    root: PathBuf,
+    tx: mpsc::Sender<SessionEvent>,
+) {
+    let rid = execute.request_id.clone();
+    let (done_tx, done_rx) = watch::channel(false);
+    let out = tokio::spawn(tail_capture(
+        root.clone(),
+        rid.clone(),
+        capture::Stream::Stdout,
+        OutputStream::Stdout,
+        tx.clone(),
+        done_rx.clone(),
+    ));
+    let err = tokio::spawn(tail_capture(
+        root.clone(),
+        rid.clone(),
+        capture::Stream::Stderr,
+        OutputStream::Stderr,
+        tx.clone(),
+        done_rx,
+    ));
+    let mut result = match exec::run(&execute, cancel, &root).await {
+        Ok(outcome) => outcome.result,
+        Err(e) => ResultFrame::errored(rid.clone(), format!("worker error: {e:#}")),
+    };
+    // Parallel jobs share a container cgroup, so its CPU and memory readings
+    // cannot be attributed to one command. Avoid reporting misleading values.
+    result.usage = ResourceUsage::default();
+    let _ = done_tx.send(true);
+    let _ = out.await;
+    let _ = err.await;
+    let _ = tx.send(SessionEvent::Result(result)).await;
+    if let Err(e) = capture::purge(&root, &rid).await {
+        warn!(%rid, "could not remove local command capture: {e}");
+    }
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+fn give_to_session_user(path: &Path, execute: &ExecuteFrame) -> Result<()> {
+    let Some(drop_to) = &execute.drop_to else {
+        return Ok(());
+    };
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    if unsafe { libc::chown(path.as_ptr(), drop_to.uid, drop_to.gid) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("chown stateful command file");
+    }
+    Ok(())
+}
+
+/// Source a script in the live Bash process. The braces run in the parent
+/// shell, so `cd` and `export` persist. Output is redirected to local files,
+/// tailed into the dispatch socket, and spooled by the server. The final
+/// status file is written only after the cwd and exported environment snapshot.
+async fn prepare_stateful_job(execute: &ExecuteFrame, root: &Path) -> Result<(String, Vec<u8>)> {
+    let dir = capture::handle_dir(root, &execute.request_id);
+    tokio::fs::create_dir_all(&dir).await?;
+    give_to_session_user(&dir, execute)?;
+    let script = dir.join("command.sh");
+    tokio::fs::write(&script, &execute.command).await?;
+    give_to_session_user(&script, execute)?;
+    let stdout = capture::stream_path(root, &execute.request_id, capture::Stream::Stdout);
+    let stderr = capture::stream_path(root, &execute.request_id, capture::Stream::Stderr);
+    for path in [&stdout, &stderr] {
+        tokio::fs::File::create(path).await?;
+        give_to_session_user(path, execute)?;
+    }
+    let cwd = dir.join("cwd");
+    let env = dir.join("env");
+    let status = dir.join("status");
+    let nonce = Uuid::new_v4();
+    let marker = format!("\x1b]shiitake-complete:{nonce}\x07").into_bytes();
+    let line = format!(
+        "__shiitake_finish() {{ \
+         printf '%s' \"$PWD\" > {}; \
+         while IFS= read -r __shiitake_name; do \
+         printf '%s=%s\\0' \"$__shiitake_name\" \"${{!__shiitake_name}}\"; \
+         done < <(compgen -e) > {}; \
+         printf '%s' \"$1\" > {}; \
+         }}; \
+         __shiitake_interrupted=0; \
+         trap '__shiitake_interrupted=1; return 130' INT; \
+         source {} > {} 2> {}; __shiitake_rc=$?; \
+         trap - INT; \
+         if [[ \"$__shiitake_interrupted\" == 1 ]]; then __shiitake_rc=130; fi; \
+         __shiitake_finish \"$__shiitake_rc\"; \
+         printf '\\033]shiitake-complete:{}\\007'\n",
+        shell_quote(&cwd),
+        shell_quote(&env),
+        shell_quote(&status),
+        shell_quote(&script),
+        shell_quote(&stdout),
+        shell_quote(&stderr),
+        nonce,
+    );
+    Ok((line, marker))
+}
+
+async fn read_shell_state(root: &Path, rid: &ExecId) -> Result<(String, BTreeMap<String, String>)> {
+    let dir = capture::handle_dir(root, rid);
+    let cwd = tokio::fs::read_to_string(dir.join("cwd")).await?;
+    let bytes = tokio::fs::read(dir.join("env")).await?;
+    let mut env = BTreeMap::new();
+    for entry in bytes.split(|b| *b == 0).filter(|part| !part.is_empty()) {
+        let text = String::from_utf8(entry.to_vec())?;
+        if let Some((key, value)) = text.split_once('=') {
+            env.insert(key.to_string(), value.to_string());
+        }
+    }
+    Ok((cwd, env))
+}
+
+async fn watch_stateful_job(
+    execute: ExecuteFrame,
+    cancel: watch::Receiver<bool>,
+    completed: watch::Receiver<bool>,
+    root: PathBuf,
+    tx: mpsc::Sender<SessionEvent>,
+) {
+    let rid = execute.request_id.clone();
+    let (done_tx, done_rx) = watch::channel(false);
+    let out = tokio::spawn(tail_capture(
+        root.clone(),
+        rid.clone(),
+        capture::Stream::Stdout,
+        OutputStream::Stdout,
+        tx.clone(),
+        done_rx.clone(),
+    ));
+    let err = tokio::spawn(tail_capture(
+        root.clone(),
+        rid.clone(),
+        capture::Stream::Stderr,
+        OutputStream::Stderr,
+        tx.clone(),
+        done_rx,
+    ));
+    let status_path = capture::handle_dir(&root, &rid).join("status");
+    let mut interrupted_at = None;
+    let mut cancelled = false;
+    let exit_code = loop {
+        if *completed.borrow()
+            && let Ok(code) = tokio::fs::read_to_string(&status_path).await
+            && let Ok(parsed) = code.trim().parse::<i32>()
+        {
+            break Some(parsed);
+        }
+        if interrupted_at.is_none() && *cancel.borrow() {
+            cancelled = true;
+            interrupted_at = Some(tokio::time::Instant::now());
+            if tx.send(SessionEvent::Interrupt).await.is_err() {
+                abandon_stateful_job(done_tx, out, err, &root, &rid).await;
+                return;
+            }
+        }
+        if interrupted_at.is_some_and(|at| at.elapsed() > Duration::from_secs(2)) {
+            abandon_stateful_job(done_tx, out, err, &root, &rid).await;
+            let _ = tx.send(SessionEvent::Abort { request_id: rid }).await;
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    };
+    let _ = done_tx.send(true);
+    let _ = out.await;
+    let _ = err.await;
+    let _ = tx
+        .send(SessionEvent::Result(ResultFrame {
+            request_id: rid,
+            exit_code,
+            exit_signal: None,
+            cancelled,
+            usage: ResourceUsage::default(),
+            error: None,
+        }))
+        .await;
+}
+
+async fn abandon_stateful_job(
+    done: watch::Sender<bool>,
+    out: tokio::task::JoinHandle<()>,
+    err: tokio::task::JoinHandle<()>,
+    root: &Path,
+    rid: &ExecId,
+) {
+    let _ = done.send(true);
+    out.abort();
+    err.abort();
+    let _ = out.await;
+    let _ = err.await;
+    if let Err(e) = capture::purge(root, rid).await {
+        warn!(%rid, "could not purge aborted stateful capture: {e}");
+    }
+}
+
+async fn tail_capture(
+    root: PathBuf,
+    rid: ExecId,
+    stream: capture::Stream,
+    which: OutputStream,
+    tx: mpsc::Sender<SessionEvent>,
+    done: watch::Receiver<bool>,
+) {
+    let path = capture::stream_path(&root, &rid, stream);
+    let mut file = loop {
+        match tokio::fs::File::open(&path).await {
+            Ok(f) => break f,
+            Err(_) if *done.borrow() || done.has_changed().is_err() => return,
+            Err(_) => sleep(Duration::from_millis(10)).await,
+        }
+    };
+    let mut buf = vec![0u8; 32 * 1024];
+    loop {
+        match file.read(&mut buf).await {
+            Ok(0) if *done.borrow() || done.has_changed().is_err() => return,
+            Ok(0) => sleep(Duration::from_millis(10)).await,
+            Ok(n) => {
+                if tx
+                    .send(SessionEvent::Output(rid.clone(), which, buf[..n].to_vec()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(e) => {
+                warn!(%rid, "could not read local output: {e}");
+                return;
+            }
+        }
+    }
 }

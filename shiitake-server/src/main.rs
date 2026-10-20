@@ -12,11 +12,16 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use shiitake_server::{
-    http::{AppState, build_api_router, build_dispatch_router},
+    http::{AppState, build_api_router, build_dispatch_router_with_profiles},
     pool::{WorkerPool, k8s_status::ClusterProbe},
     serve::{ListenAddrs, run},
 };
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 #[derive(Parser)]
 #[command(name = "shiitake-server")]
@@ -40,6 +45,14 @@ struct Config {
         value_parser = clap::builder::NonEmptyStringValueParser::new()
     )]
     dispatch_token: String,
+    /// JSON map from additional profile names to their dispatch tokens.
+    #[arg(
+        long,
+        env = "SHIITAKE_PROFILE_TOKENS",
+        default_value = "{}",
+        hide_env_values = true
+    )]
+    profile_tokens: String,
     #[arg(long, env = "SHIITAKE_DEFAULT_WORKDIR", default_value = "/")]
     default_workdir: PathBuf,
     #[arg(
@@ -56,9 +69,8 @@ struct Config {
     /// Registered workers the pool needs before `/ready` reports ready.
     #[arg(long, env = "SHIITAKE_MIN_READY_WORKERS", default_value_t = 1)]
     min_ready_workers: usize,
-    /// How often the `/pty` handler pings a pinned worker to keep its session
-    /// lease alive while a client is attached. Must stay below the worker's
-    /// `SHIITAKE_LEASE_TIMEOUT`.
+    /// Terminal client ping interval (and legacy `/pty` worker keepalive).
+    /// Must stay below the worker's `SHIITAKE_LEASE_TIMEOUT`.
     #[arg(long, env = "SHIITAKE_PTY_KEEPALIVE_SECS", default_value_t = 10)]
     pty_keepalive_secs: u64,
     #[arg(long, env = "POD_NAME", default_value = "shiitake")]
@@ -81,6 +93,23 @@ async fn main() -> Result<()> {
 
     let telemetry = shiitake_server::telemetry::init("shiitake-server")?;
     let cfg = Config::parse();
+    let profile_tokens: BTreeMap<String, String> = serde_json::from_str(&cfg.profile_tokens)
+        .context("parse SHIITAKE_PROFILE_TOKENS as a JSON object")?;
+    let mut seen_tokens = HashSet::from([cfg.dispatch_token.as_str()]);
+    for (profile, token) in &profile_tokens {
+        anyhow::ensure!(
+            profile != "default"
+                && !profile.is_empty()
+                && profile
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "invalid additional profile name: {profile}"
+        );
+        anyhow::ensure!(
+            !token.is_empty() && seen_tokens.insert(token.as_str()),
+            "each profile needs a distinct non-empty dispatch token"
+        );
+    }
 
     let probe = Some(Arc::new(
         ClusterProbe::new().await.context("kube client init")?,
@@ -108,7 +137,8 @@ async fn main() -> Result<()> {
         pty_keepalive: Duration::from_secs(cfg.pty_keepalive_secs),
     };
     let api = build_api_router(state);
-    let dispatch = build_dispatch_router(pool.clone(), &cfg.dispatch_token);
+    let dispatch =
+        build_dispatch_router_with_profiles(pool.clone(), &cfg.dispatch_token, profile_tokens)?;
 
     let addrs = ListenAddrs {
         api: format!("{}:{}", cfg.host, cfg.port)

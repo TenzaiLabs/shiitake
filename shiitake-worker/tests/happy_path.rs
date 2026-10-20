@@ -10,6 +10,7 @@ use axum::{
     routing::get,
 };
 use futures_util::{SinkExt, StreamExt};
+use shiitake_worker_api::{OutputChunk, OutputStream};
 use std::{collections::BTreeMap, time::Duration};
 use tempfile::TempDir;
 use tokio::{net::TcpListener, process::Command, sync::mpsc, time::timeout};
@@ -27,7 +28,7 @@ async fn worker_serves_two_commands_and_resets_scratch_between_them() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let (result_tx, mut result_rx) = mpsc::channel::<serde_json::Value>(2);
+    let (result_tx, mut result_rx) = mpsc::channel::<(serde_json::Value, Vec<u8>)>(2);
     let scratch_for_app = scratch_path.clone();
     let app: Router = Router::new().route(
         "/dispatch",
@@ -57,12 +58,12 @@ async fn worker_serves_two_commands_and_resets_scratch_between_them() {
         .expect("spawn worker binary");
 
     // First command's Result.
-    let r1 = timeout(Duration::from_secs(15), result_rx.recv())
+    let (r1, out1) = timeout(Duration::from_secs(15), result_rx.recv())
         .await
         .expect("no Result for command 1")
         .expect("channel closed");
     // Second command's Result — only possible if the worker stayed resident.
-    let r2 = timeout(Duration::from_secs(15), result_rx.recv())
+    let (r2, out2) = timeout(Duration::from_secs(15), result_rx.recv())
         .await
         .expect("no Result for command 2 — worker did not stay resident")
         .expect("channel closed");
@@ -74,16 +75,11 @@ async fn worker_serves_two_commands_and_resets_scratch_between_them() {
     assert_eq!(r1["kind"], "result");
     assert_eq!(r1["request_id"], "req-1");
     assert_eq!(r1["exit_code"], 0);
-    let out1 = capture_root.path().join("req-1/stdout");
-    assert!(
-        std::fs::read_to_string(&out1).unwrap().starts_with("hi"),
-        "command 1 stdout should be 'hi'"
-    );
+    assert!(out1.starts_with(b"hi"), "command 1 stdout should be 'hi'");
 
     assert_eq!(r2["request_id"], "req-2");
     assert_eq!(r2["exit_code"], 0);
-    let out2 = capture_root.path().join("req-2/stdout");
-    let body2 = std::fs::read_to_string(&out2).unwrap();
+    let body2 = String::from_utf8(out2).unwrap();
     assert_eq!(
         body2.trim(),
         "ABSENT",
@@ -91,13 +87,22 @@ async fn worker_serves_two_commands_and_resets_scratch_between_them() {
     );
 }
 
-async fn drive(socket: WebSocket, result_tx: mpsc::Sender<serde_json::Value>, scratch: String) {
+async fn drive(
+    socket: WebSocket,
+    result_tx: mpsc::Sender<(serde_json::Value, Vec<u8>)>,
+    scratch: String,
+) {
     let (mut sink, mut stream) = socket.split();
     // Hello.
     match stream.next().await {
         Some(Ok(Message::Text(_))) => {}
         other => panic!("expected Hello, got {other:?}"),
     }
+    sink.send(Message::Text(
+        r#"{"kind":"hello_ack","protocol_version":3}"#.into(),
+    ))
+    .await
+    .unwrap();
 
     let mut env = BTreeMap::new();
     env.insert(
@@ -139,7 +144,6 @@ async fn send_execute(
         "command": command,
         "working_dir": std::env::temp_dir(),
         "env": env,
-        "timeout_secs": 10.0,
     });
     sink.send(Message::Text(frame.to_string().into()))
         .await
@@ -148,15 +152,25 @@ async fn send_execute(
 
 async fn forward_result(
     stream: &mut futures_util::stream::SplitStream<WebSocket>,
-    result_tx: &mpsc::Sender<serde_json::Value>,
+    result_tx: &mpsc::Sender<(serde_json::Value, Vec<u8>)>,
 ) {
+    let mut stdout = Vec::new();
     while let Some(msg) = stream.next().await {
-        if let Ok(Message::Text(t)) = msg {
-            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
-            if v.get("kind").and_then(|k| k.as_str()) == Some("result") {
-                result_tx.send(v).await.ok();
-                return;
+        match msg {
+            Ok(Message::Binary(b)) => {
+                let chunk = OutputChunk::decode(&b).unwrap();
+                if chunk.stream == OutputStream::Stdout {
+                    stdout.extend_from_slice(chunk.bytes);
+                }
             }
+            Ok(Message::Text(t)) => {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v.get("kind").and_then(|k| k.as_str()) == Some("result") {
+                    result_tx.send((v, stdout)).await.ok();
+                    return;
+                }
+            }
+            _ => {}
         }
     }
 }

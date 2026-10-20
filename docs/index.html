@@ -1,18 +1,7 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Shiitake — sandboxing for untrusted commands</title>
-<meta name="description" content="Shiitake is an HTTP server that fans commands out to a pool of resident, resource-bounded worker containers on Kubernetes. Each command runs in its own worker, which resets to a clean slate between commands." />
-
-<!-- Open Graph -->
-<meta property="og:title" content="🍄 Shiitake" />
-<meta property="og:description" content="Sandboxing for untrusted commands on Kubernetes. Each command runs in its own resource-bounded worker that resets to a clean slate between commands." />
-<meta property="og:type" content="website" />
-
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🍄</text></svg>" />
-
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shiitake — Shell sessions in worker pools</title>
+<meta name="description" content="Shiitake allocates isolated worker containers for explicit shell sessions, with named profiles and streamed output.">
 <style>
   :root {
     --bg: #f7fafa;
@@ -167,192 +156,24 @@
   .built .tenzai .wordmark { fill: currentColor; }
   .built .tenzai .plus { fill: var(--tz-cyan); }
   footer .small { font-size: 0.85rem; opacity: 0.8; }
-</style>
-</head>
-<body>
+</style></head><body>
+<nav class="wrap"><div class="brand">🍄 Shiitake</div><div class="links"><a href="docs.html">Documentation</a><a href="https://github.com/TenzaiLabs/shiitake">GitHub</a></div></nav>
+<main class="wrap">
+<section class="hero"><div class="shroom">🍄</div><h1>Shell sessions in worker pools</h1>
+<p>Reserve a worker in a named profile. Run commands in one persistent shell, attach a terminal, and release the worker when finished.</p>
+<a class="btn btn-primary" href="docs.html">Read the documentation →</a></section>
+<section><h2>One session, one shell</h2><p>Stateful commands retain directory, exports, and shell variables. Parallel commands inherit the shell's latest directory and exported environment and run at the same time. A terminal can detach without ending the session.</p></section>
+<section><h2>Profiles shape the sandbox</h2><p>Deploy worker profiles with different mounts and resources. Give selected workers a shared application folder, and keep other workers without that mount. In the two-pod topology, each profile has a separate worker Deployment and pod-level network boundary.</p></section>
+<section><h2>Output stays with the server</h2><p>Workers stream stdout and stderr to the server over the authenticated dispatch socket. The server keeps local output files for HTTP range reads. Worker pods need no shared capture volume.</p></section>
+<section><h2>Start with the API</h2><pre><code>POST /api/v1/sessions
+{"profile":"default","env":{"PATH":"/usr/bin:/bin"}}
 
-<nav>
-  <div class="brand">🍄 Shiitake</div>
-  <div class="links">
-    <a href="#quickstart">Quickstart</a>
-    <a href="#how">How it works</a>
-    <a href="#use-cases">What it's for</a>
-    <a href="docs.html">Docs</a>
-    <a href="https://github.com/TenzaiLabs/shiitake">GitHub</a>
-  </div>
-</nav>
+POST /api/v1/sessions/{id}/commands
+{"command":"echo hello","mode":"stateful"}
 
-<header class="hero wrap">
-  <div class="shroom">🍄</div>
-  <h1>Shiitake</h1>
-  <p class="tagline">Sandboxing for untrusted commands on Kubernetes.</p>
-  <p class="lede">
-    An HTTP server that fans commands out to a pool of <strong>resident, resource-bounded
-    worker containers</strong> in your Kubernetes cluster. Each command runs in its own
-    worker, which resets to a clean slate between commands — no state bleed, ever.
-  </p>
-  <div class="cta">
-    <a class="btn btn-primary" href="docs.html">📖 Read the docs</a>
-    <a class="btn btn-ghost" href="https://github.com/TenzaiLabs/shiitake">★ View on GitHub</a>
-  </div>
-</header>
+GET /api/v1/sessions/{id}/commands/{handle}  (poll until completed)
+GET /api/v1/sessions/{id}/commands/{handle}/stdout
 
-<section class="alt" id="quickstart">
-  <div class="wrap">
-    <h2>Quickstart</h2>
-    <p class="section-sub">Run a server, run a worker, dispatch a command. The worker stays resident and resets between commands.</p>
-    <div class="code-card">
-<pre><span class="c"># Terminal 1 — the server (the only ingress)</span>
-SHIITAKE_AUTH_TOKEN=dev-token SHIITAKE_CAPTURE_ROOT=/tmp/capture \
-  cargo run --bin shiitake-server
-
-<span class="c"># Terminal 2 — one worker, joining the pool</span>
-SHIITAKE_WORKER_ID=worker-0 SHIITAKE_CAPTURE_ROOT=/tmp/capture \
-  cargo run --bin shiitake-worker
-
-<span class="c"># Terminal 3 — dispatch a command, get a handle back</span>
-curl -s <span class="p">-H</span> <span class="p">"Authorization: Bearer dev-token"</span> \
-  <span class="p">-X</span> POST localhost:8080/api/v1/exec \
-  <span class="p">-d</span> <span class="p">'{"command": "echo hello from a sandboxed worker"}'</span></pre>
-    </div>
-    <p class="read-more"><a href="docs.html#quickstart">Read more in the docs →</a></p>
-  </div>
-</section>
-
-<section id="how">
-  <div class="wrap">
-    <h2>How it works</h2>
-    <p class="section-sub">
-      One server is the only ingress. It hands each command to a worker over an
-      authenticated WebSocket — in the same pod or another one; the worker runs it,
-      streams output to disk, reports the result, then resets its sandbox before the
-      next command.
-    </p>
-    <div class="flow">
-      <div class="node"><div class="k">POST /exec</div><div class="d">your request</div></div>
-      <div class="arrow">→</div>
-      <div class="node"><div class="k">Server</div><div class="d">the only ingress</div></div>
-      <div class="arrow">→</div>
-      <div class="node"><div class="k">Worker pool</div><div class="d">N idle workers</div></div>
-      <div class="arrow">→</div>
-      <div class="node"><div class="k">Isolated run</div><div class="d">bounded · isolated · resets</div></div>
-    </div>
-    <p class="read-more"><a href="docs.html#architecture">Read more in the docs →</a></p>
-  </div>
-</section>
-
-<section class="alt" id="use-cases">
-  <div class="wrap">
-    <h2>What it's for</h2>
-    <p class="section-sub">Shiitake is generic — it knows nothing about your application. A few things it's particularly good at:</p>
-    <ul class="benefits">
-      <li>
-        <h3>🛡️ Sandbox untrusted commands</h3>
-        <p>
-          Every command runs in its own resource-bounded worker container — it can't see
-          or touch another command's process, files, or output. The worker resets to a clean
-          slate between commands (and recycles a fresh container if it can't), so nothing
-          carries over to the next caller.
-        </p>
-      </li>
-      <li>
-        <h3>⚡ Run commands without pod-create rights</h3>
-        <p>
-          Skip giving your workload Kubernetes permissions to spawn a Job or Pod per task. A fixed pool
-          of workers is already running and waiting — you just <code>POST</code> a command and get a
-          handle back. No RBAC to create pods, no per-task scheduling latency.
-        </p>
-      </li>
-      <li>
-        <h3>💥 OOM-killed protection</h3>
-        <p>
-          Memory limits are enforced at the container level, so an allocation bomb only kills its own
-          worker — the server and every other worker keep running. The kill is detected from the
-          kubelet's container status and reported as <code>oom_container</code>, never silently lost.
-        </p>
-      </li>
-      <li>
-        <h3>🌊 Handle large outputs</h3>
-        <p>
-          The worker redirects stdout/stderr straight into capture files via inherited fds — the kernel
-          writes to disk, so neither process buffers output in memory. Read it back over HTTP with
-          <code>Range</code> support, and watch output size as a metric instead of truncating it.
-        </p>
-      </li>
-    </ul>
-    <p class="read-more"><a href="docs.html#overview">Read more in the docs →</a></p>
-  </div>
-</section>
-
-<section id="contributors" hidden>
-  <div class="wrap">
-    <h2>Thank you, contributors 💙</h2>
-    <p class="section-sub">
-      Shiitake is better because of the people who pitch in from outside the team —
-      thank you for every issue, review, and pull request.
-    </p>
-    <ul class="contributors" id="contributors-grid"></ul>
-  </div>
-</section>
-
-<script>
-(async () => {
-  try {
-    // contributors.json is baked at deploy time by .github/workflows/pages.yml —
-    // it already excludes org members & owners (including private memberships,
-    // which an unauthenticated browser call can't see). No runtime GitHub API.
-    const res = await fetch('./contributors.json');
-    if (!res.ok) return;
-    const external = await res.json();
-    if (!Array.isArray(external) || external.length === 0) return;
-    const grid = document.getElementById('contributors-grid');
-    for (const c of external) {
-      const li = document.createElement('li');
-      const a = document.createElement('a');
-      a.href = c.html_url;
-      const img = document.createElement('img');
-      img.src = c.avatar_url + (c.avatar_url.includes('?') ? '&' : '?') + 's=128';
-      img.alt = c.login;
-      img.loading = 'lazy';
-      const login = document.createElement('span');
-      login.className = 'login';
-      login.textContent = c.login;
-      a.append(img, login);
-      li.append(a);
-      grid.append(li);
-    }
-    document.getElementById('contributors').hidden = false;
-  } catch {
-    // No baked list (e.g. local preview) or fetch failed — leave it hidden.
-  }
-})();
-</script>
-
-<footer>
-  <div class="wrap">
-    <div class="built">
-      <span>Made with 🤩 by</span>
-      <a class="tenzai" href="https://tenzai.com" aria-label="Tenzai">
-        <svg width="96" height="24" viewBox="0 0 192 48" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Tenzai">
-          <defs>
-            <radialGradient cx="50%" cy="50%" fx="50%" fy="50%" r="60.1985575%" gradientTransform="translate(0.5, 0.5), scale(1, 0.825), rotate(-90), translate(-0.5, -0.5)" id="tz-grad">
-              <stop stop-color="#00A8BF" offset="0%"></stop>
-              <stop stop-color="#88FFFF" offset="100%"></stop>
-            </radialGradient>
-          </defs>
-          <g stroke="none" fill="none" fill-rule="evenodd">
-            <path class="wordmark" d="M54,17 L54,11 L76,11 L76,17 L68,17 L68,37 L62,37 L62,17 L54,17 Z M79,11 L98,11 L98,17 L85,17 L85,21 L97,21 L97,27 L85,27 L85,31 L98,31 L98,37 L79,37 L79,11 Z M138,17 L127,17 L127,11 L146,11 L146,17 L135,31 L146,31 L146,37 L127,37 L127,31 L138,17 Z M155,37 L148,37 L156,11 L165,11 L173,37 L166,37 L164.385,31 L156.615,31 L155,37 Z M160.5,16.572 L158.231,25 L162.769,25 L160.5,16.572 Z M123,37 L117,37 L108,22 L108,37 L102,37 L102,11 L108,11 L117,26 L117,11 L123,11 L123,37 Z M175,11 L181,11 L181,37 L175,37 L175,11 Z"></path>
-            <g transform="translate(-8, -8)">
-              <path d="M40.2417576,35.999 L46.8492424,42.6066017 L42.6066017,46.8492424 L35.9997576,40.242 L36,36 L40.2417576,35.999 Z M23.7567576,35.999 L28,36 L27.9997576,40.242 L21.3933983,46.8492424 L17.1507576,42.6066017 L23.7567576,35.999 Z M35,14 L35,24.756 L42.6066017,17.1507576 L46.8492424,21.3933983 L40.2437576,27.999 L23.7577576,27.999 L17.1507576,21.3933983 L21.3933983,17.1507576 L29,24.756 L29,14 L35,14 Z" fill="url(#tz-grad)"></path>
-              <polygon class="plus" points="50 29 50 35 35 35 35 50 29 50 29 35 14 35 14 29"></polygon>
-            </g>
-          </g>
-        </svg>
-      </a>
-    </div>
-    <div class="small">🍄 Shiitake is open source · <a href="docs.html">Docs</a> · <a href="https://github.com/TenzaiLabs/shiitake">github.com/TenzaiLabs/shiitake</a></div>
-  </div>
-</footer>
-
-</body>
-</html>
+DELETE /api/v1/sessions/{id}</code></pre><p>See the <a href="docs.html#http-api">full API</a> and <a href="docs.html#topologies">deployment layouts</a>.</p></section>
+</main><footer class="wrap">🍄 Shiitake · <a href="https://github.com/TenzaiLabs/shiitake">GitHub</a></footer>
+</body></html>

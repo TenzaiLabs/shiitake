@@ -3,12 +3,15 @@
 //! protects the dispatcher. The token is checked on the upgrade, before a
 //! WebSocket exists, so an unauthenticated peer never sends a frame.
 
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use shiitake_server::{http::build_dispatch_router, pool::WorkerPool};
 use shiitake_worker_api::{Frame, WorkerId, WorkerLocation};
 use std::{sync::Arc, time::Duration};
 use tempfile::TempDir;
-use tokio::{net::TcpListener, time::sleep};
+use tokio::{
+    net::TcpListener,
+    time::{sleep, timeout},
+};
 use tokio_tungstenite::tungstenite::{
     Message,
     client::IntoClientRequest,
@@ -84,7 +87,9 @@ async fn accepts_a_worker_presenting_the_token() {
             .expect("upgrade with the right token must succeed");
     // A Hello from another pod, the shape the split topology sends.
     let hello = serde_json::to_string(&Frame::Hello {
+        protocol_version: 3,
         worker_id: WorkerId::new("shiitake-workers-xyz"),
+        profile: "default".into(),
         location: Some(WorkerLocation {
             pod: "shiitake-workers-xyz".into(),
             namespace: "shiitake".into(),
@@ -94,6 +99,21 @@ async fn accepts_a_worker_presenting_the_token() {
     .unwrap();
     ws.send(Message::Text(hello.into())).await.unwrap();
 
+    let ack = timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("server did not acknowledge the worker")
+        .expect("server closed without an acknowledgement")
+        .unwrap();
+    let Message::Text(ack) = ack else {
+        panic!("expected HelloAck text frame");
+    };
+    assert!(matches!(
+        serde_json::from_str::<Frame>(&ack).unwrap(),
+        Frame::HelloAck {
+            protocol_version: 3
+        }
+    ));
+
     // The worker registers as idle, so the handshake completed end to end.
     for _ in 0..50 {
         if pool.snapshot().await == (1, 0) {
@@ -102,4 +122,28 @@ async fn accepts_a_worker_presenting_the_token() {
         sleep(Duration::from_millis(20)).await;
     }
     panic!("worker never registered: {:?}", pool.snapshot().await);
+}
+
+#[tokio::test]
+async fn rejects_a_pre_streaming_worker_before_pool_registration() {
+    let (pool, _capture) = new_pool();
+    let port = dispatch_listener(pool.clone()).await;
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(request(port, Some("Bearer test-dispatch-token")))
+            .await
+            .unwrap();
+    // The old Hello has no protocol_version; it must never enter the pool.
+    ws.send(Message::Text(
+        r#"{"kind":"hello","worker_id":"legacy-worker"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    let closed = timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("server did not reject the legacy Hello");
+    assert!(matches!(
+        closed,
+        Some(Ok(Message::Close(_))) | None | Some(Err(_))
+    ));
+    assert_eq!(pool.snapshot().await, (0, 0));
 }

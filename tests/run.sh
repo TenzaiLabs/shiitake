@@ -29,27 +29,26 @@ kubectl --context "$CONTEXT" -n "$NAMESPACE" port-forward "deploy/$RELEASE" "${L
 PF_PID=$!
 base="http://127.0.0.1:${LOCAL_PORT}"
 
-# Wait for the whole pool to connect, not just one worker — the concurrency
-# tests dispatch several commands at once and assert they run in parallel, so
-# they fail (spuriously) if they start before enough workers are idle. Must
-# match the chart's worker.count.
+# Wait for both test profiles, including the isolated workers, before the
+# suite starts allocating sessions.
 workers="${SHIITAKE_E2E_WORKERS:-8}"
-log "Waiting for all ${workers} workers to connect"
+isolated="${SHIITAKE_E2E_ISOLATED_WORKERS:-2}"
+total=$((workers + isolated))
+log "Waiting for all ${total} workers to connect"
 idle=0
 for _ in $(seq 1 90); do
   idle="$(curl -fsS "$base/api/v1/health" 2>/dev/null \
     | python3 -c 'import sys,json; print(json.load(sys.stdin)["workers_idle"])' 2>/dev/null || echo 0)"
-  if [ "${idle:-0}" -ge "$workers" ]; then break; fi
+  if [ "${idle:-0}" -ge "$total" ]; then break; fi
   sleep 2
 done
-if [ "${idle:-0}" -lt "$workers" ]; then
-  echo "only ${idle}/${workers} workers connected to the dispatcher" >&2
+if [ "${idle:-0}" -lt "$total" ]; then
+  echo "only ${idle}/${total} workers connected to the dispatcher" >&2
   diagnostics
   exit 1
 fi
 
-# Topology-specific checks first: if the split isn't actually in effect (workers
-# still co-located, capture volume not shared, NetworkPolicy not enforced), say
+# Topology-specific checks first: if the split isn't actually in effect, say
 # so before the broad suite muddies the output.
 if [ "$TOPOLOGY" = "two-pod" ]; then
   log "Running test_two_pod.py against ${base}"
@@ -103,7 +102,7 @@ fi
 printf '%s\n' "$metrics"
 
 # Last: the pod-failure suite (self-contained — own port-forward + kubectl, since
-# it kills the pods the shared forward above rides on). It includes the /pty
+# it kills the pods the shared forward above rides on). It includes the terminal
 # worker-death case, so it runs under uv for the shiitake-py client. Two-pod only
 # — a worker is its own pod there.
 if [ "$TOPOLOGY" = "two-pod" ]; then

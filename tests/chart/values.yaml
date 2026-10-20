@@ -2,22 +2,24 @@
 # server flavours (e.g. a tighter-memory pool to exercise OOM handling).
 
 # Where the server and the workers run relative to each other.
-#   single-pod — one pod, loopback dispatch, capture on a shared emptyDir.
-#   two-pod    — a pod each, dispatch through a Service, capture on a volume
-#                both mount. Lets pod-scoped controls differ between them.
+#   single-pod — one pod, loopback dispatch, server-local output spool.
+#   two-pod    — server and worker profiles in separate pods, dispatch through
+#                a Service, server-local output spool, pod-scoped controls.
 topology: single-pod
 
 authToken: e2e-secret-token
-# Bearer token workers present on the dispatch upgrade. Separate from authToken:
-# a worker never needs the API's token.
+# Bearer token for the default worker profile. Extra profiles declare their
+# own distinct dispatchToken below; a worker never needs the API's token.
 dispatchToken: e2e-dispatch-token
 captureRoot: /capture
+workerCaptureRoot: /tmp/shiitake-capture
 defaultWorkdir: /tmp
 
-capture:
-  # Backs the two-pod capture volume, where an emptyDir can't be shared. Fine on
-  # single-node k3d; a multi-node deployment wants a ReadWriteMany PV.
-  hostPath: /var/lib/shiitake-e2e/capture
+# The default worker profile mounts this application folder. Isolated workers
+# do not mount it; stdout/stderr is streamed to the server in both profiles.
+sharedFolder:
+  hostPath: /var/lib/shiitake-e2e/shared
+  mountPath: /shared
 
 # Confine the worker pods: no ingress, egress only to DNS and the dispatcher.
 # Two-pod only — a NetworkPolicy selects a pod, so co-located there is no way to
@@ -33,8 +35,7 @@ server:
   # The readiness probe gates the pod on this, so the e2e never talks to a
   # server whose pool is still empty.
   minReadyWorkers: 1
-  # How often the /pty handler pings a pinned worker to keep its session lease
-  # fresh. Below worker.leaseTimeout; short so the keepalive e2e runs quickly.
+  # Legacy PTY keepalive interval. Session workers use the pool keepalive.
   ptyKeepaliveSecs: 3
   resources:
     requests:
@@ -46,14 +47,16 @@ server:
 
 worker:
   image: shiitake-test-worker:e2e
+  profile: default
+  sharedFolder: true
   # Worker containers in the single pod, or worker pods in the two-pod topology.
   count: 8
-  # Comma-separated scratch paths the worker empties between commands. Exercises
+  # Comma-separated scratch paths the worker empties between sessions. Exercises
   # the resident-worker reset path end-to-end in k8s. /dev/mqueue holds POSIX
   # message queues (not SysV, so remove_sysv_ipc skips them) — clearing the dir
   # unlinks the queues a fresh container would have discarded.
   resetPaths: "/tmp,/var/tmp,/dev/shm,/dev/mqueue"
-  # Exit (recycle the container) after this many commands. 0 = stay resident
+  # Exit (recycle the container) after this many sessions. 0 = stay resident
   # and rely on the in-process reset; N>0 adds a periodic full-container
   # teardown. Set >0 to exercise the restartPolicy/recycle path in the e2e.
   restartAfter: 0
@@ -71,6 +74,22 @@ worker:
     limits:
       cpu: "1"
       memory: 512Mi
+
+# Additional profile: a separate worker Deployment in two-pod mode, with no
+# application shared volume. In single-pod mode these are extra containers;
+# two-pod mode gives them an independent pod and network-policy boundary.
+workerProfiles:
+  - name: isolated
+    count: 2
+    dispatchToken: e2e-isolated-dispatch-token
+    sharedFolder: false
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: "1"
+        memory: 512Mi
 
 # Optional in-cluster OpenTelemetry Collector. When enabled, the server exports
 # OTLP to it and re-exposes the metrics on a Prometheus endpoint the test run

@@ -155,6 +155,11 @@ async fn drive(socket: WebSocket, hello_tx: mpsc::Sender<()>, behaviour: Behavio
         Some(Ok(Message::Text(_))) => {}
         other => panic!("expected Hello, got {other:?}"),
     }
+    sink.send(Message::Text(
+        r#"{"kind":"hello_ack","protocol_version":3}"#.into(),
+    ))
+    .await
+    .unwrap();
     hello_tx.send(()).await.ok();
 
     let sends_command = matches!(
@@ -167,15 +172,13 @@ async fn drive(socket: WebSocket, hello_tx: mpsc::Sender<()>, behaviour: Behavio
             "PATH".to_string(),
             std::env::var("PATH").unwrap_or_default(),
         );
-        // Long enough that the command is unambiguously still running when the
-        // session dies — the timeout must never be what ends this test.
+        // The command is unambiguously still running when the connection dies.
         let frame = serde_json::json!({
             "kind": "execute",
             "request_id": "req-lease",
             "command": "sleep 600",
             "working_dir": std::env::temp_dir(),
             "env": env,
-            "timeout_secs": 600.0,
         });
         sink.send(Message::Text(frame.to_string().into()))
             .await

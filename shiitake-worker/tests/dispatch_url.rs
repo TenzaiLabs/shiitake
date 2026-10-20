@@ -74,6 +74,7 @@ async fn worker_dials_the_configured_url_with_a_bearer_token_and_reports_its_loc
 
     assert_eq!(hello["kind"], "hello");
     assert_eq!(hello["worker_id"], "shiitake-workers-xyz");
+    assert_eq!(hello["protocol_version"], 3);
     // What the OOM probe will query: the worker's pod, not the server's.
     assert_eq!(hello["location"]["pod"], "shiitake-workers-xyz");
     assert_eq!(hello["location"]["namespace"], "shiitake");
@@ -128,6 +129,7 @@ async fn worker_omits_the_location_when_it_has_no_pod_identity() {
     let _ = child.wait().await;
 
     assert_eq!(hello["worker_id"], "worker-0");
+    assert_eq!(hello["protocol_version"], 3);
     assert!(
         hello.get("location").is_none(),
         "a worker with no pod identity must omit location entirely, got {hello}"
@@ -140,4 +142,68 @@ async fn capture_hello(socket: WebSocket, hello_tx: mpsc::Sender<serde_json::Val
         let v: serde_json::Value = serde_json::from_str(&t).unwrap();
         hello_tx.send(v).await.ok();
     }
+}
+
+#[tokio::test]
+async fn worker_rejects_a_command_from_a_server_without_protocol_ack() {
+    let bin = std::env::var("CARGO_BIN_EXE_shiitake-worker").unwrap();
+    let capture_root = TempDir::new().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, mut rx) = mpsc::channel(1);
+    let app = Router::new().route(
+        "/dispatch",
+        get(move |upgrade: WebSocketUpgrade| {
+            let tx = tx.clone();
+            async move {
+                upgrade.on_upgrade(move |mut socket| async move {
+                    let _hello = socket.next().await;
+                    socket
+                        .send(Message::Text(
+                            serde_json::json!({
+                                "kind": "execute",
+                                "request_id": "legacy-request",
+                                "command": "echo ran",
+                                "working_dir": "/tmp",
+                                "env": {},
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    let result = match socket.next().await {
+                        Some(Ok(Message::Text(t))) => serde_json::from_str::<serde_json::Value>(&t),
+                        other => panic!("expected compatibility Result, got {other:?}"),
+                    };
+                    tx.send(result.unwrap()).await.unwrap();
+                })
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut child = Command::new(bin)
+        .env("SHIITAKE_WORKER_ID", "new-worker")
+        .env(
+            "SHIITAKE_DISPATCH_URL",
+            format!("ws://127.0.0.1:{port}/dispatch"),
+        )
+        .env("SHIITAKE_DISPATCH_TOKEN", TOKEN)
+        .env("SHIITAKE_CAPTURE_ROOT", capture_root.path())
+        .spawn()
+        .unwrap();
+    let result = timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    child.kill().await.unwrap();
+    let _ = child.wait().await;
+    assert_eq!(result["kind"], "result");
+    assert_eq!(result["request_id"], "legacy-request");
+    assert!(result["exit_code"].is_null());
+    assert!(result["error"].as_str().unwrap().contains("incompatible"));
+    assert_eq!(
+        result.get("timed_out"),
+        Some(&serde_json::Value::Bool(false))
+    );
 }

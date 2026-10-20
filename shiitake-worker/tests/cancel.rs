@@ -8,6 +8,7 @@ use axum::{
     routing::get,
 };
 use futures_util::{SinkExt, StreamExt};
+use shiitake_worker_api::{OutputChunk, OutputStream};
 use std::{collections::BTreeMap, time::Duration};
 use tempfile::TempDir;
 use tokio::{
@@ -27,7 +28,7 @@ async fn worker_honors_cancel_mid_exec() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let (result_tx, mut result_rx) = mpsc::channel::<serde_json::Value>(1);
+    let (result_tx, mut result_rx) = mpsc::channel::<(serde_json::Value, Vec<u8>)>(1);
     let app: Router = Router::new().route(
         "/dispatch",
         get(move |upgrade: WebSocketUpgrade| {
@@ -53,7 +54,7 @@ async fn worker_honors_cancel_mid_exec() {
         .spawn()
         .expect("spawn worker");
 
-    let result = timeout(Duration::from_secs(10), result_rx.recv())
+    let (result, stderr) = timeout(Duration::from_secs(10), result_rx.recv())
         .await
         .expect("no result frame")
         .expect("channel closed");
@@ -63,19 +64,22 @@ async fn worker_honors_cancel_mid_exec() {
     child.kill().await.expect("kill worker");
     let _ = child.wait().await;
     assert_eq!(result["cancelled"], true);
-    assert_eq!(result["timed_out"], false);
 
-    let stderr = capture_root.path().join("req-cancel/stderr");
-    let body = std::fs::read_to_string(&stderr).expect("stderr capture should exist");
+    let body = String::from_utf8(stderr).unwrap();
     assert!(
         body.contains("cancelled"),
         "expected cancel marker in stderr capture, got {body:?}"
     );
 }
 
-async fn handle(socket: WebSocket, result_tx: mpsc::Sender<serde_json::Value>) {
+async fn handle(socket: WebSocket, result_tx: mpsc::Sender<(serde_json::Value, Vec<u8>)>) {
     let (mut sink, mut stream) = socket.split();
     let _hello = stream.next().await;
+    sink.send(Message::Text(
+        r#"{"kind":"hello_ack","protocol_version":3}"#.into(),
+    ))
+    .await
+    .unwrap();
 
     let mut env = BTreeMap::new();
     env.insert(
@@ -89,7 +93,6 @@ async fn handle(socket: WebSocket, result_tx: mpsc::Sender<serde_json::Value>) {
         "command": "sleep 30",
         "working_dir": std::env::temp_dir(),
         "env": env,
-        "timeout_secs": 60.0,
     });
 
     sink.send(Message::Text(exec_frame.to_string().into()))
@@ -106,13 +109,23 @@ async fn handle(socket: WebSocket, result_tx: mpsc::Sender<serde_json::Value>) {
         .await
         .unwrap();
 
+    let mut stderr = Vec::new();
     while let Some(msg) = stream.next().await {
-        if let Ok(Message::Text(t)) = msg {
-            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
-            if v.get("kind").and_then(|k| k.as_str()) == Some("result") {
-                result_tx.send(v).await.ok();
-                return;
+        match msg {
+            Ok(Message::Binary(b)) => {
+                let chunk = OutputChunk::decode(&b).unwrap();
+                if chunk.stream == OutputStream::Stderr {
+                    stderr.extend_from_slice(chunk.bytes);
+                }
             }
+            Ok(Message::Text(t)) => {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v.get("kind").and_then(|k| k.as_str()) == Some("result") {
+                    result_tx.send((v, stderr)).await.ok();
+                    return;
+                }
+            }
+            _ => {}
         }
     }
 }

@@ -16,10 +16,12 @@ spec:
   selector:
     matchLabels:
       app: shiitake-worker
+      profile: {{ .Values.worker.profile }}
   template:
     metadata:
       labels:
         app: shiitake-worker
+        profile: {{ .Values.worker.profile }}
         release: {{ .Release.Name }}
     spec:
       # The workers run arbitrary commands; only the server needs API access.
@@ -28,7 +30,50 @@ spec:
         {{- include "shiitake.workerContainer" (dict
               "root" .
               "name" "worker"
+              "profile" .Values.worker.profile
+              "resources" .Values.worker.resources
+              "sharedFolder" .Values.worker.sharedFolder
               "dispatchUrl" (printf "ws://%s-dispatch:%v/dispatch" .Release.Name (.Values.server.dispatchPort | toString))) | nindent 8 }}
+      {{- if .Values.worker.sharedFolder }}
       volumes:
-        {{- include "shiitake.captureVolume" (dict "root" .) | nindent 8 }}
+        {{- include "shiitake.sharedFolderVolume" (dict "root" .) | nindent 8 }}
+      {{- end }}
+{{- range $profile := .Values.workerProfiles }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $.Release.Name }}-workers-{{ $profile.name }}
+  labels:
+    app: shiitake-worker
+    profile: {{ $profile.name }}
+    release: {{ $.Release.Name }}
+spec:
+  replicas: {{ $profile.count }}
+  selector:
+    matchLabels:
+      app: shiitake-worker
+      profile: {{ $profile.name }}
+  template:
+    metadata:
+      labels:
+        app: shiitake-worker
+        profile: {{ $profile.name }}
+        release: {{ $.Release.Name }}
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        {{- include "shiitake.workerContainer" (dict
+              "root" $
+              "name" "worker"
+              "profile" $profile.name
+              "dispatchToken" $profile.dispatchToken
+              "resources" $profile.resources
+              "sharedFolder" $profile.sharedFolder
+              "dispatchUrl" (printf "ws://%s-dispatch:%v/dispatch" $.Release.Name ($.Values.server.dispatchPort | toString))) | nindent 8 }}
+      {{- if $profile.sharedFolder }}
+      volumes:
+        {{- include "shiitake.sharedFolderVolume" (dict "root" $) | nindent 8 }}
+      {{- end }}
+{{- end }}
 {{- end }}
