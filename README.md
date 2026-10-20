@@ -100,7 +100,8 @@ layouts:
   reach `/dispatch` through a Service. Only the server mounts the output spool;
   a separate application volume may be mounted in selected worker profiles.
   The dispatch Service uses `publishNotReadyAddresses` to avoid a startup
-  deadlock with the server's readiness probe.
+  deadlock with the server's readiness probe. The server ServiceAccount needs
+  `get` permission on pods to identify container OOM kills.
 
 The Helm test chart in `tests/chart` demonstrates both layouts and two profiles.
 The worker image is a static binary suitable for `COPY --from`; the test chart

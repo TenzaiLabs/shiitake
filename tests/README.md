@@ -24,7 +24,9 @@ In two-pod mode the server and each worker profile run in separate Deployments;
 workers have no service account token and a NetworkPolicy only permits DNS and
 the dispatcher. The server alone mounts its local `emptyDir` output spool.
 Worker stdout and stderr cross the dispatch WebSocket and never need a shared
-capture volume.
+capture volume. The dispatch Service publishes not-ready addresses so workers
+can register before server readiness succeeds. The server ServiceAccount has a
+pod-reader Role with `get` permission for OOM detection.
 
 `test_exec.py` covers profile allocation, environment, working directory,
 stateful and parallel commands, streamed/ranged output, cancellation, timeout,
