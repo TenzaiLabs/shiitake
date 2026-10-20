@@ -312,8 +312,13 @@ async fn serve_session(
                             execute.request_id,
                             "incompatible dispatcher protocol; command was not run",
                         );
-                        let frame = serde_json::to_string(&Frame::Result(error))?;
-                        sink.send(Message::Text(frame.into())).await?;
+                        // Pre-v3 dispatchers require this removed field when
+                        // parsing Result. Include it only on the compatibility
+                        // rejection so they can report the protocol error.
+                        let mut frame = serde_json::to_value(Frame::Result(error))?;
+                        frame["timed_out"] = serde_json::Value::Bool(false);
+                        sink.send(Message::Text(serde_json::to_string(&frame)?.into()))
+                            .await?;
                         anyhow::bail!("dispatcher did not acknowledge protocol version");
                     }
                     other => anyhow::bail!("unexpected dispatcher handshake frame: {other:?}"),

@@ -45,7 +45,9 @@ Dispatch protocol version 3 streams command output: the worker sends
 `Hello.protocol_version = 3`, waits for the server's `HelloAck`, and only then
 accepts work. The server rejects older Hello frames before pool registration.
 This deliberately fences mixed-version rollouts that would otherwise lose
-output when one side expects a shared capture volume.
+output when one side expects a shared capture volume. The worker's rejection
+Result for a pre-v3 server alone includes the old `timed_out: false` field so
+that server can parse the compatibility error; normal v3 results omit it.
 
 At creation a session fixes its profile, working directory, environment,
 `DropTo`, and terminal size. Stateful commands source a script in the live

@@ -202,4 +202,8 @@ async fn worker_rejects_a_command_from_a_server_without_protocol_ack() {
     assert_eq!(result["request_id"], "legacy-request");
     assert!(result["exit_code"].is_null());
     assert!(result["error"].as_str().unwrap().contains("incompatible"));
+    assert_eq!(
+        result.get("timed_out"),
+        Some(&serde_json::Value::Bool(false))
+    );
 }
