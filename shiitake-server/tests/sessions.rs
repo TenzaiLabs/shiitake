@@ -265,6 +265,14 @@ async fn profiles_reserve_workers_and_output_is_spooled_on_server() {
         assert_eq!(session.worker_id.as_str(), expected_worker);
         assert_eq!(session.session_id.as_str().len(), 18);
         assert!(session.session_id.as_str().starts_with("s-"));
+        let list_url = format!("/api/v1/sessions/{}/commands", session.session_id);
+        let (status, body) = api_call(&app, Method::GET, list_url.clone(), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            serde_json::from_slice::<Vec<StatusResponse>>(&body)
+                .unwrap()
+                .is_empty()
+        );
         let (status, _) = api_call(
             &app,
             Method::POST,
@@ -293,6 +301,13 @@ async fn profiles_reserve_workers_and_output_is_spooled_on_server() {
         let spawned: SpawnResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(spawned.handle.as_str().len(), 18);
         assert!(spawned.handle.as_str().starts_with("c-"));
+        let (status, body) = api_call(&app, Method::GET, list_url.clone(), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let listed: Vec<StatusResponse> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].handle, spawned.handle);
+        assert_eq!(listed[0].session_id.as_ref(), Some(&session.session_id));
+        assert_eq!(listed[0].worker_id.as_str(), expected_worker);
         let status_url = format!(
             "/api/v1/sessions/{}/commands/{}",
             session.session_id, spawned.handle
@@ -345,7 +360,20 @@ async fn profiles_reserve_workers_and_output_is_spooled_on_server() {
         assert_eq!(status, StatusCode::OK);
         let closed: SessionResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(closed.state, shiitake_server_api::SessionState::Closed);
+        let (status, body) = api_call(&app, Method::GET, list_url, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let listed: Vec<StatusResponse> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].handle, spawned.handle);
     }
+    let (status, _) = api_call(
+        &app,
+        Method::GET,
+        "/api/v1/sessions/unknown/commands".into(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

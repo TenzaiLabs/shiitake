@@ -38,6 +38,10 @@ async def test_range_read_on_isolated_profile(shiitake_client: AsyncShiitakeClie
         snap = await handle.wait()
         assert snap.status == "completed"
         assert snap.stdout_bytes_written == 6
+        listed = await session.commands()
+        assert [item.handle for item in listed] == [handle.handle]
+        assert listed[0].stdout_bytes_written == 6
+        handle = await session.get_command(listed[0].handle)
         head = await handle.read("stdout", from_=0, max_=3)
         assert head.content == "abc"
         assert head.bytes_written == 6

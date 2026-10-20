@@ -75,7 +75,11 @@ pub async fn status(
         .touch_and_snapshot(&handle)
         .await
         .ok_or((StatusCode::NOT_FOUND, "unknown handle".into()))?;
-    Ok(Json(StatusResponse {
+    Ok(Json(status_response(&state, snap)))
+}
+
+pub(crate) fn status_response(state: &AppState, snap: HandleSnapshot) -> StatusResponse {
+    StatusResponse {
         handle: snap.handle_id.clone(),
         session_id: snap.session_id,
         worker_id: snap.worker_id,
@@ -88,7 +92,7 @@ pub async fn status(
         cancelled: snap.cancelled,
         stdout_bytes_written: state.pool.capture_len(&snap.handle_id, Stream::Stdout),
         stderr_bytes_written: state.pool.capture_len(&snap.handle_id, Stream::Stderr),
-    }))
+    }
 }
 
 /// Serve the captured stdout file. Honours HTTP `Range` requests

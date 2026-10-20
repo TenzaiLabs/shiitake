@@ -1176,6 +1176,35 @@ impl WorkerPool {
         out
     }
 
+    /// List retained command handles for one session, oldest first. Listing
+    /// counts as activity for the session and its handles.
+    pub async fn list_session_commands(&self, id: &SessionId) -> Option<Vec<HandleSnapshot>> {
+        let rows: Vec<HandleRow> = {
+            let mut s = self.state.lock().await;
+            let rec = s.sessions.get_mut(id)?;
+            if rec.state == shiitake_server_api::SessionState::Active {
+                rec.last_activity_at = SystemTime::now();
+            }
+            s.handles
+                .values()
+                .filter(|row| row.state.session_id.as_ref() == Some(id))
+                .cloned()
+                .collect()
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut runtime = row.state.inner.lock().await;
+            runtime.last_polled_at = SystemTime::now();
+            out.push(snapshot_from(&row.state, &runtime));
+        }
+        out.sort_by(|a, b| {
+            a.started_at
+                .cmp(&b.started_at)
+                .then_with(|| a.handle_id.as_str().cmp(b.handle_id.as_str()))
+        });
+        Some(out)
+    }
+
     /// Register a freshly-Hello'd worker as available for dispatch and
     /// drive its read loop. Returns when the WS closes.
     ///

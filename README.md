@@ -34,6 +34,7 @@ protected by `SHIITAKE_DISPATCH_TOKEN`.
 | `GET` | `/sessions/{id}` | Session state and assigned worker. |
 | `DELETE` | `/sessions/{id}` | Close the shell, cancel its jobs, reset the worker, and release it. |
 | `POST` | `/sessions/{id}/commands` | Submit a stateful or parallel command; returns a handle (`202`). |
+| `GET` | `/sessions/{id}/commands` | List retained commands in this session, oldest first, with status and output byte counts. |
 | `GET` | `/sessions/{id}/commands/{handle}` | Command status, exit cause, and output byte counts. |
 | `DELETE` | `/sessions/{id}/commands/{handle}` | Cancel a command. |
 | `GET` | `/sessions/{id}/commands/{handle}/stdout` | Read output, including HTTP `Range` requests. |
@@ -94,6 +95,8 @@ handle=$(curl -fsS -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
   -d '{"command":"echo started; sleep 3600; echo finished","mode":"parallel"}' \
   "$base/sessions/$sid/commands" |
   python3 -c 'import json,sys; print(json.load(sys.stdin)["handle"])')
+curl -fsS -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
+  "$base/sessions/$sid/commands"                         # discover handles
 curl -fsS -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
   "$base/sessions/$sid/commands/$handle"                 # status: running
 curl -fsS -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \

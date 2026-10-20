@@ -163,6 +163,23 @@ pub async fn run(
     ))
 }
 
+pub async fn list_commands(
+    State(state): State<AppState>,
+    Path(id): Path<SessionId>,
+) -> Result<Json<Vec<StatusResponse>>, HttpError> {
+    let handles = state
+        .pool
+        .list_session_commands(&id)
+        .await
+        .ok_or((StatusCode::NOT_FOUND, "unknown session".into()))?;
+    Ok(Json(
+        handles
+            .into_iter()
+            .map(|snap| exec::status_response(&state, snap))
+            .collect(),
+    ))
+}
+
 async fn check_handle(state: &AppState, id: &SessionId, handle: &ExecId) -> Result<(), HttpError> {
     let snap = state
         .pool

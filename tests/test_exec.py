@@ -438,6 +438,11 @@ class SessionsAndProfiles(unittest.TestCase):
                 })
                 self.assertEqual(status, 202, job)
                 handles.append(job["handle"])
+            status, listed = _request("GET", f"/sessions/{sid}/commands")
+            self.assertEqual(status, 200, listed)
+            self.assertEqual(listed[0]["handle"], setup)
+            self.assertEqual({item["handle"] for item in listed}, {setup, *handles})
+            self.assertTrue(all(item["session_id"] == sid for item in listed))
             for handle, expected in zip(handles, ("kept\n", "/\n")):
                 while True:
                     _, snap = _request("GET", f"/sessions/{sid}/commands/{handle}")

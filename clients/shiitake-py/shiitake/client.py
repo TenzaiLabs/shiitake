@@ -291,6 +291,15 @@ class AsyncSession:
     async def status(self) -> SessionResponse:
         return await self._client.session_status(self.session_id)
 
+    async def commands(self) -> list[StatusResponse]:
+        """List retained commands in this session, oldest first."""
+        return await self._client.list_commands(self.session_id)
+
+    async def get_command(self, handle: str) -> AsyncHandle:
+        """Recover a handle for a command already submitted to this session."""
+        status = await self._client.command_status(self.session_id, handle)
+        return AsyncHandle(self._client, self.session_id, handle, status.started_at)
+
     async def spawn(
         self, command: str, *, mode: CommandMode = "stateful",
     ) -> AsyncHandle:
@@ -460,6 +469,11 @@ class AsyncShiitakeClient(_Base):
         _raise_for_status(resp)
         return StatusResponse.from_dict(resp.json())
 
+    async def list_commands(self, session_id: str) -> list[StatusResponse]:
+        resp = await self._request("GET", self._url(f"/sessions/{session_id}/commands"))
+        _raise_for_status(resp)
+        return [StatusResponse.from_dict(item) for item in resp.json()]
+
     async def kill_command(self, session_id: str, handle: str) -> None:
         resp = await self._request(
             "DELETE", self._url(f"/sessions/{session_id}/commands/{handle}")
@@ -599,6 +613,23 @@ class Session:
         )
         _raise_for_status(resp)
         return SessionResponse(**resp.json())
+
+    def commands(self) -> list[StatusResponse]:
+        """List retained commands in this session, oldest first."""
+        resp = self._client._http.get(
+            self._client._url(f"/sessions/{self.session_id}/commands"),
+            headers=self._client._headers(),
+        )
+        _raise_for_status(resp)
+        return [StatusResponse.from_dict(item) for item in resp.json()]
+
+    def get_command(self, handle: str) -> Handle:
+        """Recover a handle for a command already submitted to this session."""
+        url = self._client._url(f"/sessions/{self.session_id}/commands/{handle}")
+        resp = self._client._http.get(url, headers=self._client._headers())
+        _raise_for_status(resp)
+        status = StatusResponse.from_dict(resp.json())
+        return Handle(self._client, self.session_id, handle, status.started_at)
 
     def run(
         self, command: str, *,

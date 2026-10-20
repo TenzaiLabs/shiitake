@@ -34,13 +34,16 @@ and dispatch protocol are the same.
 
 All authenticated public routes are under `/api/v1`: `GET /profiles`,
 `POST/GET/DELETE /sessions[/{id}]`,
-`POST /sessions/{id}/commands`,
+`GET/POST /sessions/{id}/commands`,
 `GET/DELETE /sessions/{id}/commands/{handle}`,
 `GET /sessions/{id}/commands/{handle}/{stdout,stderr}`, and
 `GET /sessions/{id}/terminal` (WebSocket). `/health` and `/ready` are
 unauthenticated. Legacy `/exec` and `/pty` public routes were removed in the
 0.5.0 session API. The internal `/dispatch` listener has a separate bearer
 credential from the public API.
+`GET /sessions/{id}/commands` lists the session's retained handles, oldest
+first. Listing refreshes session and handle activity; the sweeper can still
+purge terminal handles after their retention period.
 Dispatch protocol version 3 streams command output: the worker sends
 `Hello.protocol_version = 3`, waits for the server's `HelloAck`, and only then
 accepts work. The server rejects older Hello frames before pool registration.

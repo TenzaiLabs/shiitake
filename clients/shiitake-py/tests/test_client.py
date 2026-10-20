@@ -130,6 +130,11 @@ async def test_session_command_modes_and_range_output() -> None:
             return httpx.Response(201, json=session_payload())
         if req.method == "POST":
             return httpx.Response(202, json={"handle": "h", "started_at": 2.0})
+        if req.url.path.endswith("/commands"):
+            return httpx.Response(200, json=[{
+                "handle": "h", "session_id": "s", "worker_id": "w",
+                "status": "completed", "started_at": 2.0,
+            }])
         if req.url.path.endswith("/h"):
             return httpx.Response(200, json={
                 "handle": "h", "session_id": "s", "worker_id": "w", "status": "completed",
@@ -152,6 +157,10 @@ async def test_session_command_modes_and_range_output() -> None:
     assert chunk.bytes_written == 3
     empty = await handle.read("stderr", max_=10)
     assert empty.content == ""
+    assert [item.handle for item in await session.commands()] == ["h"]
+    recovered = await session.get_command("h")
+    assert recovered.started_at == 2.0
+    assert (await recovered.poll()).status == "completed"
     await client.aclose()
 
 
@@ -213,6 +222,11 @@ def test_sync_client_requires_session() -> None:
         if req.url.path == "/api/v1/sessions" and req.method == "POST":
             return httpx.Response(201, json=session_payload())
         if req.url.path.endswith("/commands"):
+            if req.method == "GET":
+                return httpx.Response(200, json=[{
+                    "handle": "h", "session_id": "s", "worker_id": "w",
+                    "status": "completed", "started_at": 1.0,
+                }])
             return httpx.Response(202, json={"handle": "h", "started_at": 1.0})
         if req.url.path.endswith("/h"):
             return httpx.Response(200, json={
@@ -236,5 +250,7 @@ def test_sync_client_requires_session() -> None:
         assert handle.poll().status == "completed"
         assert handle.read("stdout", max_=10).content == "ok\n"
         handle.kill()
+        assert [item.handle for item in session.commands()] == ["h"]
+        assert session.get_command("h").poll().status == "completed"
     assert ("DELETE", "/api/v1/sessions/s/commands/h") in seen
     client.close()

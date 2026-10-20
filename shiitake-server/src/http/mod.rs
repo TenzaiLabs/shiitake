@@ -57,7 +57,10 @@ pub fn build_api_router(state: AppState) -> Router {
             "/sessions/{id}",
             get(sessions::status).delete(sessions::close),
         )
-        .route("/sessions/{id}/commands", post(sessions::run))
+        .route(
+            "/sessions/{id}/commands",
+            get(sessions::list_commands).post(sessions::run),
+        )
         .route(
             "/sessions/{id}/commands/{handle}",
             get(sessions::command_status).delete(sessions::cancel),

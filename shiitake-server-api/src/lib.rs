@@ -118,8 +118,9 @@ pub enum ExitCause {
     Cancelled,
 }
 
-/// Command status response. Output is read separately by byte range from
-/// `/api/v1/sessions/{id}/commands/{handle}/{stdout,stderr}`.
+/// Command status response, also returned in the array from
+/// `GET /api/v1/sessions/{id}/commands`. Output is read separately by byte
+/// range from `/api/v1/sessions/{id}/commands/{handle}/{stdout,stderr}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub handle: ExecId,

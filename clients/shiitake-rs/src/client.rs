@@ -57,6 +57,10 @@ pub struct Session<'a> {
 }
 
 impl Session<'_> {
+    pub async fn commands(&self) -> Result<Vec<StatusResponse>, ClientError> {
+        self.client.list_commands(&self.details.session_id).await
+    }
+
     pub async fn submit(
         &self,
         command: impl Into<String>,
@@ -201,6 +205,14 @@ impl Client {
                 self.http
                     .get(self.url(&format!("/sessions/{id}/commands/{handle}"))),
             )
+            .send()
+            .await?;
+        Ok(error_for_status(resp).await?.json().await?)
+    }
+
+    pub async fn list_commands(&self, id: &SessionId) -> Result<Vec<StatusResponse>, ClientError> {
+        let resp = self
+            .auth(self.http.get(self.url(&format!("/sessions/{id}/commands"))))
             .send()
             .await?;
         Ok(error_for_status(resp).await?.json().await?)

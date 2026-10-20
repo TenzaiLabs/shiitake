@@ -42,6 +42,7 @@ whose wall time is unknown, retain its handle and decide when to cancel:
 
 ```python
 job = await session.spawn("echo started; sleep 3600; echo finished", mode="parallel")
+print([item.handle for item in await session.commands()])  # rediscover handles
 print((await job.poll()).status)        # running
 print((await job.read("stdout")).content)  # output so far
 await job.kill()                         # cancel this command
@@ -49,6 +50,7 @@ print((await job.wait()).exit_cause)     # cancelled
 ```
 
 Commands have no wall-time deadline. `AsyncHandle.wait()` polls until a
-terminal status. The synchronous `ShiitakeClient` has the same `Session.run()`,
+terminal status. Use `session.get_command(handle_id)` to recover a handle from
+a listing and then poll, read, or cancel it. The synchronous `ShiitakeClient` has the same `Session.run()`,
 `Session.spawn()`, and `Handle.poll()`, `read()`, `kill()`, and `wait()` methods.
 Release the session after the command ends, or use a context manager.
