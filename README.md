@@ -41,17 +41,31 @@ protected by `SHIITAKE_DISPATCH_TOKEN`.
 | `GET` | `/sessions/{id}/terminal` | Attach an interactive WebSocket terminal. Binary messages are raw terminal bytes; send `{"op":"resize","cols":80,"rows":24}` as text to resize. |
 | `GET` | `/health`, `/ready` | Unauthenticated liveness and pool readiness. |
 
-Create a session and run a command:
+Create a session, wait for a command, read its output, and release the worker:
 
 ```bash
 base=http://localhost:8080/api/v1
 sid=$(curl -fsS -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
   -H 'Content-Type: application/json' -d '{"profile":"default","env":{"PATH":"/usr/bin:/bin"}}' \
   "$base/sessions" | python3 -c 'import json,sys; print(json.load(sys.stdin)["session_id"])')
-curl -fsS -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
+handle=$(curl -fsS -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"command":"echo hello","mode":"stateful"}' \
-  "$base/sessions/$sid/commands"
+  "$base/sessions/$sid/commands" |
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["handle"])')
+while :; do
+  state=$(curl -fsS -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
+    "$base/sessions/$sid/commands/$handle" |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
+  [ "$state" = running ] || break
+  sleep 0.2
+done
+if [ "$state" = completed ]; then
+  curl -fsS -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
+    "$base/sessions/$sid/commands/$handle/stdout"
+else
+  echo "command ended as $state" >&2
+fi
 curl -fsS -X DELETE -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
   "$base/sessions/$sid"
 ```
@@ -77,8 +91,8 @@ unbounded, so size the server's local volume for expected workloads.
 
 ## Deployment and configuration
 
-The server and workers use the same binaries and wire protocol in both
-supported layouts:
+The server and worker binaries use the same wire protocol in both supported
+layouts:
 
 - **Single pod:** server and worker containers share one pod. The dispatcher
   listens on loopback. The server has a local `emptyDir` output spool.
@@ -131,7 +145,7 @@ terminal support via its `[pty]` extra. `clients/shiitake-rs` provides an async
 HTTP session client. Both clients expose explicit session release.
 
 ```bash
-cargo fmt --all --check
+cargo +nightly fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 uv run --project clients/shiitake-py --group dev pytest clients/shiitake-py/tests

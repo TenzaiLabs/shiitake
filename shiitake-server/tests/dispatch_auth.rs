@@ -99,6 +99,21 @@ async fn accepts_a_worker_presenting_the_token() {
     .unwrap();
     ws.send(Message::Text(hello.into())).await.unwrap();
 
+    let ack = timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("server did not acknowledge the worker")
+        .expect("server closed without an acknowledgement")
+        .unwrap();
+    let Message::Text(ack) = ack else {
+        panic!("expected HelloAck text frame");
+    };
+    assert!(matches!(
+        serde_json::from_str::<Frame>(&ack).unwrap(),
+        Frame::HelloAck {
+            protocol_version: 2
+        }
+    ));
+
     // The worker registers as idle, so the handshake completed end to end.
     for _ in 0..50 {
         if pool.snapshot().await == (1, 0) {

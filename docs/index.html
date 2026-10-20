@@ -171,6 +171,9 @@
 POST /api/v1/sessions/{id}/commands
 {"command":"echo hello","mode":"stateful"}
 
+GET /api/v1/sessions/{id}/commands/{handle}  (poll until completed)
+GET /api/v1/sessions/{id}/commands/{handle}/stdout
+
 DELETE /api/v1/sessions/{id}</code></pre><p>See the <a href="docs.html#http-api">full API</a> and <a href="docs.html#topologies">deployment layouts</a>.</p></section>
 </main><footer class="wrap">🍄 Shiitake · <a href="https://github.com/TenzaiLabs/shiitake">GitHub</a></footer>
 </body></html>

@@ -74,6 +74,7 @@ async fn worker_dials_the_configured_url_with_a_bearer_token_and_reports_its_loc
 
     assert_eq!(hello["kind"], "hello");
     assert_eq!(hello["worker_id"], "shiitake-workers-xyz");
+    assert_eq!(hello["protocol_version"], 2);
     // What the OOM probe will query: the worker's pod, not the server's.
     assert_eq!(hello["location"]["pod"], "shiitake-workers-xyz");
     assert_eq!(hello["location"]["namespace"], "shiitake");
@@ -128,6 +129,7 @@ async fn worker_omits_the_location_when_it_has_no_pod_identity() {
     let _ = child.wait().await;
 
     assert_eq!(hello["worker_id"], "worker-0");
+    assert_eq!(hello["protocol_version"], 2);
     assert!(
         hello.get("location").is_none(),
         "a worker with no pod identity must omit location entirely, got {hello}"

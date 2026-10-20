@@ -1,7 +1,7 @@
-//! Startup reconciliation of the capture volume.
+//! Startup reconciliation of the server's local output spool.
 //!
-//! Handles live only in memory, so a server restart orphans every capture
-//! directory on the volume. `run_sweeper` purges by walking the registry, so it
+//! Handles live only in memory, so a server restart orphans every output
+//! directory in the spool. `run_sweeper` purges by walking the registry, so it
 //! can never reach them. Matters most in the two-pod topology, where the volume
 //! outlives the server pod rather than dying with it as an `emptyDir` does.
 

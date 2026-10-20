@@ -204,14 +204,33 @@
     <p>The server allocates a worker to a session in a named profile. A session has one persistent Bash shell, one identity, and one worker until release. Stateful commands run in that shell and keep its directory, variables, and exports. Parallel commands run concurrently using the shell's latest directory and exported environment; they cannot change the parent shell's state. A terminal can attach, detach, and attach again without releasing the worker.</p>
     <p>Workers stream stdout and stderr over their authenticated dispatch WebSocket. The server spools output locally for HTTP range reads. No capture volume is shared between server and workers. The worker uses temporary files inside its own container while a command runs and removes them when the command finishes.</p>
     <h2 id="quickstart">Quickstart</h2>
-    <p>Set the API and dispatch tokens on the server, and the dispatch URL, token, unique worker id, and profile on each worker. Then create a session:</p>
+    <p>Set the API and dispatch tokens on the server, and the dispatch URL, token, unique worker id, and profile on each worker. Then create a session, finish a command, and release it:</p>
     <pre><code>base=http://localhost:8080/api/v1
-curl -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
+sid=$(curl -fsS -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"profile":"default","env":{"PATH":"/usr/bin:/bin"}}' \
-  "$base/sessions"
-# Use the returned session_id for subsequent calls.</code></pre>
-    <p>A caller must release the session with <code>DELETE /sessions/{id}</code>. A closed session resets its worker; a worker restart can bound any state that reset misses. The worker clears its environment before the shell starts, so supply <code>PATH</code> when using external binaries.</p>
+  "$base/sessions" | python3 -c 'import json,sys; print(json.load(sys.stdin)["session_id"])')
+handle=$(curl -fsS -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"command":"echo hello","mode":"stateful"}' \
+  "$base/sessions/$sid/commands" |
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["handle"])')
+while :; do
+  state=$(curl -fsS -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
+    "$base/sessions/$sid/commands/$handle" |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
+  [ "$state" = running ] || break
+  sleep 0.2
+done
+if [ "$state" = completed ]; then
+  curl -fsS -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
+    "$base/sessions/$sid/commands/$handle/stdout"
+else
+  echo "command ended as $state"
+fi
+curl -fsS -X DELETE -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
+  "$base/sessions/$sid"</code></pre>
+    <p>Release each session after its commands finish; release cancels any jobs still running and resets the worker. An idle session is reclaimed after one hour as a backstop for abandoned clients. The worker clears its environment before the shell starts, so supply <code>PATH</code> when using external binaries.</p>
     <h2 id="http-api">HTTP API</h2>
     <p>All public routes are under <code>/api/v1</code>. Only <code>/health</code> and <code>/ready</code> are unauthenticated.</p>
     <div class="table-wrap"><table><thead><tr><th>Method</th><th>Path</th><th>Purpose</th></tr></thead><tbody>
@@ -231,7 +250,7 @@ curl -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
     <h2 id="clients">Clients</h2>
     <p><code>clients/shiitake-py</code> provides async and synchronous context-managed sessions. Its optional <code>[pty]</code> extra adds terminal attachment. <code>clients/shiitake-rs</code> provides an async HTTP client for sessions and command output.</p>
     <h2 id="topologies">Topologies and worker profiles</h2>
-    <p>In single-pod mode, the server and workers share a pod and the dispatcher listens on loopback. In two-pod mode, worker profiles run in separate Deployments and connect through a Service. The server has a local output spool in either mode. Profiles are advertised by workers on connection; the server maintains an idle queue for each profile and allocates only from the requested one.</p>
+    <p>In single-pod mode, the server and workers share a pod and the dispatcher listens on loopback. In two-pod mode, worker profiles run in separate Deployments and connect through a Service. The server has a local output spool in either mode. Profiles are advertised by workers on connection; the server selects the least recently used idle worker in the requested profile.</p>
     <p>The test chart offers a <code>default</code> profile with <code>/shared</code> and an <code>isolated</code> profile without that application mount. In two-pod mode they also have separate pod boundaries. The caller manages file permissions in shared folders. A single-pod layout shares a network namespace, so use separate pods when pod-level network policy matters.</p>
     <h2 id="configuration">Configuration</h2>
     <p>Server: <code>SHIITAKE_AUTH_TOKEN</code>, <code>SHIITAKE_DISPATCH_TOKEN</code>, <code>SHIITAKE_PROFILE_TOKENS</code> (JSON map of additional profile credentials), <code>SHIITAKE_DISPATCH_HOST</code>/<code>PORT</code>, <code>SHIITAKE_CAPTURE_ROOT</code> (server-local output spool), <code>SHIITAKE_DEFAULT_WORKDIR</code>, and <code>SHIITAKE_MIN_READY_WORKERS</code>. Worker: <code>SHIITAKE_WORKER_ID</code>, <code>SHIITAKE_PROFILE</code>, <code>SHIITAKE_DISPATCH_URL</code>, <code>SHIITAKE_DISPATCH_TOKEN</code>, <code>SHIITAKE_CAPTURE_ROOT</code> (worker-local temporary output), <code>SHIITAKE_RESET_PATHS</code>, <code>SHIITAKE_RESTART_AFTER</code>, and <code>SHIITAKE_LEASE_TIMEOUT</code>.</p>
@@ -241,7 +260,7 @@ curl -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
     <h2 id="security">Security</h2>
     <p>Use distinct API and dispatch bearer tokens. Worker commands run under the session's <code>drop_to</code> identity, but a root shell inside a worker can read that worker's dispatch credential. Configure a distinct dispatch token for each additional profile with <code>SHIITAKE_PROFILE_TOKENS</code>. The server binds the token used on the WebSocket upgrade to the profile in Hello, so a worker cannot claim another profile. Give each profile its intended mounts and network policy; workers within one profile share its trust domain.</p>
     <h2 id="development">Development</h2>
-    <pre><code>cargo fmt --all --check
+    <pre><code>cargo +nightly fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 bash tests/build.sh &amp;&amp; bash tests/setup.sh &amp;&amp; bash tests/run.sh

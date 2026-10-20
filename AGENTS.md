@@ -76,7 +76,7 @@ The server-side spool must therefore have enough capacity for expected output.
 ## Build and test
 
 ```bash
-cargo fmt --all --check
+cargo +nightly fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 uv run --project clients/shiitake-py --group dev pytest clients/shiitake-py/tests
