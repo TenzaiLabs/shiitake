@@ -117,7 +117,8 @@ version unless its scope needs a larger bump.
   SIGKILL to the process group. A terminal attachment owns its
   reservation and releases it on drop, including failed WebSocket upgrades.
   Worker-drop closure is queued after any terminal output backlog so an
-  attached client always receives the close event.
+  attached client always receives the close event. The WebSocket close reason
+  must use a fixed public message when the worker reports an internal error.
 - `/health` is liveness and stays healthy for an empty pool. `/ready` needs
   `SHIITAKE_MIN_READY_WORKERS` registered workers, including allocated ones.
   The two-pod dispatch Service uses `publishNotReadyAddresses` so workers can

@@ -275,11 +275,7 @@ async fn serve_terminal(socket: WebSocket, mut attachment: TerminalAttachment) {
                     if client_tx.send(Message::Binary(bytes.into())).await.is_err() { break; }
                 }
                 Some(TerminalEvent::Closed(error)) => {
-                    let code = if error.is_some() { 1011 } else { 1000 };
-                    let reason = error.unwrap_or_else(|| "session ended".into());
-                    let _ = client_tx.send(Message::Close(Some(CloseFrame {
-                        code, reason: reason.into(),
-                    }))).await;
+                    let _ = client_tx.send(Message::Close(Some(terminal_close(error)))).await;
                     break;
                 }
                 None => {
@@ -294,9 +290,35 @@ async fn serve_terminal(socket: WebSocket, mut attachment: TerminalAttachment) {
     attachment.detach().await;
 }
 
+fn terminal_close(error: Option<String>) -> CloseFrame {
+    match error {
+        Some(details) => {
+            tracing::warn!(%details, "terminal session ended with worker error");
+            CloseFrame {
+                code: 1011,
+                reason: "session ended unexpectedly".into(),
+            }
+        }
+        None => CloseFrame {
+            code: 1000,
+            reason: "session ended".into(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_close_hides_worker_error_details() {
+        let close = terminal_close(Some("private path /root/session-state".into()));
+        assert_eq!(close.code, 1011);
+        assert_eq!(close.reason.as_str(), "session ended unexpectedly");
+        let normal = terminal_close(None);
+        assert_eq!(normal.code, 1000);
+        assert_eq!(normal.reason.as_str(), "session ended");
+    }
 
     #[test]
     fn public_ids_are_short_and_unambiguous() {

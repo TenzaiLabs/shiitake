@@ -636,11 +636,16 @@ class Session:
         mode: CommandMode = "stateful", max_inline_bytes: int = 64 * 1024
     ) -> RunResult:
         handle = self.spawn(command, mode=mode)
-        status = handle.wait()
-        streams = {
-            stream: handle.read(stream, max_=max_inline_bytes).content
-            for stream in ("stdout", "stderr")
-        }
+        try:
+            status = handle.wait()
+            streams = {
+                stream: handle.read(stream, max_=max_inline_bytes).content
+                for stream in ("stdout", "stderr")
+            }
+        except BaseException:
+            with contextlib.suppress(Exception):
+                handle.kill()
+            raise
         return RunResult(
             stdout=streams["stdout"], stderr=streams["stderr"],
             exit_code=status.exit_code if status.exit_code is not None else -1,

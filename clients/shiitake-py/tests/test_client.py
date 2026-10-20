@@ -254,3 +254,28 @@ def test_sync_client_requires_session() -> None:
         assert session.get_command("h").poll().status == "completed"
     assert ("DELETE", "/api/v1/sessions/s/commands/h") in seen
     client.close()
+
+
+def test_sync_run_interrupt_cancels_command_without_context_manager() -> None:
+    seen: list[tuple[str, str]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append((req.method, req.url.path))
+        if req.url.path == "/api/v1/sessions":
+            return httpx.Response(201, json=session_payload())
+        if req.url.path.endswith("/commands"):
+            return httpx.Response(202, json={"handle": "h", "started_at": 1.0})
+        if req.method == "GET" and req.url.path.endswith("/h"):
+            raise KeyboardInterrupt
+        if req.method == "DELETE" and req.url.path.endswith("/h"):
+            return httpx.Response(200, json={"handle": "h", "status": "running"})
+        raise AssertionError(f"unexpected request: {req.method} {req.url.path}")
+
+    client = ShiitakeClient("http://srv")
+    client.close()
+    client._http = httpx.Client(transport=httpx.MockTransport(handler))
+    session = client.create_session()
+    with pytest.raises(KeyboardInterrupt):
+        session.run("sleep 600", mode="parallel")
+    assert ("DELETE", "/api/v1/sessions/s/commands/h") in seen
+    client.close()
