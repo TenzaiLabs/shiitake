@@ -242,9 +242,17 @@ pub async fn terminal(
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum TerminalControl {
     Resize { cols: u16, rows: u16 },
+}
+
+fn terminal_resize(text: &str) -> Result<(u16, u16), String> {
+    match serde_json::from_str::<TerminalControl>(text) {
+        Ok(TerminalControl::Resize { cols, rows }) if cols > 0 && rows > 0 => Ok((cols, rows)),
+        Ok(_) => Err("terminal dimensions must be nonzero".into()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 async fn serve_terminal(socket: WebSocket, mut attachment: TerminalAttachment) {
@@ -260,10 +268,29 @@ async fn serve_terminal(socket: WebSocket, mut attachment: TerminalAttachment) {
                     if writer.lock().await.send(Message::Binary(chunk.encode().into())).await.is_err() { break; }
                 }
                 Some(Ok(Message::Text(t))) => {
-                    if let Ok(TerminalControl::Resize { cols, rows }) = serde_json::from_str(&t) {
-                        let frame = Frame::SessionResize { session_id: id.clone(), cols, rows };
-                        if let Ok(json) = serde_json::to_string(&frame) {
-                            let _ = writer.lock().await.send(Message::Text(json.into())).await;
+                    let (cols, rows) = match terminal_resize(&t) {
+                        Ok(size) => size,
+                        Err(error) => {
+                            tracing::warn!(%error, "invalid terminal control frame");
+                            let _ = client_tx.send(Message::Close(Some(CloseFrame {
+                                code: 1007, reason: "invalid terminal control".into(),
+                            }))).await;
+                            break;
+                        }
+                    };
+                    let frame = Frame::SessionResize { session_id: id.clone(), cols, rows };
+                    match serde_json::to_string(&frame) {
+                        Ok(json) => {
+                            if writer.lock().await.send(Message::Text(json.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "could not encode terminal resize frame");
+                            let _ = client_tx.send(Message::Close(Some(CloseFrame {
+                                code: 1011, reason: "terminal control failed".into(),
+                            }))).await;
+                            break;
                         }
                     }
                 }
@@ -318,6 +345,22 @@ mod tests {
         let normal = terminal_close(None);
         assert_eq!(normal.code, 1000);
         assert_eq!(normal.reason.as_str(), "session ended");
+    }
+
+    #[test]
+    fn terminal_resize_rejects_invalid_client_frames() {
+        assert_eq!(
+            terminal_resize(r#"{"op":"resize","cols":80,"rows":24}"#),
+            Ok((80, 24))
+        );
+        for frame in [
+            "not json",
+            r#"{"op":"unknown","cols":80,"rows":24}"#,
+            r#"{"op":"resize","cols":0,"rows":24}"#,
+            r#"{"op":"resize","cols":80,"rows":24,"extra":1}"#,
+        ] {
+            assert!(terminal_resize(frame).is_err(), "accepted {frame}");
+        }
     }
 
     #[test]

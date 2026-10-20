@@ -111,6 +111,19 @@ async def test_resize_reaches_tty(shiitake_client: AsyncShiitakeClient) -> None:
             await term.close()
 
 
+@pytest.mark.parametrize("frame", ["not json", '{"op":"unknown"}', '{"op":"resize","cols":0,"rows":24}'])
+async def test_invalid_terminal_control_closes_attachment(
+    shiitake_client: AsyncShiitakeClient, frame: str,
+) -> None:
+    async with await _session(shiitake_client) as session:
+        terminal = await session.attach_terminal()
+        await terminal._ws.send(frame)
+        await asyncio.wait_for(terminal._ws.wait_closed(), 5)
+        assert terminal.close_code == 1007
+        assert terminal.close_reason == "invalid terminal control"
+        assert (await session.status()).state == "active"
+
+
 async def test_output_is_byte_transparent(shiitake_client: AsyncShiitakeClient) -> None:
     async with await _session(shiitake_client) as session:
         term = _Term(await session.attach_terminal())

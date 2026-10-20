@@ -543,6 +543,35 @@ impl WorkerPool {
         })
     }
 
+    /// Finish creation only while the acknowledged session still owns a live
+    /// worker. The state and worker checks share one pool lock so a drop that
+    /// has already been observed cannot turn into a successful create reply.
+    async fn created_session_snapshot(
+        &self,
+        id: &SessionId,
+    ) -> Result<SessionSnapshot, SessionError> {
+        let mut s = self.state.lock().await;
+        let rec = s.sessions.get(id).ok_or(SessionError::NotFound)?;
+        let worker_id = rec.worker_id.clone();
+        if rec.state != shiitake_server_api::SessionState::Active
+            || !s.liveness.contains_key(&worker_id)
+            || s.worker_sessions.get(&worker_id) != Some(id)
+        {
+            return Err(SessionError::Worker(
+                "worker disconnected during open".into(),
+            ));
+        }
+        let rec = s.sessions.get_mut(id).expect("checked above");
+        rec.last_activity_at = SystemTime::now();
+        Ok(SessionSnapshot {
+            session_id: id.clone(),
+            worker_id,
+            profile: rec.profile.clone(),
+            state: rec.state,
+            created_at: rec.created_at,
+        })
+    }
+
     pub async fn create_session(
         &self,
         profile: String,
@@ -597,10 +626,7 @@ impl WorkerPool {
             return Err(SessionError::Worker(e));
         }
         match tokio::time::timeout(Duration::from_secs(10), ready_rx).await {
-            Ok(Ok(Ok(()))) => self
-                .session_snapshot(&id)
-                .await
-                .ok_or(SessionError::NotFound),
+            Ok(Ok(Ok(()))) => self.created_session_snapshot(&id).await,
             Ok(Ok(Err(e))) => Err(SessionError::Worker(e)),
             Ok(Err(_)) => Err(SessionError::Worker(
                 "worker disconnected during open".into(),
