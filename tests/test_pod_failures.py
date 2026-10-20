@@ -64,6 +64,38 @@ def worker_pods():
     return {p["metadata"]["name"]: p for p in json.loads(out)["items"]}
 
 
+def server_pods():
+    out = kubectl("get", "pods", "-l", "app=shiitake", "-o", "json").stdout
+    return {p["metadata"]["uid"]: p for p in json.loads(out)["items"]}
+
+
+def wait_for_server_replacement(previous_uids, deadline=180.0):
+    """Wait for a ready *new* server, then pin a fresh port-forward to it."""
+    end = time.monotonic() + deadline
+    while time.monotonic() < end:
+        for uid, pod in server_pods().items():
+            ready = any(
+                condition["type"] == "Ready" and condition["status"] == "True"
+                for condition in pod.get("status", {}).get("conditions", [])
+            )
+            if uid not in previous_uids and ready and not pod["metadata"].get("deletionTimestamp"):
+                PF.stop()
+                return
+        time.sleep(2.0)
+    raise AssertionError("replacement server pod never became ready")
+
+
+def wait_for_worker_replacements(previous_names, deadline=180.0):
+    """Avoid dispatching to workers that are still pending forced deletion."""
+    end = time.monotonic() + deadline
+    while time.monotonic() < end:
+        pods = worker_pods()
+        if len(pods) >= POOL_SIZE and previous_names.isdisjoint(pods):
+            return
+        time.sleep(2.0)
+    raise AssertionError("replacement worker pods did not appear")
+
+
 def restart_count(pod, container="worker"):
     """How many times `container` has been restarted in `pod`. A worker that
     recycles (exits 0 for a fresh container) increments this in place, which is
@@ -247,7 +279,9 @@ class PodFailures(unittest.TestCase):
         wait_for_pool()  # the Deployment replaces it, unattended
 
     def test_20_server_pod_deleted_while_idle(self):
+        previous_uids = set(server_pods())
         delete_pods("app=shiitake")
+        wait_for_server_replacement(previous_uids)
 
         # Workers reconnect to the replacement through the dispatch Service —
         # which is exactly why that Service publishes not-ready addresses: the
@@ -263,7 +297,9 @@ class PodFailures(unittest.TestCase):
         before = restart_count(victim)
         self.assertIsNotNone(before, f"no container status for {victim}")
 
+        previous_uids = set(server_pods())
         delete_pods("app=shiitake")
+        wait_for_server_replacement(previous_uids)
 
         # The handle dies with the server: the registry is in memory, so the
         # replacement has never heard of it. 404 is the correct answer, not a
@@ -296,10 +332,14 @@ class PodFailures(unittest.TestCase):
 
     def test_40_both_deleted_together(self):
         running_handle()
+        previous_uids = set(server_pods())
+        previous_workers = set(worker_pods())
         delete_pods("app=shiitake")
         delete_pods("app=shiitake-worker")
 
         # Neither side coordinates the other; both just come back.
+        wait_for_server_replacement(previous_uids)
+        wait_for_worker_replacements(previous_workers)
         wait_for_pool()
         snap = wait_for_terminal(spawn("echo recovered"))
         self.assertEqual(snap["status"], "completed", msg=snap)
@@ -310,7 +350,9 @@ class PodFailures(unittest.TestCase):
         wait_for_pool()
         before = {pod: restart_count(pod) for pod in worker_pods()}
 
+        previous_uids = set(server_pods())
         delete_pods("app=shiitake")
+        wait_for_server_replacement(previous_uids)
         wait_for_pool()
 
         # Give any recycle that was going to happen time to show up.
