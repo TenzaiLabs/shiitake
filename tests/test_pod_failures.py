@@ -47,6 +47,7 @@ POOL_SIZE = int(os.environ.get("SHIITAKE_E2E_WORKERS", "8"))
 PORT = int(os.environ.get("SHIITAKE_E2E_FAILOVER_PORT", "18090"))
 
 PATH_ENV = {"PATH": "/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"}
+_SESSIONS = {}
 
 
 def kubectl(*args, check=True):
@@ -61,6 +62,38 @@ def kubectl(*args, check=True):
 def worker_pods():
     out = kubectl("get", "pods", "-l", "app=shiitake-worker", "-o", "json").stdout
     return {p["metadata"]["name"]: p for p in json.loads(out)["items"]}
+
+
+def server_pods():
+    out = kubectl("get", "pods", "-l", "app=shiitake", "-o", "json").stdout
+    return {p["metadata"]["uid"]: p for p in json.loads(out)["items"]}
+
+
+def wait_for_server_replacement(previous_uids, deadline=180.0):
+    """Wait for a ready *new* server, then pin a fresh port-forward to it."""
+    end = time.monotonic() + deadline
+    while time.monotonic() < end:
+        for uid, pod in server_pods().items():
+            ready = any(
+                condition["type"] == "Ready" and condition["status"] == "True"
+                for condition in pod.get("status", {}).get("conditions", [])
+            )
+            if uid not in previous_uids and ready and not pod["metadata"].get("deletionTimestamp"):
+                PF.stop()
+                return
+        time.sleep(2.0)
+    raise AssertionError("replacement server pod never became ready")
+
+
+def wait_for_worker_replacements(previous_names, deadline=180.0):
+    """Avoid dispatching to workers that are still pending forced deletion."""
+    end = time.monotonic() + deadline
+    while time.monotonic() < end:
+        pods = worker_pods()
+        if len(pods) >= POOL_SIZE and previous_names.isdisjoint(pods):
+            return
+        time.sleep(2.0)
+    raise AssertionError("replacement worker pods did not appear")
 
 
 def restart_count(pod, container="worker"):
@@ -153,14 +186,20 @@ def api(path, method="GET", body=None, token=TOKEN, timeout=10, raw=False):
         return None, str(exc)
 
 
-def spawn(command, timeout=300.0, deadline=120.0):
-    """POST /exec, waiting out a server that is still coming back."""
+def spawn(command, deadline=120.0):
+    """Create a session and command, waiting out a recovering server."""
     end = time.monotonic() + deadline
-    body = {"command": command, "timeout": timeout, "env": PATH_ENV}
     while time.monotonic() < end:
-        status, payload = api("/exec", method="POST", body=body)
-        if status == 202:
-            return payload["handle"]
+        status, payload = api("/sessions", method="POST", body={"env": PATH_ENV})
+        if status == 201:
+            sid = payload["session_id"]
+            status, payload = api(f"/sessions/{sid}/commands", method="POST", body={
+                "command": command, "mode": "parallel",
+            })
+            if status == 202:
+                _SESSIONS[payload["handle"]] = sid
+                return payload["handle"]
+            api(f"/sessions/{sid}", method="DELETE")
         time.sleep(2.0)
     raise AssertionError(f"could not spawn {command!r} within {deadline}s")
 
@@ -185,10 +224,11 @@ def wait_for_terminal(handle, deadline=180.0):
     outcome here, not a failure."""
     end = time.monotonic() + deadline
     while time.monotonic() < end:
-        status, snap = api(f"/exec/{handle}")
+        status, snap = api(f"/sessions/{_SESSIONS[handle]}/commands/{handle}")
         if status == 404:
             return None
         if status == 200 and snap["status"] != "running":
+            api(f"/sessions/{_SESSIONS[handle]}", method="DELETE")
             return snap
         time.sleep(1.0)
     raise AssertionError(f"handle {handle} still running after {deadline}s")
@@ -197,10 +237,10 @@ def wait_for_terminal(handle, deadline=180.0):
 def running_handle(command="sleep 120"):
     """Spawn `command` and return `(handle, worker_pod)` once it is really
     running on a worker — so a delete lands mid-command, not in the gap."""
-    handle = spawn(command, timeout=600.0)
+    handle = spawn(command)
     end = time.monotonic() + 60.0
     while time.monotonic() < end:
-        status, snap = api(f"/exec/{handle}")
+        status, snap = api(f"/sessions/{_SESSIONS[handle]}/commands/{handle}")
         if status == 200 and snap["status"] == "running" and snap.get("worker_id"):
             return handle, snap["worker_id"]
         time.sleep(0.5)
@@ -239,7 +279,9 @@ class PodFailures(unittest.TestCase):
         wait_for_pool()  # the Deployment replaces it, unattended
 
     def test_20_server_pod_deleted_while_idle(self):
+        previous_uids = set(server_pods())
         delete_pods("app=shiitake")
+        wait_for_server_replacement(previous_uids)
 
         # Workers reconnect to the replacement through the dispatch Service —
         # which is exactly why that Service publishes not-ready addresses: the
@@ -255,7 +297,9 @@ class PodFailures(unittest.TestCase):
         before = restart_count(victim)
         self.assertIsNotNone(before, f"no container status for {victim}")
 
+        previous_uids = set(server_pods())
         delete_pods("app=shiitake")
+        wait_for_server_replacement(previous_uids)
 
         # The handle dies with the server: the registry is in memory, so the
         # replacement has never heard of it. 404 is the correct answer, not a
@@ -288,10 +332,14 @@ class PodFailures(unittest.TestCase):
 
     def test_40_both_deleted_together(self):
         running_handle()
+        previous_uids = set(server_pods())
+        previous_workers = set(worker_pods())
         delete_pods("app=shiitake")
         delete_pods("app=shiitake-worker")
 
         # Neither side coordinates the other; both just come back.
+        wait_for_server_replacement(previous_uids)
+        wait_for_worker_replacements(previous_workers)
         wait_for_pool()
         snap = wait_for_terminal(spawn("echo recovered"))
         self.assertEqual(snap["status"], "completed", msg=snap)
@@ -302,7 +350,9 @@ class PodFailures(unittest.TestCase):
         wait_for_pool()
         before = {pod: restart_count(pod) for pod in worker_pods()}
 
+        previous_uids = set(server_pods())
         delete_pods("app=shiitake")
+        wait_for_server_replacement(previous_uids)
         wait_for_pool()
 
         # Give any recycle that was going to happen time to show up.
@@ -317,7 +367,7 @@ class PodFailures(unittest.TestCase):
                 )
 
     def test_60_pty_worker_death_closes_the_client_with_a_reason(self):
-        """The /pty analogue of test_10: a session whose worker dies mid-stream
+        """A terminal whose worker dies mid-stream
         must close the client 1011 with a reason, not leave it waiting on output
         that will never come. Uses the shiitake-py WebSocket client (this suite
         runs under uv for it); imported lazily so the rest still runs on python3."""
@@ -329,9 +379,9 @@ class PodFailures(unittest.TestCase):
 
         async def drive():
             async with AsyncShiitakeClient(f"http://127.0.0.1:{PORT}", auth_token=TOKEN) as c:
-                session = await c.attach_pty(
-                    working_dir="/tmp", command=["bash", "-c", "echo READY; sleep 60"]
-                )
+                reserved = await c.create_session(workdir="/tmp", env=PATH_ENV)
+                session = await reserved.attach_terminal()
+                await session.send(b"echo READY; sleep 60\n")
                 buf = bytearray()
 
                 async def until(needle):
@@ -354,7 +404,7 @@ class PodFailures(unittest.TestCase):
 
         code, reason = asyncio.run(drive())
         self.assertEqual(code, 1011, f"abnormal worker loss closes 1011; got {code} / {reason!r}")
-        self.assertIn("worker disconnected", reason, f"reason should name the cause; got {reason!r}")
+        self.assertEqual(reason, "session ended unexpectedly")
         wait_for_pool()  # the Deployment replaces the workers, unattended
 
 

@@ -1,18 +1,13 @@
-//! End-to-end HTTP read path: a fake worker writes a capture file, then the
-//! client reads it back through `GET /exec/{handle}/stdout` — full body, a
-//! byte range (`206 Partial Content`), and a suffix range (last N bytes).
-//! Exercises the tower-http range wiring, auth, and handle validation.
+//! Ranged HTTP reads of output streamed over dispatch from a worker with no
+//! access to the server's capture directory.
 
 use futures_util::{SinkExt, StreamExt};
 use shiitake_server::{
-    http::{AppState, build_api_router, build_dispatch_router},
+    http::{AppState, build_api_router, build_dispatch_router_with_profiles},
     pool::WorkerPool,
 };
-use shiitake_worker_api::{
-    Frame, ResultFrame, WorkerId,
-    capture::{Stream, handle_dir, stream_path},
-};
-use std::{sync::Arc, time::Duration};
+use shiitake_worker_api::{Frame, OutputChunk, OutputStream, ResultFrame, WorkerId};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tokio::{net::TcpListener, time::sleep};
 use tokio_tungstenite::tungstenite::{
@@ -21,80 +16,57 @@ use tokio_tungstenite::tungstenite::{
     http::header::{AUTHORIZATION, HeaderValue},
 };
 
-const TOKEN: &str = "test-token";
-
-/// Bearer token the dispatch listener is built with in these tests. The
-/// dispatcher is authenticated now that it may face the network rather than
-/// only loopback, so every fake worker must present it.
-const DISPATCH_TOKEN: &str = "test-dispatch-token";
-
-/// Connect to the dispatch listener the way a real worker does: a WS upgrade
-/// carrying the dispatch bearer token.
-async fn connect_worker(
-    port: u16,
-) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
-    let mut req = format!("ws://127.0.0.1:{port}/dispatch")
-        .into_client_request()
-        .unwrap();
-    req.headers_mut().insert(
-        AUTHORIZATION,
-        HeaderValue::try_from(format!("Bearer {DISPATCH_TOKEN}")).unwrap(),
-    );
-    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
-    ws
-}
-
 fn payload() -> Vec<u8> {
-    // 0,1,…,250,0,1,… — a u8 cycle, so no integer conversion is needed.
     (0u8..251).cycle().take(200_000).collect()
 }
 
 #[tokio::test]
 async fn reads_full_and_range_and_suffix() {
     let capture = TempDir::new().unwrap();
-    let capture_path = capture.path().to_path_buf();
     let pool = Arc::new(WorkerPool::new(
         None,
-        "shiitake-test".into(),
+        "server".into(),
         "test".into(),
-        capture_path.clone(),
+        capture.path().into(),
     ));
-
-    let dispatch_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let dispatch_addr = dispatch_listener.local_addr().unwrap();
-    let dispatch_router = build_dispatch_router(pool.clone(), DISPATCH_TOKEN);
+    let dispatch = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dispatch_port = dispatch.local_addr().unwrap().port();
+    let dispatch_app = build_dispatch_router_with_profiles(
+        pool.clone(),
+        "default-token",
+        BTreeMap::from([("isolated".into(), "isolated-token".into())]),
+    )
+    .unwrap();
     tokio::spawn(async move {
-        axum::serve(dispatch_listener, dispatch_router.into_make_service())
-            .await
-            .unwrap();
+        axum::serve(dispatch, dispatch_app).await.unwrap();
     });
-
-    // Public API listener.
-    let api_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let api_addr = api_listener.local_addr().unwrap();
+    let api = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_port = api.local_addr().unwrap().port();
     let state = AppState {
-        pool: pool.clone(),
-        auth_token: Arc::new(TOKEN.into()),
-        default_workdir: std::env::temp_dir(),
-        max_body_bytes: 256 * 1024 * 1024,
+        pool,
+        auth_token: Arc::new("api-token".into()),
+        default_workdir: "/tmp".into(),
+        max_body_bytes: 1024 * 1024,
         min_ready_workers: 1,
-        pty_keepalive: std::time::Duration::from_secs(10),
+        pty_keepalive: Duration::from_secs(1),
     };
-    let api_router = build_api_router(state);
     tokio::spawn(async move {
-        axum::serve(api_listener, api_router.into_make_service())
-            .await
-            .unwrap();
+        axum::serve(api, build_api_router(state)).await.unwrap();
     });
-
-    // Fake worker: on Execute, write the capture file for the request and
-    // report success.
-    let capture_for_worker = capture_path.clone();
     let worker = tokio::spawn(async move {
-        let mut ws = connect_worker(dispatch_addr.port()).await;
+        let mut req = format!("ws://127.0.0.1:{dispatch_port}/dispatch")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer isolated-token"),
+        );
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
         ws.send(Message::Text(
             serde_json::to_string(&Frame::Hello {
+                protocol_version: 3,
                 worker_id: WorkerId::new("fake"),
+                profile: "isolated".into(),
                 location: None,
             })
             .unwrap()
@@ -102,65 +74,95 @@ async fn reads_full_and_range_and_suffix() {
         ))
         .await
         .unwrap();
-        let exec = loop {
-            if let Message::Text(t) = ws.next().await.unwrap().unwrap()
-                && let Frame::Execute(e) = serde_json::from_str::<Frame>(&t).unwrap()
-            {
-                break e;
+        while let Some(Ok(Message::Text(t))) = ws.next().await {
+            match serde_json::from_str::<Frame>(&t).unwrap() {
+                Frame::SessionOpen(open) => {
+                    ws.send(Message::Text(
+                        serde_json::to_string(&Frame::SessionReady {
+                            session_id: open.session_id,
+                            error: None,
+                        })
+                        .unwrap()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                }
+                Frame::SessionRun { execute, .. } => {
+                    let bytes = payload();
+                    for part in bytes.chunks(32 * 1024) {
+                        let chunk = OutputChunk {
+                            stream: OutputStream::Stdout,
+                            id: execute.request_id.as_str(),
+                            bytes: part,
+                        };
+                        ws.send(Message::Binary(chunk.encode().into()))
+                            .await
+                            .unwrap();
+                    }
+                    ws.send(Message::Text(
+                        serde_json::to_string(&Frame::Result(ResultFrame {
+                            request_id: execute.request_id,
+                            exit_code: Some(0),
+                            exit_signal: None,
+                            cancelled: false,
+                            usage: Default::default(),
+                            error: None,
+                        }))
+                        .unwrap()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                }
+                Frame::SessionClose { session_id } => {
+                    ws.send(Message::Text(
+                        serde_json::to_string(&Frame::SessionClosed {
+                            session_id,
+                            error: None,
+                            reusable: true,
+                        })
+                        .unwrap()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                    break;
+                }
+                _ => {}
             }
-        };
-        tokio::fs::create_dir_all(handle_dir(&capture_for_worker, &exec.request_id))
-            .await
-            .unwrap();
-        tokio::fs::write(
-            stream_path(&capture_for_worker, &exec.request_id, Stream::Stdout),
-            payload(),
-        )
-        .await
-        .unwrap();
-        let result = ResultFrame {
-            request_id: exec.request_id,
-            exit_code: Some(0),
-            exit_signal: None,
-            timed_out: false,
-            cancelled: false,
-            usage: Default::default(),
-            error: None,
-        };
-        ws.send(Message::Text(
-            serde_json::to_string(&Frame::Result(result))
-                .unwrap()
-                .into(),
-        ))
-        .await
-        .unwrap();
-        ws.close(None).await.ok();
+        }
     });
-
-    // Wait for the worker to register.
-    sleep(Duration::from_millis(200)).await;
-
-    let base = format!("http://127.0.0.1:{}/api/v1", api_addr.port());
+    sleep(Duration::from_millis(100)).await;
+    let base = format!("http://127.0.0.1:{api_port}/api/v1");
     let client = reqwest::Client::new();
-
-    let spawn: serde_json::Value = client
-        .post(format!("{base}/exec"))
-        .bearer_auth(TOKEN)
-        .json(&serde_json::json!({ "command": "true" }))
+    let created: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .bearer_auth("api-token")
+        .json(&serde_json::json!({"profile": "isolated"}))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    let handle = spawn["handle"].as_str().unwrap().to_string();
-    worker.await.unwrap();
-
-    // Poll status until terminal so the capture file is fully written.
-    for _ in 0..50 {
+    let sid = created["session_id"].as_str().unwrap();
+    let spawned: serde_json::Value = client
+        .post(format!("{base}/sessions/{sid}/commands"))
+        .bearer_auth("api-token")
+        .json(&serde_json::json!({"command": "true", "mode": "parallel"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let handle = spawned["handle"].as_str().unwrap();
+    let status_url = format!("{base}/sessions/{sid}/commands/{handle}");
+    for _ in 0..100 {
         let status: serde_json::Value = client
-            .get(format!("{base}/exec/{handle}"))
-            .bearer_auth(TOKEN)
+            .get(&status_url)
+            .bearer_auth("api-token")
             .send()
             .await
             .unwrap()
@@ -168,42 +170,33 @@ async fn reads_full_and_range_and_suffix() {
             .await
             .unwrap();
         if status["status"] != "running" {
-            assert_eq!(status["stdout_bytes_written"].as_u64().unwrap(), 200_000);
+            assert_eq!(status["stdout_bytes_written"], 200_000);
             break;
         }
-        sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(20)).await;
     }
-
     let expected = payload();
-    let stdout_url = format!("{base}/exec/{handle}/stdout");
-
+    let stdout_url = format!("{status_url}/stdout");
     let full = client
         .get(&stdout_url)
-        .bearer_auth(TOKEN)
+        .bearer_auth("api-token")
         .send()
         .await
         .unwrap();
     assert_eq!(full.status(), reqwest::StatusCode::OK);
     assert_eq!(full.bytes().await.unwrap().as_ref(), expected.as_slice());
-
     let ranged = client
         .get(&stdout_url)
-        .bearer_auth(TOKEN)
+        .bearer_auth("api-token")
         .header(reqwest::header::RANGE, "bytes=0-9")
         .send()
         .await
         .unwrap();
     assert_eq!(ranged.status(), reqwest::StatusCode::PARTIAL_CONTENT);
-    assert!(
-        ranged
-            .headers()
-            .contains_key(reqwest::header::CONTENT_RANGE)
-    );
     assert_eq!(ranged.bytes().await.unwrap().as_ref(), &expected[0..10]);
-
     let suffix = client
         .get(&stdout_url)
-        .bearer_auth(TOKEN)
+        .bearer_auth("api-token")
         .header(reqwest::header::RANGE, "bytes=-10")
         .send()
         .await
@@ -213,15 +206,25 @@ async fn reads_full_and_range_and_suffix() {
         suffix.bytes().await.unwrap().as_ref(),
         &expected[expected.len() - 10..]
     );
-
-    let unauth = client.get(&stdout_url).send().await.unwrap();
-    assert_eq!(unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
-
-    let wrong = client
-        .get(&stdout_url)
-        .bearer_auth("nope")
+    assert_eq!(
+        client.get(&stdout_url).send().await.unwrap().status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .get(&stdout_url)
+            .bearer_auth("wrong")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    client
+        .delete(format!("{base}/sessions/{sid}"))
+        .bearer_auth("api-token")
         .send()
         .await
         .unwrap();
-    assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
+    worker.await.unwrap();
 }

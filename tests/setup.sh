@@ -42,12 +42,11 @@ log "Importing images into k3d"
 k3d image import "$SERVER_IMAGE" "$WORKER_IMAGE" -c "$CLUSTER"
 
 # On a re-run the same `:e2e` tag won't roll on its own, so trigger a restart to
-# pick up the freshly-imported images (no-op on a first install). Both
-# deployments, since in the two-pod topology the workers are their own. `helm
+# pick up the freshly-imported images (no-op on a first install). Restart the
+# server and every worker-profile Deployment in the two-pod topology. `helm
 # --wait` then blocks until they're ready; `--debug` streams what it's waiting on.
-for d in "$RELEASE" "$WORKER_DEPLOY"; do
-  kubectl --context "$CONTEXT" -n "$NAMESPACE" rollout restart "deploy/$d" 2>/dev/null || true
-done
+kubectl --context "$CONTEXT" -n "$NAMESPACE" rollout restart "deploy/$RELEASE" 2>/dev/null || true
+kubectl --context "$CONTEXT" -n "$NAMESPACE" rollout restart deployment -l app=shiitake-worker 2>/dev/null || true
 
 log "Deploying release '${RELEASE}' (${TOPOLOGY}) into namespace '${NAMESPACE}'"
 if ! helm --kube-context "$CONTEXT" upgrade --install "$RELEASE" "$ROOT/tests/chart" \

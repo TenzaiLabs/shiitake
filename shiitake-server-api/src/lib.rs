@@ -4,46 +4,100 @@
 //! is both `Serialize` and `Deserialize`. Pure types, no transport.
 
 use serde::{Deserialize, Serialize};
-// `DropTo` is part of the `/exec` request body (and the on-the-wire frame), so
-// re-export it for callers building requests against this API. `WorkerId`
-// likewise appears on `StatusResponse`.
-pub use shiitake_worker_api::{DropTo, ExecId, WorkerId};
+// `DropTo` is part of session creation and the worker wire frame. `WorkerId`
+// appears on status and session responses.
+pub use shiitake_worker_api::{DropTo, ExecId, SessionCommandMode, SessionId, WorkerId};
 use std::collections::BTreeMap;
 use strum::IntoStaticStr;
 
-fn default_timeout() -> f64 {
-    300.0
-}
-
-/// `POST /api/v1/exec` request body. The command is run as `bash -c <command>`.
+/// Legacy internal request type for the removed `/exec` route.
+#[doc(hidden)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecRequest {
     pub command: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
-    #[serde(default = "default_timeout")]
-    pub timeout: f64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drop_to: Option<DropTo>,
 }
 
-/// `202` response to `POST /api/v1/exec` — a handle to a freshly-spawned
-/// command. No output or exit code yet; the command is running.
+/// Allocate a worker from a profile and start its persistent shell. The
+/// identity, environment and initial directory are fixed for the session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSessionRequest {
+    #[serde(default = "shiitake_worker_api::default_profile")]
+    pub profile: String,
+    #[serde(default)]
+    pub workdir: Option<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub drop_to: Option<DropTo>,
+    #[serde(default = "default_cols")]
+    pub cols: u16,
+    #[serde(default = "default_rows")]
+    pub rows: u16,
+}
+
+fn default_cols() -> u16 {
+    80
+}
+fn default_rows() -> u16 {
+    24
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionResponse {
+    pub session_id: SessionId,
+    pub worker_id: WorkerId,
+    pub profile: String,
+    pub state: SessionState,
+    pub created_at: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    Opening,
+    Active,
+    Closing,
+    Closed,
+    Failed,
+}
+
+/// Submit one job to a session. Jobs inherit its identity and initial
+/// environment/directory; several jobs may run simultaneously.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCommandRequest {
+    pub command: String,
+    #[serde(default)]
+    pub mode: SessionCommandMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileResponse {
+    pub name: String,
+    pub idle: usize,
+    pub allocated: usize,
+}
+
+/// `202` response to `POST /api/v1/sessions/{id}/commands`. The command is
+/// running; poll its handle for completion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnResponse {
     pub handle: ExecId,
     pub started_at: f64,
 }
 
-/// The status of a handle, as reported by `GET /api/v1/exec/{handle}`.
+/// The status of a session command handle.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HandleStatus {
     Running,
     Completed,
-    Timeout,
     Oomkilled,
     Error,
 }
@@ -58,16 +112,20 @@ pub enum ExitCause {
     Normal,
     Signal,
     OomContainer,
-    Timeout,
     WorkerDied,
+    WorkerError,
+    OutputError,
     Cancelled,
 }
 
-/// `GET /api/v1/exec/{handle}` response. Output is read separately, by byte
-/// range, from `/api/v1/exec/{handle}/{stdout,stderr}`.
+/// Command status response, also returned in the array from
+/// `GET /api/v1/sessions/{id}/commands`. Output is read separately by byte
+/// range from `/api/v1/sessions/{id}/commands/{handle}/{stdout,stderr}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub handle: ExecId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
     pub worker_id: WorkerId,
     pub status: HandleStatus,
     pub started_at: f64,
@@ -80,8 +138,6 @@ pub struct StatusResponse {
     #[serde(default)]
     pub exit_signal: Option<i32>,
     #[serde(default)]
-    pub timed_out: bool,
-    #[serde(default)]
     pub cancelled: bool,
     #[serde(default)]
     pub stdout_bytes_written: u64,
@@ -89,8 +145,7 @@ pub struct StatusResponse {
     pub stderr_bytes_written: u64,
 }
 
-/// `DELETE /api/v1/exec/{handle}` response — the terminal snapshot after the
-/// process group was killed.
+/// `DELETE /api/v1/sessions/{id}/commands/{handle}` response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandleSnapshotJson {
     pub handle: ExecId,
@@ -114,6 +169,8 @@ pub struct HealthResponse {
     /// Lets operators — and an idle reaper — see capacity a terminal is holding.
     #[serde(default)]
     pub workers_interactive: usize,
+    #[serde(default)]
+    pub workers_sessions: usize,
 }
 
 /// `GET /api/v1/ready` response — readiness, as distinct from liveness. The
@@ -131,6 +188,8 @@ pub struct ReadyResponse {
     pub workers_idle: usize,
     #[serde(default)]
     pub workers_inflight: usize,
+    #[serde(default)]
+    pub workers_sessions: usize,
     /// Registered workers the pool must have to report ready
     /// (`SHIITAKE_MIN_READY_WORKERS`).
     #[serde(default)]

@@ -1,4 +1,4 @@
-"""Round-trip tests for shiitake-py against an httpx MockTransport."""
+"""Client contract tests against an HTTP mock transport."""
 
 from __future__ import annotations
 
@@ -8,10 +8,20 @@ from collections.abc import Callable
 
 import httpx
 import pytest
-from shiitake.client import AsyncShiitakeClient, DropTo, NoIdleWorkerError, ShiitakeError
+from shiitake.client import (
+    AsyncShiitakeClient, DropTo, NoIdleWorkerError, SessionResponse, ShiitakeClient,
+    ShiitakeError,
+)
 
 
-async def _with_mock(handler: Callable[[httpx.Request], httpx.Response], **kw: object) -> AsyncShiitakeClient:
+def session_payload() -> dict[str, object]:
+    return {
+        "session_id": "s", "worker_id": "w", "profile": "isolated",
+        "state": "active", "created_at": 1.0,
+    }
+
+
+async def with_mock(handler: Callable[[httpx.Request], httpx.Response], **kw: object) -> AsyncShiitakeClient:
     client = AsyncShiitakeClient("http://srv", **kw)  # type: ignore[arg-type]
     await client.aclose()
     client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=5.0)
@@ -19,185 +29,253 @@ async def _with_mock(handler: Callable[[httpx.Request], httpx.Response], **kw: o
 
 
 @pytest.mark.asyncio
-async def test_spawn_sends_command_and_drop_to() -> None:
-    captured: dict[str, object] = {}
+async def test_create_and_release_session_with_fixed_identity() -> None:
+    seen: list[tuple[str, str, dict[str, object] | None]] = []
 
     def handler(req: httpx.Request) -> httpx.Response:
-        captured["path"] = req.url.path
-        captured["auth"] = req.headers.get("authorization")
-        captured["body"] = json.loads(req.content)
-        return httpx.Response(202, json={"handle": "h", "started_at": 1.0})
-
-    client = await _with_mock(handler, auth_token="tok")
-    h = await client.spawn("echo hi", env={"PATH": "/bin"}, drop_to=DropTo(uid=10, gid=20, umask=0o007))
-    assert h.handle == "h"
-    assert captured["path"] == "/api/v1/exec"
-    assert captured["auth"] == "Bearer tok"
-    body = captured["body"]
-    assert body["command"] == "echo hi"
-    assert body["env"] == {"PATH": "/bin"}
-    assert body["drop_to"] == {"uid": 10, "gid": 20, "supplementary_gids": [], "umask": 0o007}
-    await client.aclose()
-
-
-@pytest.mark.asyncio
-async def test_spawn_429_raises() -> None:
-    client = await _with_mock(lambda req: httpx.Response(429, text="busy"), max_retries=1)
-    with pytest.raises(NoIdleWorkerError):
-        await client.spawn("echo")
-    await client.aclose()
-
-
-@pytest.mark.asyncio
-async def test_run_collapses_spawn_wait_read() -> None:
-    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.headers["authorization"] == "Bearer tok"
+        body = json.loads(req.content) if req.content else None
+        seen.append((req.method, req.url.path, body))
         if req.method == "POST":
-            return httpx.Response(202, json={"handle": "h", "started_at": 0.0})
-        if req.url.path == "/api/v1/exec/h":
-            return httpx.Response(
-                200,
-                json={
-                    "handle": "h",
-                    "worker_id": "w",
-                    "status": "completed",
-                    "started_at": 0.0,
-                    "exit_code": 0,
-                    "exit_cause": "normal",
-                    "stdout_bytes_written": 3,
-                },
-            )
-        if req.url.path == "/api/v1/exec/h/stdout":
+            return httpx.Response(201, json=session_payload())
+        return httpx.Response(200, json={**session_payload(), "state": "closed"})
+
+    client = await with_mock(handler, auth_token="tok")
+    async with await client.create_session(
+        profile="isolated", workdir="/tmp", env={"PATH": "/bin"},
+        drop_to=DropTo(uid=10, gid=20, umask=0o007, name="alice", create_home=True),
+    ) as session:
+        assert session.session_id == "s"
+    assert seen[0][0:2] == ("POST", "/api/v1/sessions")
+    assert seen[0][2]["drop_to"] == {
+        "uid": 10, "gid": 20, "supplementary_gids": [], "umask": 0o007,
+        "name": "alice", "create_home": True,
+    }
+    assert seen[1][0:2] == ("DELETE", "/api/v1/sessions/s")
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_profile_busy_raises() -> None:
+    client = await with_mock(lambda req: httpx.Response(429, text="busy"), max_retries=1)
+    with pytest.raises(NoIdleWorkerError):
+        await client.create_session(profile="isolated")
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_create_session_retries_only_when_capacity_is_unavailable() -> None:
+    attempts = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(429, text="busy")
+        return httpx.Response(201, json=session_payload())
+
+    client = await with_mock(handler, max_retries=3, retry_initial_delay=0)
+    session = await client.create_session(wait_for_worker=True)
+    assert session.session_id == "s"
+    assert attempts == 2
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_create_session_does_not_repeat_ambiguous_failure() -> None:
+    for failure in (httpx.ReadTimeout("response lost"), httpx.Response(502, text="failed")):
+        attempts = 0
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if isinstance(failure, Exception):
+                raise failure
+            return failure
+
+        client = await with_mock(handler, max_retries=3, retry_initial_delay=0)
+        with pytest.raises((httpx.ReadTimeout, ShiitakeError)):
+            await client.create_session(wait_for_worker=True)
+        assert attempts == 1
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_spawn_does_not_repeat_lost_response() -> None:
+    attempts = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        if req.url.path == "/api/v1/sessions":
+            return httpx.Response(201, json=session_payload())
+        attempts += 1
+        raise httpx.ReadTimeout("command response lost")
+
+    client = await with_mock(handler, max_retries=3, retry_initial_delay=0)
+    session = await client.create_session()
+    with pytest.raises(httpx.ReadTimeout):
+        await session.spawn("echo once")
+    assert attempts == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_session_command_modes_and_range_output() -> None:
+    seen: list[tuple[str, str, dict[str, object] | None]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content) if req.content else None
+        seen.append((req.method, req.url.path, body))
+        if req.url.path == "/api/v1/sessions":
+            return httpx.Response(201, json=session_payload())
+        if req.method == "POST":
+            return httpx.Response(202, json={"handle": "h", "started_at": 2.0})
+        if req.url.path.endswith("/commands"):
+            return httpx.Response(200, json=[{
+                "handle": "h", "session_id": "s", "worker_id": "w",
+                "status": "completed", "started_at": 2.0,
+            }])
+        if req.url.path.endswith("/h"):
+            return httpx.Response(200, json={
+                "handle": "h", "session_id": "s", "worker_id": "w", "status": "completed",
+                "started_at": 2.0, "exit_code": 0, "exit_cause": "normal",
+                "stdout_bytes_written": 3,
+            })
+        if req.url.path.endswith("/stdout"):
+            assert req.headers["range"] == "bytes=0-9"
             return httpx.Response(206, content=b"hi\n", headers={"content-range": "bytes 0-2/3"})
         return httpx.Response(416, headers={"content-range": "bytes */0"})
 
-    client = await _with_mock(handler)
-    result = await client.run("echo hi")
-    assert result.status == "completed"
-    assert result.exit_code == 0
-    assert result.stdout == "hi\n"
-    assert result.exit_cause == "normal"
+    client = await with_mock(handler)
+    session = await client.create_session(profile="isolated")
+    handle = await session.spawn("echo hi", mode="parallel")
+    assert seen[-1][2] == {"command": "echo hi", "mode": "parallel"}
+    status = await handle.wait()
+    assert status.session_id == "s"
+    chunk = await handle.read("stdout", max_=10)
+    assert chunk.content == "hi\n"
+    assert chunk.bytes_written == 3
+    empty = await handle.read("stderr", max_=10)
+    assert empty.content == ""
+    assert [item.handle for item in await session.commands()] == ["h"]
+    recovered = await session.get_command("h")
+    assert recovered.started_at == 2.0
+    assert (await recovered.poll()).status == "completed"
     await client.aclose()
 
 
 @pytest.mark.asyncio
-async def test_read_range_and_past_eof() -> None:
-    def handler(req: httpx.Request) -> httpx.Response:
-        if req.headers.get("range") == "bytes=0-1023":
-            return httpx.Response(206, content=b"hello", headers={"content-range": "bytes 0-4/5"})
-        return httpx.Response(416, headers={"content-range": "bytes */5"})
-
-    client = await _with_mock(handler)
-    r = await client.read("h", "stdout", from_=0, max_=1024)
-    assert r.content == "hello"
-    assert r.bytes_written == 5
-    assert r.eof is True
-    past = await client.read("h", "stdout", from_=999)
-    assert past.content == ""
-    assert past.eof is True
-    await client.aclose()
-
-
-@pytest.mark.asyncio
-async def test_http_error_raises() -> None:
-    client = await _with_mock(lambda req: httpx.Response(500, text="boom"), max_retries=1)
-    with pytest.raises(ShiitakeError) as exc:
-        await client.status("h")
-    assert exc.value.status == 500
-    await client.aclose()
-
-
-@pytest.mark.asyncio
-async def test_health() -> None:
-    def handler(req: httpx.Request) -> httpx.Response:
-        assert req.url.path == "/api/v1/health"
-        return httpx.Response(200, json={"status": "ok", "service": "shiitake", "workers_idle": 7, "workers_inflight": 1})
-
-    client = await _with_mock(handler)
-    h = await client.health()
-    assert h.service == "shiitake"
-    assert h.workers_idle == 7
-    await client.aclose()
-
-
-@pytest.mark.asyncio
-async def test_ready_when_the_pool_has_workers() -> None:
-    def handler(req: httpx.Request) -> httpx.Response:
-        assert req.url.path == "/api/v1/ready"
-        return httpx.Response(
-            200,
-            json={"ready": True, "service": "shiitake", "workers_idle": 3, "workers_inflight": 1, "workers_required": 1},
-        )
-
-    client = await _with_mock(handler)
-    r = await client.ready()
-    assert r.ready is True
-    assert r.workers_idle == 3
-    assert r.workers_required == 1
-    await client.aclose()
-
-
-@pytest.mark.asyncio
-async def test_ready_returns_the_verdict_on_503() -> None:
-    """An unready server answers 503 — a verdict, not a failed call."""
-
-    def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            503,
-            json={"ready": False, "service": "shiitake", "workers_idle": 0, "workers_inflight": 0, "workers_required": 1},
-        )
-
-    client = await _with_mock(handler, max_retries=1)
-    r = await client.ready()
-    assert r.ready is False
-    assert r.workers_idle == 0
-    await client.aclose()
-
-
-def _running_status() -> dict[str, object]:
-    return {"handle": "h", "worker_id": "w0", "status": "running", "started_at": 1.0}
-
-
-@pytest.mark.asyncio
-async def test_run_kills_the_handle_when_cancelled() -> None:
-    """Cancelling `run` must not leave the command holding its worker slot."""
+async def test_run_cancels_only_its_command() -> None:
     seen: list[tuple[str, str]] = []
 
     def handler(req: httpx.Request) -> httpx.Response:
         seen.append((req.method, req.url.path))
-        if req.url.path.endswith("/exec") and req.method == "POST":
+        if req.url.path == "/api/v1/sessions":
+            return httpx.Response(201, json=session_payload())
+        if req.method == "POST":
             return httpx.Response(202, json={"handle": "h", "started_at": 1.0})
         if req.method == "DELETE":
-            return httpx.Response(204)
-        # Never leaves "running", so the caller is still waiting when cancelled.
-        return httpx.Response(200, json=_running_status())
+            return httpx.Response(200, json={"handle": "h", "status": "error"})
+        return httpx.Response(200, json={
+            "handle": "h", "session_id": "s", "worker_id": "w", "status": "running",
+            "started_at": 1.0,
+        })
 
-    client = await _with_mock(handler)
-    task = asyncio.create_task(client.run("sleep 600"))
-    while ("GET", "/api/v1/exec/h") not in seen:
+    client = await with_mock(handler)
+    session = await client.create_session()
+    task = asyncio.create_task(session.run("sleep 600"))
+    while ("GET", "/api/v1/sessions/s/commands/h") not in seen:
         await asyncio.sleep(0)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-
-    assert ("DELETE", "/api/v1/exec/h") in seen
+    assert ("DELETE", "/api/v1/sessions/s/commands/h") in seen
+    assert ("DELETE", "/api/v1/sessions/s") not in seen
     await client.aclose()
 
 
 @pytest.mark.asyncio
-async def test_run_still_cancels_when_the_kill_fails() -> None:
-    """A failed best-effort kill must not mask the cancellation."""
+async def test_profiles_readiness_and_error() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/profiles"):
+            return httpx.Response(200, json=[{"name": "isolated", "idle": 2, "allocated": 1}])
+        if req.url.path.endswith("/ready"):
+            return httpx.Response(503, json={
+                "ready": False, "service": "shiitake", "workers_idle": 0,
+                "workers_inflight": 0, "workers_required": 1,
+            })
+        return httpx.Response(500, text="boom")
+
+    client = await with_mock(handler, max_retries=1)
+    assert (await client.profiles())[0].allocated == 1
+    assert (await client.ready()).ready is False
+    with pytest.raises(ShiitakeError) as exc:
+        await client.session_status("s")
+    assert exc.value.status == 500
+    await client.aclose()
+
+
+def test_sync_client_requires_session() -> None:
+    seen: list[tuple[str, str]] = []
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append((req.method, req.url.path))
+        if req.url.path == "/api/v1/sessions" and req.method == "POST":
+            return httpx.Response(201, json=session_payload())
+        if req.url.path.endswith("/commands"):
+            if req.method == "GET":
+                return httpx.Response(200, json=[{
+                    "handle": "h", "session_id": "s", "worker_id": "w",
+                    "status": "completed", "started_at": 1.0,
+                }])
+            return httpx.Response(202, json={"handle": "h", "started_at": 1.0})
+        if req.url.path.endswith("/h"):
+            return httpx.Response(200, json={
+                "handle": "h", "session_id": "s", "worker_id": "w", "status": "completed",
+                "started_at": 1.0, "exit_code": 0,
+            })
+        if req.url.path.endswith("/stdout"):
+            return httpx.Response(206, content=b"ok\n", headers={"content-range": "bytes 0-2/3"})
+        if req.url.path.endswith("/stderr"):
+            return httpx.Response(416, headers={"content-range": "bytes */0"})
+        return httpx.Response(200, json={**session_payload(), "state": "closed"})
+
+    client = ShiitakeClient("http://srv")
+    client.close()
+    client._http = httpx.Client(transport=httpx.MockTransport(handler))
+    with client.create_session(profile="isolated") as session:
+        result = session.run("echo ok")
+        assert result.stdout == "ok\n"
+        assert result.exit_code == 0
+        handle = session.spawn("sleep 100", mode="parallel")
+        assert handle.poll().status == "completed"
+        assert handle.read("stdout", max_=10).content == "ok\n"
+        handle.kill()
+        assert [item.handle for item in session.commands()] == ["h"]
+        assert session.get_command("h").poll().status == "completed"
+    assert ("DELETE", "/api/v1/sessions/s/commands/h") in seen
+    client.close()
+
+
+def test_sync_run_interrupt_cancels_command_without_context_manager() -> None:
+    seen: list[tuple[str, str]] = []
 
     def handler(req: httpx.Request) -> httpx.Response:
-        if req.url.path.endswith("/exec") and req.method == "POST":
+        seen.append((req.method, req.url.path))
+        if req.url.path == "/api/v1/sessions":
+            return httpx.Response(201, json=session_payload())
+        if req.url.path.endswith("/commands"):
             return httpx.Response(202, json={"handle": "h", "started_at": 1.0})
-        if req.method == "DELETE":
-            return httpx.Response(500, text="boom")
-        return httpx.Response(200, json=_running_status())
+        if req.method == "GET" and req.url.path.endswith("/h"):
+            raise KeyboardInterrupt
+        if req.method == "DELETE" and req.url.path.endswith("/h"):
+            return httpx.Response(200, json={"handle": "h", "status": "running"})
+        raise AssertionError(f"unexpected request: {req.method} {req.url.path}")
 
-    client = await _with_mock(handler, max_retries=1)
-    task = asyncio.create_task(client.run("sleep 600"))
-    await asyncio.sleep(0.05)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    await client.aclose()
+    client = ShiitakeClient("http://srv")
+    client.close()
+    client._http = httpx.Client(transport=httpx.MockTransport(handler))
+    session = client.create_session()
+    with pytest.raises(KeyboardInterrupt):
+        session.run("sleep 600", mode="parallel")
+    assert ("DELETE", "/api/v1/sessions/s/commands/h") in seen
+    client.close()

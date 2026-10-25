@@ -62,7 +62,7 @@ impl Default for Metrics {
                 .build(),
             capture_volume_free_bytes: m
                 .u64_gauge("shiitake_capture_volume_free_bytes")
-                .with_description("free space on the capture volume")
+                .with_description("free space in the server output spool")
                 .build(),
             pool_workers: m
                 .u64_gauge("shiitake_pool_workers")
@@ -124,7 +124,7 @@ impl Metrics {
         self.pool_rejected.add(1, &[]);
     }
 
-    /// Record free space on the capture volume.
+    /// Record free space in the server output spool.
     pub fn record_capture_free_bytes(&self, bytes: u64) {
         self.capture_volume_free_bytes.record(bytes, &[]);
     }

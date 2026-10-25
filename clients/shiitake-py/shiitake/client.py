@@ -1,10 +1,4 @@
-"""Async + sync HTTP clients for the shiitake API (``/api/v1``).
-
-A fire-and-forget ``POST /exec`` returns a handle; poll ``GET /exec/{handle}``
-and read output by HTTP ``Range`` from ``/exec/{handle}/{stdout,stderr}``. This
-client is policy-free: the caller supplies ``env`` and an optional ``drop_to``
-directly. Embedding layers add their own auth/identity/env policy on top.
-"""
+"""Async and sync clients for explicit shiitake sessions and their commands."""
 
 from __future__ import annotations
 
@@ -13,6 +7,7 @@ import contextlib
 import dataclasses
 import json
 import random
+import time
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -20,6 +15,7 @@ from typing import Any, Literal
 import httpx
 
 StreamName = Literal["stdout", "stderr"]
+CommandMode = Literal["stateful", "parallel"]
 
 _RETRYABLE_EXC: tuple[type[Exception], ...] = (
     httpx.RemoteProtocolError,
@@ -28,7 +24,6 @@ _RETRYABLE_EXC: tuple[type[Exception], ...] = (
     httpx.WriteError,
     httpx.ReadTimeout,
 )
-_RETRYABLE_STATUS: tuple[int, ...] = (429, 502, 503, 504)
 _API_PREFIX = "/api/v1"
 
 
@@ -58,6 +53,8 @@ class DropTo:
     gid: int
     supplementary_gids: list[int] = field(default_factory=list)
     umask: int | None = None
+    name: str | None = None
+    create_home: bool = False
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -67,7 +64,27 @@ class DropTo:
         }
         if self.umask is not None:
             out["umask"] = self.umask
+        if self.name is not None:
+            out["name"] = self.name
+        if self.create_home:
+            out["create_home"] = True
         return out
+
+
+@dataclass
+class ProfileResponse:
+    name: str
+    idle: int
+    allocated: int
+
+
+@dataclass
+class SessionResponse:
+    session_id: str
+    worker_id: str
+    profile: str
+    state: str
+    created_at: float
 
 
 @dataclass
@@ -82,11 +99,11 @@ class StatusResponse:
     worker_id: str
     status: str
     started_at: float
+    session_id: str | None = None
     finished_at: float | None = None
     exit_code: int | None = None
     exit_cause: str | None = None
     exit_signal: int | None = None
-    timed_out: bool = False
     cancelled: bool = False
     stdout_bytes_written: int = 0
     stderr_bytes_written: int = 0
@@ -104,6 +121,7 @@ class HealthResponse:
     workers_idle: int = 0
     workers_inflight: int = 0
     workers_interactive: int = 0
+    workers_sessions: int = 0
 
 
 @dataclass
@@ -116,6 +134,7 @@ class ReadyResponse:
     service: str
     workers_idle: int = 0
     workers_inflight: int = 0
+    workers_sessions: int = 0
     workers_required: int = 0
 
 
@@ -180,13 +199,14 @@ class _Base:
 class AsyncHandle:
     """Reference to a spawned command; every call goes through the parent client."""
 
-    def __init__(self, client: AsyncShiitakeClient, handle: str, started_at: float) -> None:
+    def __init__(self, client: AsyncShiitakeClient, session_id: str, handle: str, started_at: float) -> None:
         self._client = client
+        self.session_id = session_id
         self.handle = handle
         self.started_at = started_at
 
     async def poll(self) -> StatusResponse:
-        return await self._client.status(self.handle)
+        return await self._client.command_status(self.session_id, self.handle)
 
     async def wait(self, poll_interval: float = 0.2) -> StatusResponse:
         """Poll until the handle leaves Running."""
@@ -199,10 +219,10 @@ class AsyncHandle:
             attempt += 1
 
     async def kill(self) -> None:
-        await self._client.kill(self.handle)
+        await self._client.kill_command(self.session_id, self.handle)
 
     async def read(self, stream: StreamName, *, from_: int = 0, max_: int | None = None) -> ReadChunk:
-        return await self._client.read(self.handle, stream, from_=from_, max_=max_)
+        return await self._client.read_command(self.session_id, self.handle, stream, from_=from_, max_=max_)
 
     async def slurp(self, stream: StreamName, *, max_bytes: int = 64 * 1024) -> tuple[str, bool]:
         """Read up to ``max_bytes`` from offset 0; returns (content, truncated)."""
@@ -211,12 +231,11 @@ class AsyncHandle:
 
 
 class AsyncPtySession:
-    """A live interactive terminal over one ``/api/v1/pty`` WebSocket.
+    """A detachable terminal attachment to a persistent session.
 
     Binary frames are the raw byte stream — server→client is pty **output**,
-    client→server is **stdin**; JSON text frames are control (only ``resize``
-    from the client). Use as an async context manager; ``output()`` yields until
-    the shell exits or the socket closes."""
+    client→server is **stdin**; JSON text frames carry resize. Closing this
+    attachment leaves the session and shell alive."""
 
     def __init__(self, ws: Any) -> None:
         self._ws = ws
@@ -259,6 +278,75 @@ class AsyncPtySession:
         await self.aclose()
 
 
+class AsyncSession:
+    """A reserved worker and shell. Release explicitly or use an async context manager."""
+
+    def __init__(self, client: AsyncShiitakeClient, details: SessionResponse) -> None:
+        self._client = client
+        self.session_id = details.session_id
+        self.worker_id = details.worker_id
+        self.profile = details.profile
+        self.created_at = details.created_at
+
+    async def status(self) -> SessionResponse:
+        return await self._client.session_status(self.session_id)
+
+    async def commands(self) -> list[StatusResponse]:
+        """List retained commands in this session, oldest first."""
+        return await self._client.list_commands(self.session_id)
+
+    async def get_command(self, handle: str) -> AsyncHandle:
+        """Recover a handle for a command already submitted to this session."""
+        status = await self._client.command_status(self.session_id, handle)
+        return AsyncHandle(self._client, self.session_id, handle, status.started_at)
+
+    async def spawn(
+        self, command: str, *, mode: CommandMode = "stateful",
+    ) -> AsyncHandle:
+        body = {"command": command, "mode": mode}
+        resp = await self._client._request(
+            "POST", self._client._url(f"/sessions/{self.session_id}/commands"),
+            json=body, retry_transport=False,
+        )
+        _raise_for_status(resp)
+        d = resp.json()
+        return AsyncHandle(self._client, self.session_id, d["handle"], d["started_at"])
+
+    async def run(
+        self, command: str, *,
+        mode: CommandMode = "stateful", max_inline_bytes: int = 64 * 1024
+    ) -> RunResult:
+        handle = await self.spawn(command, mode=mode)
+        try:
+            status = await handle.wait()
+            stdout, _ = await handle.slurp("stdout", max_bytes=max_inline_bytes)
+            stderr, _ = await handle.slurp("stderr", max_bytes=max_inline_bytes)
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await handle.kill()
+            raise
+        return RunResult(
+            stdout=stdout, stderr=stderr,
+            exit_code=status.exit_code if status.exit_code is not None else -1,
+            status=status.status, exit_cause=status.exit_cause,
+            exit_signal=status.exit_signal,
+            stdout_bytes_written=status.stdout_bytes_written,
+            stderr_bytes_written=status.stderr_bytes_written,
+        )
+
+    async def attach_terminal(self) -> AsyncPtySession:
+        return await self._client.attach_terminal(self.session_id)
+
+    async def release(self) -> SessionResponse:
+        return await self._client.release_session(self.session_id)
+
+    async def __aenter__(self) -> AsyncSession:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.release()
+
+
 class AsyncShiitakeClient(_Base):
     """Async client. Reuses a single ``httpx.AsyncClient`` for connection pooling."""
 
@@ -283,22 +371,24 @@ class AsyncShiitakeClient(_Base):
         json: dict[str, Any] | None = None,
         extra_headers: dict[str, str] | None = None,
         retry_on_429: bool = False,
+        retry_transport: bool = True,
     ) -> httpx.Response:
         headers = self._headers()
         if extra_headers:
             headers.update(extra_headers)
         last_exc: Exception | None = None
-        for attempt in range(self._max_retries):
+        attempts = self._max_retries if (retry_transport or retry_on_429) else 1
+        for attempt in range(attempts):
             try:
                 resp = await self._http.request(method, url, headers=headers, json=json)
             except _RETRYABLE_EXC as exc:
                 last_exc = exc
-                if attempt + 1 >= self._max_retries:
+                if not retry_transport or attempt + 1 >= attempts:
                     break
                 await asyncio.sleep(self._backoff(attempt))
                 continue
-            if retry_on_429 and resp.status_code in _RETRYABLE_STATUS:
-                if attempt + 1 >= self._max_retries:
+            if retry_on_429 and resp.status_code == 429:
+                if attempt + 1 >= attempts:
                     return resp
                 await asyncio.sleep(self._backoff(attempt))
                 continue
@@ -316,6 +406,7 @@ class AsyncShiitakeClient(_Base):
             workers_idle=d.get("workers_idle", 0),
             workers_inflight=d.get("workers_inflight", 0),
             workers_interactive=d.get("workers_interactive", 0),
+            workers_sessions=d.get("workers_sessions", 0),
         )
 
     async def ready(self) -> ReadyResponse:
@@ -330,97 +421,77 @@ class AsyncShiitakeClient(_Base):
             service=d["service"],
             workers_idle=d.get("workers_idle", 0),
             workers_inflight=d.get("workers_inflight", 0),
+            workers_sessions=d.get("workers_sessions", 0),
             workers_required=d.get("workers_required", 0),
         )
 
-    async def spawn(
-        self,
-        command: str,
-        *,
-        workdir: str | None = None,
-        timeout: float = 300.0,
+    async def profiles(self) -> list[ProfileResponse]:
+        resp = await self._request("GET", self._url("/profiles"))
+        _raise_for_status(resp)
+        return [ProfileResponse(**p) for p in resp.json()]
+
+    async def create_session(
+        self, *, profile: str = "default", workdir: str | None = None,
         env: dict[str, str] | None = None,
         drop_to: DropTo | Mapping[str, Any] | None = None,
-        wait_for_worker: bool = False,
-    ) -> AsyncHandle:
-        """Run ``command`` as ``bash -c <command>``. Returns a handle once a
-        worker accepts it (or raises ``NoIdleWorkerError`` on 429; pass
-        ``wait_for_worker`` to retry instead)."""
-        body: dict[str, Any] = {"command": command, "timeout": timeout, "env": env or {}}
+        cols: int = 80, rows: int = 24, wait_for_worker: bool = False,
+    ) -> AsyncSession:
+        body: dict[str, Any] = {
+            "profile": profile, "env": env or {}, "cols": cols, "rows": rows,
+        }
         if workdir is not None:
             body["workdir"] = workdir
         if drop_to is not None:
             body["drop_to"] = drop_to.to_json() if isinstance(drop_to, DropTo) else dict(drop_to)
-        resp = await self._request("POST", self._url("/exec"), json=body, retry_on_429=wait_for_worker)
+        resp = await self._request(
+            "POST", self._url("/sessions"), json=body,
+            retry_on_429=wait_for_worker, retry_transport=False,
+        )
         if resp.status_code == 429:
             raise NoIdleWorkerError
         _raise_for_status(resp)
-        d = resp.json()
-        return AsyncHandle(self, d["handle"], d["started_at"])
+        return AsyncSession(self, SessionResponse(**resp.json()))
 
-    async def status(self, handle: str) -> StatusResponse:
-        resp = await self._request("GET", self._url(f"/exec/{handle}"))
+    async def session_status(self, session_id: str) -> SessionResponse:
+        resp = await self._request("GET", self._url(f"/sessions/{session_id}"))
+        _raise_for_status(resp)
+        return SessionResponse(**resp.json())
+
+    async def release_session(self, session_id: str) -> SessionResponse:
+        resp = await self._request("DELETE", self._url(f"/sessions/{session_id}"))
+        _raise_for_status(resp)
+        return SessionResponse(**resp.json())
+
+    async def command_status(self, session_id: str, handle: str) -> StatusResponse:
+        resp = await self._request(
+            "GET", self._url(f"/sessions/{session_id}/commands/{handle}")
+        )
         _raise_for_status(resp)
         return StatusResponse.from_dict(resp.json())
 
-    async def kill(self, handle: str) -> None:
-        resp = await self._request("DELETE", self._url(f"/exec/{handle}"))
+    async def list_commands(self, session_id: str) -> list[StatusResponse]:
+        resp = await self._request("GET", self._url(f"/sessions/{session_id}/commands"))
+        _raise_for_status(resp)
+        return [StatusResponse.from_dict(item) for item in resp.json()]
+
+    async def kill_command(self, session_id: str, handle: str) -> None:
+        resp = await self._request(
+            "DELETE", self._url(f"/sessions/{session_id}/commands/{handle}")
+        )
         _raise_for_status(resp)
 
-    async def attach_pty(
-        self,
-        *,
-        working_dir: str,
-        command: list[str] | None = None,
-        env: dict[str, str] | None = None,
-        cols: int = 80,
-        rows: int = 24,
-        drop_to: DropTo | Mapping[str, Any] | None = None,
-    ) -> AsyncPtySession:
-        """Open an interactive PTY. Pins one worker for the session's life;
-        raises if none is idle. ``command`` empty means the worker's default
-        shell. Requires the ``pty`` extra (``shiitake-py[pty]``)."""
-        try:
-            from websockets.asyncio.client import connect as ws_connect
-        except ImportError as exc:  # pragma: no cover - import-guard
-            raise RuntimeError("attach_pty needs the 'pty' extra: pip install shiitake-py[pty]") from exc
-
-        # `/pty` is the same origin + prefix as `/exec`, over ws(s) not http(s).
-        ws_url = self._url("/pty").replace("https://", "wss://", 1).replace("http://", "ws://", 1)
-        open_frame: dict[str, Any] = {
-            "op": "open",
-            "command": command or [],
-            "working_dir": working_dir,
-            "env": env or {},
-            "cols": cols,
-            "rows": rows,
-        }
-        if drop_to is not None:
-            open_frame["drop_to"] = drop_to.to_json() if isinstance(drop_to, DropTo) else dict(drop_to)
-        ws = await ws_connect(ws_url, additional_headers=self._headers())
-        try:
-            await ws.send(json.dumps(open_frame))
-        except Exception:
-            with contextlib.suppress(Exception):
-                await ws.close()
-            raise
-        return AsyncPtySession(ws)
-
-    async def read(
-        self,
-        handle: str,
-        stream: StreamName,
-        *,
-        from_: int = 0,
-        max_: int | None = None,
+    async def read_command(
+        self, session_id: str, handle: str, stream: StreamName,
+        *, from_: int = 0, max_: int | None = None,
     ) -> ReadChunk:
-        """Read a slice of a captured stream over HTTP ``Range``. Reading past
-        EOF yields an empty, ``eof=True`` chunk rather than an error."""
         extra: dict[str, str] = {}
         if from_ or max_ is not None:
             end = "" if max_ is None else str(from_ + max_ - 1)
             extra["Range"] = f"bytes={from_}-{end}"
-        resp = await self._request("GET", self._url(f"/exec/{handle}/{stream}"), extra_headers=extra)
+        resp = await self._request(
+            "GET", self._url(f"/sessions/{session_id}/commands/{handle}/{stream}"),
+            extra_headers=extra,
+        )
         if resp.status_code == 416:
             total = _total_from_content_range(resp.headers.get("content-range"))
             return ReadChunk(content="", next_offset=from_, bytes_written=total, eof=True)
@@ -431,85 +502,173 @@ class AsyncShiitakeClient(_Base):
         next_offset = from_ + len(body)
         return ReadChunk(
             content=body.decode("utf-8", errors="replace"),
-            next_offset=next_offset,
-            bytes_written=total,
-            eof=next_offset >= total,
+            next_offset=next_offset, bytes_written=total, eof=next_offset >= total,
         )
 
-    async def run(
-        self,
-        command: str,
-        *,
-        workdir: str | None = None,
-        timeout: float = 300.0,
+    async def attach_terminal(self, session_id: str) -> AsyncPtySession:
+        try:
+            from websockets.asyncio.client import connect as ws_connect
+        except ImportError as exc:  # pragma: no cover - import-guard
+            raise RuntimeError("terminal needs the 'pty' extra: pip install shiitake-py[pty]") from exc
+        ws_url = self._url(f"/sessions/{session_id}/terminal")
+        ws_url = ws_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+        ws = await ws_connect(ws_url, additional_headers=self._headers())
+        return AsyncPtySession(ws)
+
+
+
+class Handle:
+    """Synchronous reference to a command that can be polled, read, or cancelled."""
+
+    def __init__(self, client: ShiitakeClient, session_id: str, handle: str, started_at: float) -> None:
+        self._client = client
+        self.session_id = session_id
+        self.handle = handle
+        self.started_at = started_at
+
+    def _url(self) -> str:
+        return self._client._url(f"/sessions/{self.session_id}/commands/{self.handle}")
+
+    def poll(self) -> StatusResponse:
+        resp = self._client._http.get(self._url(), headers=self._client._headers())
+        _raise_for_status(resp)
+        return StatusResponse.from_dict(resp.json())
+
+    def wait(self, poll_interval: float = 0.2) -> StatusResponse:
+        delay = poll_interval
+        while True:
+            status = self.poll()
+            if status.status != "running":
+                return status
+            time.sleep(delay)
+            delay = min(delay * 1.5, 2.0)
+
+    def kill(self) -> None:
+        resp = self._client._http.delete(self._url(), headers=self._client._headers())
+        _raise_for_status(resp)
+
+    def read(self, stream: StreamName, *, from_: int = 0, max_: int | None = None) -> ReadChunk:
+        headers = self._client._headers()
+        if from_ or max_ is not None:
+            end = "" if max_ is None else str(from_ + max_ - 1)
+            headers["Range"] = f"bytes={from_}-{end}"
+        resp = self._client._http.get(f"{self._url()}/{stream}", headers=headers)
+        if resp.status_code == 416:
+            return ReadChunk("", from_, _total_from_content_range(resp.headers.get("content-range")), True)
+        _raise_for_status(resp)
+        body = resp.content
+        cr = resp.headers.get("content-range")
+        total = _total_from_content_range(cr) if (resp.status_code == 206 and cr) else from_ + len(body)
+        next_offset = from_ + len(body)
+        return ReadChunk(body.decode("utf-8", errors="replace"), next_offset, total, next_offset >= total)
+
+
+class ShiitakeClient(_Base):
+    """Synchronous client. Commands run through an explicitly created session."""
+
+    def __init__(self, base_url: str, **kwargs: Any) -> None:
+        super().__init__(base_url, **kwargs)
+        self._http = httpx.Client(timeout=self._timeout)
+
+    def close(self) -> None:
+        self._http.close()
+
+    def __enter__(self) -> ShiitakeClient:
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+    def create_session(
+        self, *, profile: str = "default", workdir: str | None = None,
         env: dict[str, str] | None = None,
         drop_to: DropTo | Mapping[str, Any] | None = None,
-        max_inline_bytes: int = 64 * 1024,
-        wait_for_worker: bool = True,
-    ) -> RunResult:
-        """Spawn + wait + slurp small output into one result. Output beyond
-        ``max_inline_bytes`` stays on the server (the ``*_bytes_written`` fields
-        reflect the full size)."""
-        handle = await self.spawn(
-            command,
-            workdir=workdir,
-            timeout=timeout,
-            env=env,
-            drop_to=drop_to,
-            wait_for_worker=wait_for_worker,
+        cols: int = 80, rows: int = 24,
+    ) -> Session:
+        body: dict[str, Any] = {"profile": profile, "env": env or {}, "cols": cols, "rows": rows}
+        if workdir is not None:
+            body["workdir"] = workdir
+        if drop_to is not None:
+            body["drop_to"] = drop_to.to_json() if isinstance(drop_to, DropTo) else dict(drop_to)
+        resp = self._http.post(self._url("/sessions"), headers=self._headers(), json=body)
+        if resp.status_code == 429:
+            raise NoIdleWorkerError
+        _raise_for_status(resp)
+        return Session(self, SessionResponse(**resp.json()))
+
+
+class Session:
+    """Synchronous session with explicit release or a context manager."""
+
+    def __init__(self, client: ShiitakeClient, details: SessionResponse) -> None:
+        self._client = client
+        self.session_id = details.session_id
+        self.worker_id = details.worker_id
+        self.profile = details.profile
+
+    def release(self) -> SessionResponse:
+        resp = self._client._http.delete(
+            self._client._url(f"/sessions/{self.session_id}"),
+            headers=self._client._headers(),
         )
+        _raise_for_status(resp)
+        return SessionResponse(**resp.json())
+
+    def commands(self) -> list[StatusResponse]:
+        """List retained commands in this session, oldest first."""
+        resp = self._client._http.get(
+            self._client._url(f"/sessions/{self.session_id}/commands"),
+            headers=self._client._headers(),
+        )
+        _raise_for_status(resp)
+        return [StatusResponse.from_dict(item) for item in resp.json()]
+
+    def get_command(self, handle: str) -> Handle:
+        """Recover a handle for a command already submitted to this session."""
+        url = self._client._url(f"/sessions/{self.session_id}/commands/{handle}")
+        resp = self._client._http.get(url, headers=self._client._headers())
+        _raise_for_status(resp)
+        status = StatusResponse.from_dict(resp.json())
+        return Handle(self._client, self.session_id, handle, status.started_at)
+
+    def run(
+        self, command: str, *,
+        mode: CommandMode = "stateful", max_inline_bytes: int = 64 * 1024
+    ) -> RunResult:
+        handle = self.spawn(command, mode=mode)
         try:
-            status = await handle.wait()
-            stdout, _ = await handle.slurp("stdout", max_bytes=max_inline_bytes)
-            stderr, _ = await handle.slurp("stderr", max_bytes=max_inline_bytes)
-        except asyncio.CancelledError:
-            # Cancelling the await only stops the polling here; the command keeps
-            # running on its worker and holds that slot until it exits or the
-            # server times it out. `run` owns this handle, so it kills it.
+            status = handle.wait()
+            streams = {
+                stream: handle.read(stream, max_=max_inline_bytes).content
+                for stream in ("stdout", "stderr")
+            }
+        except BaseException:
             with contextlib.suppress(Exception):
-                await handle.kill()
+                handle.kill()
             raise
         return RunResult(
-            stdout=stdout,
-            stderr=stderr,
+            stdout=streams["stdout"], stderr=streams["stderr"],
             exit_code=status.exit_code if status.exit_code is not None else -1,
-            status=status.status,
-            exit_cause=status.exit_cause,
-            exit_signal=status.exit_signal,
+            status=status.status, exit_cause=status.exit_cause, exit_signal=status.exit_signal,
             stdout_bytes_written=status.stdout_bytes_written,
             stderr_bytes_written=status.stderr_bytes_written,
         )
 
+    def spawn(self, command: str, *, mode: CommandMode = "stateful") -> Handle:
+        base = self._client._url(f"/sessions/{self.session_id}/commands")
+        resp = self._client._http.post(
+            base, headers=self._client._headers(),
+            json={"command": command, "mode": mode}
+        )
+        _raise_for_status(resp)
+        payload = resp.json()
+        return Handle(self._client, self.session_id, payload["handle"], payload["started_at"])
 
-class ShiitakeClient(_Base):
-    """Sync wrapper around a one-shot ``AsyncShiitakeClient.run`` — for scripts."""
+    def __enter__(self) -> Session:
+        return self
 
-    def __init__(self, base_url: str, **kwargs: Any) -> None:
-        super().__init__(base_url, **kwargs)
-        self._kwargs = kwargs
-
-    def run(
-        self,
-        command: str,
-        *,
-        workdir: str | None = None,
-        timeout: float = 300.0,
-        env: dict[str, str] | None = None,
-        drop_to: DropTo | Mapping[str, Any] | None = None,
-        max_inline_bytes: int = 64 * 1024,
-    ) -> RunResult:
-        async def _go() -> RunResult:
-            async with AsyncShiitakeClient(self._base_url, **self._kwargs) as c:
-                return await c.run(
-                    command,
-                    workdir=workdir,
-                    timeout=timeout,
-                    env=env,
-                    drop_to=drop_to,
-                    max_inline_bytes=max_inline_bytes,
-                )
-
-        return asyncio.run(_go())
+    def __exit__(self, *exc: Any) -> None:
+        self.release()
 
 
 def _raise_for_status(resp: httpx.Response) -> None:

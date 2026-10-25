@@ -33,7 +33,7 @@ pub struct ExecId(String);
 
 impl ExecId {
     /// Mint a fresh id. Call only at the true origin of an execution — the
-    /// server's UUID mint — never to convert an arbitrary string mid-chain.
+    /// server's handle mint — never to convert an arbitrary string mid-chain.
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
@@ -41,6 +41,29 @@ impl ExecId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Display)]
+#[serde(transparent)]
+#[display("{_0}")]
+pub struct SessionId(String);
+
+impl SessionId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+pub fn default_profile() -> String {
+    "default".to_string()
+}
+
+fn is_default_profile(profile: &String) -> bool {
+    profile == "default"
 }
 
 /// Optional privilege-drop directive carried on an Execute frame.
@@ -89,28 +112,76 @@ pub struct WorkerLocation {
     pub container: String,
 }
 
+/// Dispatch wire version. Version 3 removes command deadlines; version 2
+/// streams command output, and version 1 required a shared capture volume.
+pub const PROTOCOL_VERSION: u16 = 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Frame {
     /// Worker → server: first frame after connect, advertises availability.
     Hello {
         worker_id: WorkerId,
+        /// Missing in pre-streaming workers; such workers must not be scheduled.
+        #[serde(default)]
+        protocol_version: u16,
+        #[serde(
+            default = "default_profile",
+            skip_serializing_if = "is_default_profile"
+        )]
+        profile: String,
         /// For the server's OOM probe. Omitted when the worker has no pod
         /// identity (local runs); the server then falls back to its own pod.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         location: Option<WorkerLocation>,
     },
+    /// Server → worker: confirms that both peers use the same wire protocol.
+    /// A worker must wait for this before accepting work from the dispatcher.
+    HelloAck {
+        protocol_version: u16,
+    },
     /// Server → worker: a command to run.
     Execute(ExecuteFrame),
-    /// Server → worker: cancel the in-flight command. Worker SIGKILLs the
-    /// process group and follows up with a Result frame whose `cancelled`
-    /// flag is set.
-    Cancel { request_id: ExecId },
-    /// Worker → server: the result of an Execute. The output lives on
-    /// disk under `<capture_root>/<request_id>/{stdout,stderr}` — the server
-    /// stats those files for byte counts, so only exit metadata and the
-    /// per-command resource usage travel on the wire.
+    /// Server → worker: cancel the in-flight command. Parallel jobs receive
+    /// SIGTERM then SIGKILL; a stateful shell command receives an interrupt.
+    /// The worker follows up with a Result frame whose `cancelled` flag is set.
+    Cancel {
+        request_id: ExecId,
+    },
+    /// Worker → server: the result of an Execute. Stdout/stderr travel first
+    /// as binary OutputChunk frames and are spooled by the server. Result
+    /// carries exit metadata and resource usage. The worker removes its
+    /// temporary local capture files after streaming them.
     Result(ResultFrame),
+
+    /// A worker remains reserved from Open until Closed. Commands may overlap
+    /// within that interval; the identity belongs to the session, not a job.
+    SessionOpen(SessionOpenFrame),
+    SessionReady {
+        session_id: SessionId,
+        error: Option<String>,
+    },
+    SessionRun {
+        session_id: SessionId,
+        execute: ExecuteFrame,
+        #[serde(default)]
+        mode: SessionCommandMode,
+    },
+    SessionClose {
+        session_id: SessionId,
+    },
+    SessionClosed {
+        session_id: SessionId,
+        error: Option<String>,
+        /// False when the worker is recycling or its reset failed.
+        #[serde(default = "session_reusable_default")]
+        reusable: bool,
+    },
+    SessionResize {
+        session_id: SessionId,
+        cols: u16,
+        rows: u16,
+    },
 
     /// Server → worker: open an interactive PTY and spawn a shell on it. Unlike
     /// `Execute`, the session is persistent and bidirectional: its byte stream
@@ -126,7 +197,9 @@ pub enum Frame {
     },
     /// Server → worker: end the session — SIGHUP the process group and close the
     /// pty. Idempotent with a `PtyExit` the worker may already have sent.
-    PtyClose { session_id: ExecId },
+    PtyClose {
+        session_id: ExecId,
+    },
     /// Worker → server: the shell exited, or the pty could not be opened
     /// (`error` set). Terminal frame; the worker then resets and rejoins idle.
     PtyExit {
@@ -139,20 +212,101 @@ pub enum Frame {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionOpenFrame {
+    pub session_id: SessionId,
+    pub working_dir: String,
+    pub env: BTreeMap<String, String>,
+    pub drop_to: Option<DropTo>,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+fn session_reusable_default() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCommandMode {
+    #[default]
+    Stateful,
+    Parallel,
+}
+
+/// Binary output on the dispatch socket. The first byte is the stream, then a
+/// u16 big-endian id length, UTF-8 id bytes, and raw output bytes. Stream 3 is
+/// client terminal input; streams 0/1/2 are worker stdout/stderr/PTY output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OutputStream {
+    Stdout = 0,
+    Stderr = 1,
+    Terminal = 2,
+    Stdin = 3,
+}
+
+impl TryFrom<u8> for OutputStream {
+    type Error = &'static str;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Stdout),
+            1 => Ok(Self::Stderr),
+            2 => Ok(Self::Terminal),
+            3 => Ok(Self::Stdin),
+            _ => Err("unknown output stream"),
+        }
+    }
+}
+
+pub struct OutputChunk<'a> {
+    pub stream: OutputStream,
+    pub id: &'a str,
+    pub bytes: &'a [u8],
+}
+
+impl<'a> OutputChunk<'a> {
+    pub fn encode(&self) -> Vec<u8> {
+        let len = u16::try_from(self.id.len()).expect("id fits in output header");
+        let mut out = Vec::with_capacity(3 + self.id.len() + self.bytes.len());
+        out.push(self.stream as u8);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(self.id.as_bytes());
+        out.extend_from_slice(self.bytes);
+        out
+    }
+
+    pub fn decode(bytes: &'a [u8]) -> Result<Self, &'static str> {
+        if bytes.len() < 3 {
+            return Err("short output header");
+        }
+        let stream = OutputStream::try_from(bytes[0])?;
+        let len = usize::from(u16::from_be_bytes([bytes[1], bytes[2]]));
+        if bytes.len() < 3 + len {
+            return Err("short output id");
+        }
+        let id = std::str::from_utf8(&bytes[3..3 + len]).map_err(|_| "invalid output id")?;
+        Ok(Self {
+            stream,
+            id,
+            bytes: &bytes[3 + len..],
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecuteFrame {
     pub request_id: ExecId,
     pub command: String,
     pub working_dir: String,
     pub env: BTreeMap<String, String>,
-    pub timeout_secs: f64,
     /// Optional privilege-drop directive. `None` means run as the worker uid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drop_to: Option<DropTo>,
 }
 
 /// Parameters for an interactive PTY session (`Frame::PtyOpen`). Mirrors
-/// `ExecuteFrame`'s identity/cwd/env handling; there is no `timeout_secs` — a
-/// terminal lives until the shell exits or the client disconnects.
+/// `ExecuteFrame`'s identity/cwd/env handling. A terminal lives until the shell
+/// exits or the client disconnects.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PtyOpenFrame {
     pub session_id: ExecId,
@@ -189,7 +343,6 @@ pub struct ResultFrame {
     pub request_id: ExecId,
     pub exit_code: Option<i32>,
     pub exit_signal: Option<i32>,
-    pub timed_out: bool,
     pub cancelled: bool,
     #[serde(default)]
     pub usage: ResourceUsage,
@@ -206,7 +359,6 @@ impl ResultFrame {
             request_id,
             exit_code: None,
             exit_signal: None,
-            timed_out: false,
             cancelled: false,
             usage: ResourceUsage::default(),
             error: Some(message.into()),
@@ -220,35 +372,47 @@ mod tests {
 
     // `WorkerId` is `#[serde(transparent)]`, so it must be wire-identical to the
     // bare `String` it replaced: a `Hello` frame serializes its worker_id as a
-    // plain JSON string, and an old-format payload still deserializes. This
-    // pins the protocol so the newtype can never silently change the wire shape.
+    // plain JSON string. A pre-version Hello still deserializes as version 0
+    // so the server can explicitly reject it before scheduling a command.
     #[test]
     fn worker_id_is_wire_transparent() {
         let frame = Frame::Hello {
+            protocol_version: 3,
             worker_id: WorkerId::new("worker-0"),
+            profile: default_profile(),
             location: None,
         };
         let json = serde_json::to_string(&frame).unwrap();
-        assert_eq!(json, r#"{"kind":"hello","worker_id":"worker-0"}"#);
+        assert_eq!(
+            json,
+            r#"{"kind":"hello","worker_id":"worker-0","protocol_version":3}"#
+        );
 
         // The pre-newtype payload (a bare string) still deserializes.
         let parsed: Frame =
             serde_json::from_str(r#"{"kind":"hello","worker_id":"worker-7"}"#).unwrap();
         match parsed {
-            Frame::Hello { worker_id, .. } => assert_eq!(worker_id.as_str(), "worker-7"),
+            Frame::Hello {
+                worker_id,
+                protocol_version,
+                ..
+            } => {
+                assert_eq!(worker_id.as_str(), "worker-7");
+                assert_eq!(protocol_version, 0);
+            }
             _ => panic!("expected Hello"),
         }
     }
 
     // A worker that knows where it runs (the two-pod topology) puts that on the
-    // Hello; a worker that doesn't omits the field entirely, so the frame stays
-    // byte-identical to what a pre-location worker sends. Both directions are
-    // pinned here because the server's OOM probe reads this field and must keep
-    // accepting either shape.
+    // Hello; a worker that doesn't omits the field entirely. Both directions
+    // are pinned here because the server's OOM probe reads this field.
     #[test]
     fn hello_carries_an_optional_worker_location() {
         let frame = Frame::Hello {
+            protocol_version: 3,
             worker_id: WorkerId::new("worker-0"),
+            profile: default_profile(),
             location: Some(WorkerLocation {
                 pod: "shiitake-workers-abc".into(),
                 namespace: "shiitake".into(),
@@ -258,7 +422,7 @@ mod tests {
         let json = serde_json::to_string(&frame).unwrap();
         assert_eq!(
             json,
-            r#"{"kind":"hello","worker_id":"worker-0","location":{"pod":"shiitake-workers-abc","namespace":"shiitake","container":"worker"}}"#
+            r#"{"kind":"hello","worker_id":"worker-0","protocol_version":3,"location":{"pod":"shiitake-workers-abc","namespace":"shiitake","container":"worker"}}"#
         );
 
         let parsed: Frame = serde_json::from_str(&json).unwrap();
@@ -299,10 +463,8 @@ mod tests {
     }
 }
 
-/// The frame examples published in `docs/docs.html` under "The dispatch
-/// protocol", verbatim. Someone writing their own worker builds against those,
-/// so a change here that leaves them stale is a change that misleads them — this
-/// fails first.
+/// Example frames for the dispatch protocol. Someone writing their own worker
+/// builds against these, so keep them aligned with the documented version.
 #[cfg(test)]
 mod documented_frames {
     use super::*;
@@ -312,6 +474,7 @@ mod documented_frames {
         let f: Frame = serde_json::from_str(
             r#"{"kind": "hello",
                 "worker_id": "shiitake-workers-6d4b8f9c7-x2k9p",
+                "protocol_version": 3,
                 "location": {"pod": "shiitake-workers-6d4b8f9c7-x2k9p",
                              "namespace": "shiitake",
                              "container": "worker"}}"#,
@@ -319,12 +482,15 @@ mod documented_frames {
         .expect("documented hello frame must deserialize");
         let Frame::Hello {
             worker_id,
+            protocol_version,
             location,
+            ..
         } = f
         else {
             panic!("expected Hello")
         };
         assert_eq!(worker_id.as_str(), "shiitake-workers-6d4b8f9c7-x2k9p");
+        assert_eq!(protocol_version, PROTOCOL_VERSION);
         assert_eq!(location.expect("location").container, "worker");
     }
 
@@ -336,7 +502,6 @@ mod documented_frames {
                 "command": "echo hi",
                 "working_dir": "/tmp",
                 "env": {"PATH": "/usr/bin:/bin"},
-                "timeout_secs": 300.0,
                 "drop_to": {"uid": 1000, "gid": 1000, "supplementary_gids": [], "umask": 7}}"#,
         )
         .expect("documented execute frame must deserialize");
@@ -344,7 +509,6 @@ mod documented_frames {
             panic!("expected Execute")
         };
         assert_eq!(e.command, "echo hi");
-        assert_eq!(e.timeout_secs, 300.0);
         assert_eq!(e.drop_to.expect("drop_to").uid, 1000);
     }
 
@@ -365,7 +529,6 @@ mod documented_frames {
                 "request_id": "0f3c",
                 "exit_code": 0,
                 "exit_signal": null,
-                "timed_out": false,
                 "cancelled": false,
                 "usage": {"memory_peak_bytes": 1048576, "memory_limit_bytes": 536870912,
                           "cpu_user_seconds": 0.01, "cpu_system_seconds": 0.00},
