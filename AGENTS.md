@@ -86,19 +86,28 @@ temporary capture on worker-local storage; workers deliver bytes over dispatch.
 cargo +nightly fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-uv run --project clients/shiitake-py --group dev pytest clients/shiitake-py/tests
+uv run --locked --project clients/shiitake-py --group dev pytest clients/shiitake-py/tests
 bash tests/build.sh && bash tests/setup.sh && bash tests/run.sh
 SHIITAKE_E2E_TOPOLOGY=two-pod bash tests/setup.sh
 SHIITAKE_E2E_TOPOLOGY=two-pod bash tests/run.sh
 ```
 
-`mise install` provides k3d, kubectl, Helm, Python, and uv. Rust is pinned in
+`mise install` provides k3d, kubectl, Helm, Python, and uv. Python test
+dependencies are pinned in `clients/shiitake-py/uv.lock`; use `uv lock --upgrade`
+from that directory when updating them. Rust is pinned in
 `rust-toolchain.toml`; nightly rustfmt is used by CI for unstable import
 formatting options. `ci.yml` runs format, clippy, test, and version checks;
 `test.yml` runs both topology variants. The Cargo workspace and Python
 package versions must move together. The first PR after a release must bump
 both above the latest release; a later PR in the same cycle inherits that
 version unless its scope needs a larger bump.
+
+The e2e runner supervises `kubectl port-forward`: a WebSocket close with an
+invalid-control code can make kubectl exit even while the server pod is healthy.
+On failure, `tests/run.sh` prints the forward logs and cluster diagnostics.
+The test server Deployment uses `Recreate` because workers hold persistent
+dispatch connections; a rolling update can leave every worker on the old
+server and the new server permanently unready.
 
 ## Operational gotchas
 

@@ -33,7 +33,7 @@ else
   # SHIITAKE_RESTART_AFTER recycle path) is the ContainerRestartRules feature,
   # beta/on-by-default from k8s 1.35. k3d's default k3s is older and the API
   # server would reject the pod template, so pin a >=1.35 k3s image here.
-  K3S_IMAGE="${K3S_IMAGE:-rancher/k3s:v1.35.5-k3s1}"
+  K3S_IMAGE="${K3S_IMAGE:-rancher/k3s:v1.37.1-k3s1}"
   log "Creating k3d cluster '${CLUSTER}' (image ${K3S_IMAGE})"
   k3d cluster create "$CLUSTER" --image "$K3S_IMAGE" --wait --timeout 180s
 fi

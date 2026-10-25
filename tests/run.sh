@@ -18,14 +18,50 @@ ROOT="$(cd "$HERE/.." && pwd)"
 
 PF_PID=""
 MPF_PID=""
+PF_LOG="$(mktemp)"
+MPF_LOG="$(mktemp)"
+
+port_forward_forever() (
+  local resource="$1" local_port="$2" remote_port="$3" log_file="$4" child=""
+  stop_forward() {
+    trap - TERM INT
+    if [ -n "$child" ]; then
+      kill "$child" >/dev/null 2>&1 || true
+      wait "$child" 2>/dev/null || true
+    fi
+    exit 0
+  }
+  trap stop_forward TERM INT
+  while :; do
+    kubectl --context "$CONTEXT" -n "$NAMESPACE" port-forward \
+      "$resource" "${local_port}:${remote_port}" >>"$log_file" 2>&1 &
+    child=$!
+    wait "$child" || true
+    child=""
+    printf 'port-forward %s exited; restarting\n' "$resource" >&2
+    sleep 0.2
+  done
+)
+
 cleanup() {
+  local status=$?
+  trap - EXIT
   if [ -n "$PF_PID" ]; then kill "$PF_PID" >/dev/null 2>&1 || true; fi
   if [ -n "$MPF_PID" ]; then kill "$MPF_PID" >/dev/null 2>&1 || true; fi
+  if [ "$status" -ne 0 ]; then
+    log "API port-forward log"
+    tail -60 "$PF_LOG" || true
+    log "Metrics port-forward log"
+    tail -60 "$MPF_LOG" || true
+    diagnostics
+  fi
+  rm -f "$PF_LOG" "$MPF_LOG"
+  exit "$status"
 }
 trap cleanup EXIT
 
 log "Port-forwarding ${LOCAL_PORT} -> 8080"
-kubectl --context "$CONTEXT" -n "$NAMESPACE" port-forward "deploy/$RELEASE" "${LOCAL_PORT}:8080" >/dev/null 2>&1 &
+port_forward_forever "deploy/$RELEASE" "$LOCAL_PORT" 8080 "$PF_LOG" &
 PF_PID=$!
 base="http://127.0.0.1:${LOCAL_PORT}"
 
@@ -63,8 +99,11 @@ SHIITAKE_E2E_URL="$base" SHIITAKE_E2E_TOKEN="$TOKEN" SHIITAKE_E2E_WORKERS="$work
 # The workers run as root in-cluster, so the PTY named-user drop (writes
 # /etc/passwd + setuids) can run here; SHIITAKE_E2E_ROOT_WORKERS enables it.
 log "Running shiitake-py e2e against ${base}"
+# An existing project .venv can have been created by an older Python. Use the
+# same interpreter as the HTTP checks and mise pin for both uv invocations.
+test_python="$(command -v python3)"
 SHIITAKE_E2E_URL="$base" SHIITAKE_E2E_TOKEN="$TOKEN" SHIITAKE_E2E_ROOT_WORKERS=1 \
-  uv run --project "$ROOT/clients/shiitake-py" --group dev \
+  uv run --python "$test_python" --locked --project "$ROOT/clients/shiitake-py" --group dev \
   pytest "$ROOT/clients/shiitake-py/tests/test_e2e.py" \
          "$ROOT/clients/shiitake-py/tests/test_pty_e2e.py" -q
 
@@ -79,7 +118,7 @@ if ! kubectl --context "$CONTEXT" -n "$NAMESPACE" get "svc/${RELEASE}-otel" >/de
   exit 1
 fi
 
-kubectl --context "$CONTEXT" -n "$NAMESPACE" port-forward "svc/${RELEASE}-otel" "${mport}:8889" >/dev/null 2>&1 &
+port_forward_forever "svc/${RELEASE}-otel" "$mport" 8889 "$MPF_LOG" &
 MPF_PID=$!
 
 metrics=""
@@ -110,7 +149,7 @@ if [ "$TOPOLOGY" = "two-pod" ]; then
   SHIITAKE_E2E_TOKEN="$TOKEN" SHIITAKE_E2E_WORKERS="$workers" \
     SHIITAKE_E2E_CONTEXT="$CONTEXT" SHIITAKE_E2E_NAMESPACE="$NAMESPACE" \
     SHIITAKE_E2E_RELEASE="$RELEASE" \
-    uv run --project "$ROOT/clients/shiitake-py" --group dev \
+    uv run --python "$test_python" --locked --project "$ROOT/clients/shiitake-py" --group dev \
     python "$ROOT/tests/test_pod_failures.py"
 fi
 

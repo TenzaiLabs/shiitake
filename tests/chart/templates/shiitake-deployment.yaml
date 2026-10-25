@@ -12,6 +12,10 @@ metadata:
     release: {{ .Release.Name }}
 spec:
   replicas: 1
+  # Workers keep persistent dispatch connections. During a rolling update they
+  # can all reconnect to the old server, leaving the new one unready forever.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: shiitake

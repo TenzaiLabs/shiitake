@@ -185,7 +185,7 @@ HTTP session client. Both clients expose explicit session release.
 cargo +nightly fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-uv run --project clients/shiitake-py --group dev pytest clients/shiitake-py/tests
+uv run --locked --project clients/shiitake-py --group dev pytest clients/shiitake-py/tests
 bash tests/build.sh && bash tests/setup.sh && bash tests/run.sh
 SHIITAKE_E2E_TOPOLOGY=two-pod bash tests/setup.sh
 SHIITAKE_E2E_TOPOLOGY=two-pod bash tests/run.sh

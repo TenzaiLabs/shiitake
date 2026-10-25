@@ -24,9 +24,9 @@ shiitake-worker-api = { path = "../shiitake-worker-api" }
 shiitake-server-api = { path = "../shiitake-server-api" }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["fs", "auth"] }
-opentelemetry = { version = "0.32", features = ["trace", "metrics"] }
-opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+opentelemetry = { version = "0.33", features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.33", features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
     "trace",
     "metrics",
     # All OTLP transports, selected at runtime by OTEL_EXPORTER_OTLP_PROTOCOL.
@@ -39,7 +39,7 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "reqwest-blocking-client",
     "grpc-tonic",
 ] }
-tracing-opentelemetry = "0.33"
+tracing-opentelemetry = "0.34"
 
 [dev-dependencies]
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
