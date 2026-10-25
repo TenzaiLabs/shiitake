@@ -48,6 +48,10 @@ cleanup() {
   trap - EXIT
   if [ -n "$PF_PID" ]; then kill "$PF_PID" >/dev/null 2>&1 || true; fi
   if [ -n "$MPF_PID" ]; then kill "$MPF_PID" >/dev/null 2>&1 || true; fi
+  # Each supervisor reaps its kubectl child before exiting. Wait for both so
+  # the ports are free when another run starts immediately.
+  if [ -n "$PF_PID" ]; then wait "$PF_PID" 2>/dev/null || true; fi
+  if [ -n "$MPF_PID" ]; then wait "$MPF_PID" 2>/dev/null || true; fi
   if [ "$status" -ne 0 ]; then
     log "API port-forward log"
     tail -60 "$PF_LOG" || true
