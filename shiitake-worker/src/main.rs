@@ -36,6 +36,12 @@ struct Config {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+    // Session commands run beside this process and can be root. Without the
+    // dumpable flag, /proc/<pid>/environ and memory need CAP_SYS_PTRACE, which
+    // keeps SHIITAKE_DISPATCH_TOKEN out of their reach. Children regain the
+    // default at exec.
+    #[cfg(target_os = "linux")]
+    nix::sys::prctl::set_dumpable(false).expect("clear the dumpable flag");
     let cfg = Config::parse();
     // Always exit 0: whether the worker reaches its restart-after quota or a
     // session errors out, a non-zero exit would make routine recycles look like

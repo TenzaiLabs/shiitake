@@ -61,6 +61,8 @@ impl Session<'_> {
         self.client.list_commands(&self.details.session_id).await
     }
 
+    /// Submit a command without waiting. Commands start in submission order;
+    /// see [`SessionCommandMode`] for how stateful and parallel commands wait.
     pub async fn submit(
         &self,
         command: impl Into<String>,

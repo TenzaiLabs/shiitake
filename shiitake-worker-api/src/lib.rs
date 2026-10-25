@@ -225,11 +225,22 @@ fn session_reusable_default() -> bool {
     true
 }
 
+/// How a session command runs. Commands start in submission order: every
+/// command waits until each stateful command submitted before it has finished.
+/// A waiting command reports `running`. A stateful command that never finishes
+/// therefore holds back every later command, parallel ones included, until it
+/// exits or is cancelled.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionCommandMode {
+    /// Runs in the session's Bash shell, one at a time, so `cd`, `export`, and
+    /// shell variables persist. Reads stdin from the session terminal.
     #[default]
     Stateful,
+    /// Runs in its own child shell, starting from the directory and exported
+    /// variables left by the last stateful command before it. Overlaps other
+    /// commands, does not wait for earlier parallel commands, cannot change
+    /// the session shell, and gets empty stdin.
     Parallel,
 }
 

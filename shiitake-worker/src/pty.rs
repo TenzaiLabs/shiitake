@@ -74,10 +74,12 @@ impl PtySession {
         {
             cmd.env("HOME", home);
         }
-        // SAFETY: only async-signal-safe syscalls run before exec — setsid, a
-        // TIOCSCTTY ioctl, and the same setgid/setgroups/setuid `exec` uses.
+        // SAFETY: only async-signal-safe syscalls run before exec — sigaction,
+        // setsid, a TIOCSCTTY ioctl, and the same setgid/setgroups/setuid
+        // `exec` uses.
         unsafe {
             cmd.pre_exec(move || {
+                crate::exec::reset_signal_dispositions()?;
                 setsid().map_err(io_err)?;
                 // fd 0 is the pty slave (stdin, above); make it the controlling
                 // terminal so job control and terminal signals work.

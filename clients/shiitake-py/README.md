@@ -27,9 +27,15 @@ asyncio.run(main())
 ```
 
 `stateful` is the default command mode: it executes in the live Bash shell,
-retaining `cd`, exports, and shell variables. These commands run in order.
-`parallel` commands run concurrently in child shells with the current directory
-and exported environment. The caller manages permissions on any shared folder.
+one at a time, retaining `cd`, exports, and shell variables. `parallel`
+commands run in child shells that overlap other commands and get empty stdin.
+Commands start in submission order: each waits until every stateful command
+submitted before it has finished, then a parallel command starts from the
+directory and exported variables that command left. While waiting, a command
+reports `running`. A stateful command that never finishes (a foreground
+server, `cat`, a prompt) holds back every later command, parallel ones
+included, until it exits or is killed, so start long-lived processes with
+`mode="parallel"`. The caller manages permissions on any shared folder.
 The worker clears its environment at session creation, so supply `PATH` for
 external programs.
 

@@ -78,6 +78,7 @@ pub async fn run(
     }
     unsafe {
         cmd.pre_exec(move || {
+            reset_signal_dispositions()?;
             // Own process group so cancellation can signal the whole tree.
             setsid().map_err(io_err)?;
             if let Some(d) = drop_to.as_ref() {
@@ -246,6 +247,20 @@ pub(crate) fn apply_drop_to(d: &DropTo) -> std::io::Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn apply_drop_to(_d: &DropTo) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Restore default signal dispositions in a child before exec. Ignored
+/// dispositions survive exec, so a worker started with SIGINT ignored (e.g. by
+/// `nohup worker &`) would otherwise make every command ignore interrupts.
+/// The standard library already clears the signal mask.
+pub(crate) fn reset_signal_dispositions() -> std::io::Result<()> {
+    use nix::sys::signal::{SigHandler, signal};
+
+    for sig in Signal::iterator().filter(|s| !matches!(s, Signal::SIGKILL | Signal::SIGSTOP)) {
+        // SAFETY: sigaction is async-signal-safe, and SIG_DFL installs no handler.
+        unsafe { signal(sig, SigHandler::SigDfl) }.map_err(io_err)?;
+    }
     Ok(())
 }
 
