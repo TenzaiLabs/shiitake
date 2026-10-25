@@ -95,7 +95,9 @@ impl PtySession {
         drop(slave); // the child holds its own dups of the slave
 
         set_nonblocking(master.as_raw_fd()).context("set master non-blocking")?;
-        let master = AsyncFd::new(master).context("register master with tokio")?;
+        // SAFETY: OwnedFd keeps this open and its raw fd stable for the entire
+        // lifetime of AsyncFd; no code replaces or closes it behind AsyncFd.
+        let master = unsafe { AsyncFd::register(master) }.context("register master with tokio")?;
         let session = Self { child, master };
         // Best-effort initial size; the client resends on connect anyway.
         let _ = session.resize(open.cols, open.rows);

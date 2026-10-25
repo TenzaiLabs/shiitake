@@ -2,7 +2,7 @@
 # The Rust toolchain is pinned separately in rust-toolchain.toml.
 [tools]
 k3d = "5.9.0"
-kubectl = "1.36.1"
-helm = "3.19.5"
-python = "3.14"
-uv = "0.11.7"
+kubectl = "1.37.1"
+helm = "4.3.1"
+python = "3.15.1"
+uv = "0.13.5"
