@@ -153,7 +153,8 @@ server and the new server permanently unready.
 - The worker clears its dumpable flag so commands, root included, cannot read
   its environment or memory without `CAP_SYS_PTRACE`; never grant that
   capability to worker containers. Children reset every signal disposition to
-  default before exec, so an inherited ignored SIGINT cannot break cancel.
+  default and clear the signal mask before exec (`Command` does neither), so
+  an inherited ignored or blocked SIGINT/SIGTERM cannot break cancel.
   Production uses
   `SHIITAKE_PROFILE_TOKENS` to bind additional profiles to distinct tokens;
   the server rejects a Hello that claims another profile. Keep that mapping

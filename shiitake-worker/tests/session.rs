@@ -4,7 +4,7 @@ use axum::{
     routing::get,
 };
 use futures_util::StreamExt;
-use nix::sys::signal::{SigHandler, Signal, signal};
+use nix::sys::signal::{SigHandler, SigSet, SigmaskHow, Signal, signal, sigprocmask};
 use shiitake_worker_api::{
     ExecId, ExecuteFrame, Frame, OutputChunk, OutputStream, ResultFrame, SessionCommandMode,
     SessionId, SessionOpenFrame,
@@ -504,14 +504,19 @@ async fn parallel_job_waits_for_an_earlier_stateful_job_and_inherits_its_state()
 }
 
 #[tokio::test]
-async fn cancel_interrupts_a_stateful_job_when_the_worker_inherits_ignored_signals() {
+async fn cancel_works_when_the_worker_inherits_ignored_or_blocked_signals() {
     // `nohup worker &` from a non-interactive shell starts the worker with
-    // these signals ignored, and exec preserves ignored dispositions.
+    // these signals ignored. Exec preserves ignored dispositions and the
+    // blocked mask, so a launcher can also leave signals blocked.
     let mut worker = start_session(|command| unsafe {
         command.pre_exec(|| {
             for sig in [Signal::SIGINT, Signal::SIGQUIT, Signal::SIGHUP] {
                 signal(sig, SigHandler::SigIgn)?;
             }
+            let mut blocked = SigSet::empty();
+            blocked.add(Signal::SIGINT);
+            blocked.add(Signal::SIGTERM);
+            sigprocmask(SigmaskHow::SIG_BLOCK, Some(&blocked), None)?;
             Ok(())
         });
     })
@@ -553,6 +558,25 @@ async fn cancel_interrupts_a_stateful_job_when_the_worker_inherits_ignored_signa
     .await;
     let (after, _) = result_of(&mut worker.ws, "after").await.unwrap();
     assert_eq!(after.exit_code, Some(0));
+    submit(
+        &mut worker.ws,
+        "background",
+        SessionCommandMode::Parallel,
+        "sleep 30",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    send(
+        &mut worker.ws,
+        Frame::Cancel {
+            request_id: ExecId::new("background"),
+        },
+    )
+    .await;
+    let (background, _) = result_of(&mut worker.ws, "background").await.unwrap();
+    assert!(background.cancelled);
+    // SIGTERM ends it; a blocked SIGTERM would leave it for the SIGKILL fallback.
+    assert_eq!(background.exit_signal, Some(Signal::SIGTERM as i32));
 }
 
 #[tokio::test]

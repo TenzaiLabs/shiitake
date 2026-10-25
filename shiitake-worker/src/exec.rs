@@ -78,7 +78,7 @@ pub async fn run(
     }
     unsafe {
         cmd.pre_exec(move || {
-            reset_signal_dispositions()?;
+            reset_signal_state()?;
             // Own process group so cancellation can signal the whole tree.
             setsid().map_err(io_err)?;
             if let Some(d) = drop_to.as_ref() {
@@ -250,18 +250,18 @@ pub(crate) fn apply_drop_to(_d: &DropTo) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Restore default signal dispositions in a child before exec. Ignored
-/// dispositions survive exec, so a worker started with SIGINT ignored (e.g. by
-/// `nohup worker &`) would otherwise make every command ignore interrupts.
-/// The standard library already clears the signal mask.
-pub(crate) fn reset_signal_dispositions() -> std::io::Result<()> {
-    use nix::sys::signal::{SigHandler, signal};
+/// Restore default signal dispositions and an empty signal mask in a child
+/// before exec. Both survive exec, and `Command` resets neither, so a worker
+/// started with SIGINT ignored (e.g. by `nohup worker &`) or blocked would
+/// otherwise make every command deaf to interrupts and cancellation.
+pub(crate) fn reset_signal_state() -> std::io::Result<()> {
+    use nix::sys::signal::{SigHandler, SigSet, SigmaskHow, signal, sigprocmask};
 
     for sig in Signal::iterator().filter(|s| !matches!(s, Signal::SIGKILL | Signal::SIGSTOP)) {
         // SAFETY: sigaction is async-signal-safe, and SIG_DFL installs no handler.
         unsafe { signal(sig, SigHandler::SigDfl) }.map_err(io_err)?;
     }
-    Ok(())
+    sigprocmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None).map_err(io_err)
 }
 
 pub(crate) fn io_err(e: nix::errno::Errno) -> std::io::Error {
