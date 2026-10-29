@@ -303,6 +303,18 @@ class AsyncSession:
     async def spawn(
         self, command: str, *, mode: CommandMode = "stateful",
     ) -> AsyncHandle:
+        """Submit a command and return its handle without waiting.
+
+        Commands start in submission order: each waits until every stateful
+        command submitted before it has finished, and reports ``running`` while
+        it waits. ``stateful`` runs in the session shell one at a time, so
+        ``cd`` and ``export`` persist. ``parallel`` runs in a child shell from
+        the directory and exported variables the last earlier stateful command
+        left, overlaps other commands, and gets empty stdin. A stateful command
+        that never finishes (a foreground server, ``cat``, a prompt) holds back
+        every later command until it exits or is killed, so start long-lived
+        processes in ``parallel`` mode.
+        """
         body = {"command": command, "mode": mode}
         resp = await self._client._request(
             "POST", self._client._url(f"/sessions/{self.session_id}/commands"),
@@ -655,6 +667,13 @@ class Session:
         )
 
     def spawn(self, command: str, *, mode: CommandMode = "stateful") -> Handle:
+        """Submit a command and return its handle without waiting.
+
+        Ordering matches ``AsyncSession.spawn``: each command waits for every
+        earlier stateful command, ``parallel`` commands overlap and get empty
+        stdin, and a stateful command that never finishes holds back every
+        later command until it exits or is killed.
+        """
         base = self._client._url(f"/sessions/{self.session_id}/commands")
         resp = self._client._http.post(
             base, headers=self._client._headers(),

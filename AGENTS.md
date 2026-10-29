@@ -54,9 +54,13 @@ that server can parse the compatibility error; normal v3 results omit it.
 
 At creation a session fixes its profile, working directory, environment,
 `DropTo`, and terminal size. Stateful commands source a script in the live
-Bash process: shell state persists, and these jobs run in order. Parallel jobs
-run in child Bash processes and may overlap; they inherit the last recorded
-working directory and exported environment, but do not change parent state.
+Bash process: shell state persists, and these jobs run one at a time. Parallel
+jobs run in child Bash processes and overlap; they do not change parent state.
+Jobs start in submission order: each waits for every earlier stateful job, so a
+parallel job inherits the cwd and exported environment that job left. This
+causal ordering is deliberate (`cd` then a parallel job runs in the new dir);
+the cost is that a never-ending stateful job holds back every later job. Keep
+the rule documented in README, docs, and client docstrings when changing it.
 Stateful completion requires the shell's per-command PTY marker after `source`
 returns and a valid cwd/environment/status snapshot; the capture status file
 alone is writable by the session user and is never proof of completion.
@@ -146,7 +150,12 @@ server and the new server permanently unready.
 - In two-pod mode, each profile gets its own worker Deployment. A profile can
   omit application shared volumes. In single-pod mode profile containers
   still share the pod network namespace and service account boundary.
-- A root command can read its worker's dispatch credential. Production uses
+- The worker clears its dumpable flag so commands, root included, cannot read
+  its environment or memory without `CAP_SYS_PTRACE`; never grant that
+  capability to worker containers. Children reset every signal disposition to
+  default and clear the signal mask before exec (`Command` does neither), so
+  an inherited ignored or blocked SIGINT/SIGTERM cannot break cancel.
+  Production uses
   `SHIITAKE_PROFILE_TOKENS` to bind additional profiles to distinct tokens;
   the server rejects a Hello that claims another profile. Keep that mapping
   aligned with each worker Deployment. Workers within one profile still share

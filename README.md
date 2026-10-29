@@ -8,11 +8,12 @@ Workers connect to the server over an internal WebSocket and never bind an
 inbound port.
 
 A session can run several commands at once. **Stateful** commands run in the
-persistent Bash shell, so `cd`, `export`, and shell variables survive. They are
-serialized. **Parallel** commands run concurrently as child Bash processes,
-using the shell's latest working directory and exported environment snapshot.
-They cannot change the parent shell's state. Terminal attachment is optional
-and detachable; closing the terminal connection does not release the session.
+persistent Bash shell, one at a time, so `cd`, `export`, and shell variables
+survive. **Parallel** commands run as child Bash processes that overlap other
+commands and cannot change the shell's state. Commands start in submission
+order, and every command waits for the stateful commands submitted before it;
+see [Command ordering](#command-ordering). Terminal attachment is optional and
+detachable; closing the terminal connection does not release the session.
 
 Worker profiles let a deployment offer different container shapes. For example,
 a `default` profile can mount `/shared`, while an `isolated` profile has no
@@ -82,7 +83,32 @@ Session IDs have the form `s-` plus 16 lowercase letters or digits; command
 handles use `c-` plus the same short alphabet. Both are opaque random IDs.
 Commands accept a shell `command` string and `mode` (`stateful` by default or
 `parallel`). There is no command deadline: poll the handle, read output while
-it runs, or cancel it with `DELETE`. Identity is fixed for a
+it runs, or cancel it with `DELETE`.
+
+### Command ordering
+
+Commands in a session start in the order they are submitted:
+
+- A **stateful** command runs in the session shell. It starts once every
+  stateful command submitted before it has finished.
+- A **parallel** command runs in its own child shell. It also waits for every
+  stateful command submitted before it, then starts with the working directory
+  and exported variables that command left. It does not wait for earlier
+  parallel commands, and later commands do not wait for it. Its stdin is empty.
+- A command that is waiting to start reports status `running`. `DELETE` on it
+  cancels it before it starts.
+- A stateful command that does not finish, such as a foreground server, `cat`,
+  or a command waiting at a prompt, holds back **every** command submitted
+  after it, parallel ones included, until it exits or is cancelled. Start
+  long-lived processes with `"mode":"parallel"` or in the background
+  (`server > log 2>&1 &`), and answer prompts through the terminal.
+- At most 32 commands per session can be running or waiting. A submission
+  beyond that ends with status `error`.
+
+For example, submitting `cd /repo` (stateful) and then `make test` (parallel)
+without waiting runs `make test` in `/repo`, after the `cd` finishes.
+
+Identity is fixed for a
 session; callers cannot change it on a command. The worker clears its own
 environment before starting the shell, so include `PATH` for external programs.
 Release sessions explicitly. As a backstop for lost responses and abandoned
@@ -169,8 +195,10 @@ Per-command CPU and memory attribution is omitted for parallel jobs because
 they share a container cgroup.
 
 **Trust boundary:** separate worker pods can have separate mounts and network
-policy. A root shell in a worker container can read that container's dispatch
-credential. Bind each profile to a distinct token with
+policy. The worker process is not dumpable, so commands, root included, cannot
+read its dispatch credential from `/proc` or its memory unless the container
+has `CAP_SYS_PTRACE`; do not grant that capability. Bind each profile to a
+distinct token with
 `SHIITAKE_PROFILE_TOKENS`; the server checks that `Hello.profile` matches the
 credential used to connect. Commands in the same profile still share that
 profile's trust domain.
