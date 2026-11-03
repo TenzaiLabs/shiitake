@@ -30,7 +30,7 @@ use shiitake_worker_api::{
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::AsyncReadExt,
@@ -58,6 +58,40 @@ type Stream = SplitStream<Ws>;
 /// server doesn't spin the worker. The orchestrator's restart policy is the
 /// ultimate backstop if the worker process itself dies.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
+/// How long the dispatcher may be unreachable before a reconnect escalates from
+/// info to warning. A brief gap is routine (a rolling server restart, or the lag
+/// before this worker's own teardown signal arrives); only a sustained outage
+/// warns, and a planned teardown exits on its signal before reaching this.
+const WARN_AFTER: Duration = Duration::from_secs(30);
+
+/// Resolves when the process is asked to terminate (SIGTERM on pod teardown,
+/// SIGINT on local Ctrl-C). The worker treats either as a planned exit: it
+/// returns 0 and stops reconnecting, so the dispatch drop at teardown is expected.
+#[cfg(unix)]
+async fn shutdown_requested() {
+    use tokio::signal::unix::{SignalKind, signal};
+    async fn wait(kind: SignalKind, name: &str) {
+        match signal(kind) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                warn!("cannot install {name} handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+    tokio::select! {
+        _ = wait(SignalKind::terminate(), "SIGTERM") => {}
+        _ = wait(SignalKind::interrupt(), "SIGINT") => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_requested() {
+    let _ = tokio::signal::ctrl_c().await;
+}
 
 /// One served command's outcome on the live session.
 enum CmdOutcome {
@@ -215,8 +249,29 @@ pub async fn run(cfg: &ClientConfig) -> Result<()> {
     let reset_paths = cfg.scratch_paths();
     let location = cfg.location();
     let mut served: u64 = 0;
+    let shutdown = shutdown_requested();
+    tokio::pin!(shutdown);
+    // When the current outage began, so a brief gap stays quiet while a sustained
+    // one escalates; cleared on a successful handshake (see below).
+    let mut unreachable_since: Option<Instant> = None;
     loop {
-        match serve_session(cfg, location.clone(), &reset_paths, &mut served).await {
+        // Time an outage from the start of the failing attempt (a connect that
+        // hangs to its timeout included), not from when it gives up.
+        let attempt_start = Instant::now();
+        let mut connected = false;
+        let session = tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                info!("termination signal received; exiting");
+                return Ok(());
+            }
+            session = serve_session(cfg, location.clone(), &reset_paths, &mut served, &mut connected) => session,
+        };
+        // A completed handshake proves the dispatcher reachable, ending any outage.
+        if connected {
+            unreachable_since = None;
+        }
+        match session {
             Ok(SessionEnd::RestartQuotaReached) => {
                 info!(
                     served,
@@ -234,9 +289,32 @@ pub async fn run(cfg: &ClientConfig) -> Result<()> {
                 return Ok(());
             }
             Ok(SessionEnd::Closed) => info!("dispatch session ended; reconnecting"),
-            Err(e) => warn!("dispatch session error: {e:#}; reconnecting"),
+            Err(e) => {
+                // The dispatcher is unreachable; escalate to warn only once the
+                // outage passes WARN_AFTER. A session that had just been healthy
+                // times from now, not from this attempt's start, so a dropped
+                // healthy connection isn't counted as an already-long outage.
+                let started = if connected {
+                    Instant::now()
+                } else {
+                    attempt_start
+                };
+                let since = *unreachable_since.get_or_insert(started);
+                if since.elapsed() >= WARN_AFTER {
+                    warn!("dispatch session error: {e:#}; reconnecting");
+                } else {
+                    info!("dispatch session error: {e:#}; reconnecting");
+                }
+            }
         }
-        sleep(RECONNECT_DELAY).await;
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                info!("termination signal received; exiting");
+                return Ok(());
+            }
+            _ = sleep(RECONNECT_DELAY) => {}
+        }
     }
 }
 
@@ -246,6 +324,7 @@ async fn serve_session(
     location: Option<WorkerLocation>,
     reset_paths: &[PathBuf],
     served: &mut u64,
+    connected: &mut bool,
 ) -> Result<SessionEnd> {
     let ClientConfig {
         worker_id,
@@ -305,6 +384,8 @@ async fn serve_session(
                     Frame::HelloAck { protocol_version }
                         if protocol_version == shiitake_worker_api::PROTOCOL_VERSION =>
                     {
+                        // Signals the reconnect loop that the dispatcher is reachable.
+                        *connected = true;
                         return Ok(());
                     }
                     Frame::Execute(execute) => {
