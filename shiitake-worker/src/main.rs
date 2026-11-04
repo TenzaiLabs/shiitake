@@ -43,11 +43,13 @@ async fn main() {
     #[cfg(target_os = "linux")]
     nix::sys::prctl::set_dumpable(false).expect("clear the dumpable flag");
     let cfg = Config::parse();
-    // Always exit 0: whether the worker reaches its restart-after quota or a
-    // session errors out, a non-zero exit would make routine recycles look like
-    // crashes (CrashLoopBackOff). The orchestrator restarts it via the
-    // container restartPolicy; the command's own exit status rides the Result
-    // frame, never the worker process exit code.
+    // Always exit 0: whether the worker reaches its restart-after quota, a
+    // session errors out, or it catches a termination signal (SIGTERM on pod
+    // teardown), a non-zero exit would make routine recycles look like crashes
+    // (CrashLoopBackOff) and a planned teardown surface as an "Error" in the
+    // supervisor. The orchestrator restarts it via the container restartPolicy;
+    // the command's own exit status rides the Result frame, never the worker
+    // process exit code.
     if let Err(e) = run(&cfg.client).await {
         tracing::warn!("worker exited with error: {e:#}");
     }

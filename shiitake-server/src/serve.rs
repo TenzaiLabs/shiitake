@@ -1,4 +1,5 @@
-//! Bind public API + worker dispatch listeners and run them until SIGINT.
+//! Bind public API + worker dispatch listeners and run them until a termination
+//! signal (SIGTERM on a Kubernetes pod teardown, or SIGINT for a local Ctrl-C).
 //!
 //! Downstream embedders pass in their already-composed Router (which usually
 //! starts from `http::build_api_router` and adds their own routes) and the
@@ -32,9 +33,37 @@ pub async fn run(addrs: ListenAddrs, api: Router, dispatch: Router) -> Result<()
     tokio::select! {
         res = api_handle => res??,
         res = dispatch_handle => res??,
-        _ = tokio::signal::ctrl_c() => {
-            info!("SIGINT received; shutting down");
+        _ = shutdown_signal() => {
+            info!("termination signal received; shutting down");
         }
     }
     Ok(())
+}
+
+/// Resolves on SIGTERM (a Kubernetes pod teardown) or SIGINT (local Ctrl-C), so
+/// `main` can flush telemetry and exit 0 instead of being hard-killed. Trapping
+/// only SIGINT (the prior behaviour) meant every k8s teardown was a hard kill.
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    async fn wait(kind: SignalKind, name: &str) {
+        match signal(kind) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!("cannot install {name} handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+    tokio::select! {
+        _ = wait(SignalKind::terminate(), "SIGTERM") => {}
+        _ = wait(SignalKind::interrupt(), "SIGINT") => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
