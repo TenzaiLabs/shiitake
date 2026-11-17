@@ -1282,6 +1282,11 @@ fn give_to_session_user(path: &Path, execute: &ExecuteFrame) -> Result<()> {
 /// shell, so `cd` and `export` persist. Output is redirected to local files,
 /// tailed into the dispatch socket, and spooled by the server. The final
 /// status file is written only after the cwd and exported environment snapshot.
+///
+/// `__shiitake_finish` is also the next prompt's `PROMPT_COMMAND`: an interrupt
+/// returns Bash to the prompt without running the rest of the input line. INT
+/// stays untrapped so the interrupt ends the whole script; with a trap, Bash
+/// ends only the foreground job and runs the rest of a list.
 async fn prepare_stateful_job(execute: &ExecuteFrame, root: &Path) -> Result<(String, Vec<u8>)> {
     let dir = capture::handle_dir(root, &execute.request_id);
     tokio::fs::create_dir_all(&dir).await?;
@@ -1302,26 +1307,27 @@ async fn prepare_stateful_job(execute: &ExecuteFrame, root: &Path) -> Result<(St
     let marker = format!("\x1b]shiitake-complete:{nonce}\x07").into_bytes();
     let line = format!(
         "__shiitake_finish() {{ \
+         local __shiitake_rc=$?; \
+         PROMPT_COMMAND=${{PROMPT_COMMAND//__shiitake_finish;/}}; \
+         PROMPT_COMMAND=${{PROMPT_COMMAND//__shiitake_finish/}}; \
+         [[ -n ${{PROMPT_COMMAND[*]}} ]] || unset PROMPT_COMMAND; \
          printf '%s' \"$PWD\" > {}; \
          while IFS= read -r __shiitake_name; do \
          printf '%s=%s\\0' \"$__shiitake_name\" \"${{!__shiitake_name}}\"; \
          done < <(compgen -e) > {}; \
-         printf '%s' \"$1\" > {}; \
+         printf '%s' \"$__shiitake_rc\" > {}; \
+         printf '\\033]shiitake-complete:{}\\007'; \
          }}; \
-         __shiitake_interrupted=0; \
-         trap '__shiitake_interrupted=1; return 130' INT; \
-         source {} > {} 2> {}; __shiitake_rc=$?; \
+         PROMPT_COMMAND=\"__shiitake_finish${{PROMPT_COMMAND:+;$PROMPT_COMMAND}}\"; \
          trap - INT; \
-         if [[ \"$__shiitake_interrupted\" == 1 ]]; then __shiitake_rc=130; fi; \
-         __shiitake_finish \"$__shiitake_rc\"; \
-         printf '\\033]shiitake-complete:{}\\007'\n",
+         source {} > {} 2> {}; __shiitake_finish\n",
         shell_quote(&cwd),
         shell_quote(&env),
         shell_quote(&status),
+        nonce,
         shell_quote(&script),
         shell_quote(&stdout),
         shell_quote(&stderr),
-        nonce,
     );
     Ok((line, marker))
 }

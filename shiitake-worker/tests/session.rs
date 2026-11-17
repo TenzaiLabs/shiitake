@@ -504,6 +504,53 @@ async fn parallel_job_waits_for_an_earlier_stateful_job_and_inherits_its_state()
 }
 
 #[tokio::test]
+async fn cancel_stops_a_whole_compound_command_and_keeps_the_session() {
+    let mut worker = start_session(|_| {}).await;
+    // Bash abandons the rest of the input line when an interrupt breaks a loop.
+    submit(
+        &mut worker.ws,
+        "loop",
+        SessionCommandMode::Stateful,
+        "cd /; export KEPT=yes; for i in 1 2 3; do sleep 30; done",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    send(
+        &mut worker.ws,
+        Frame::Cancel {
+            request_id: ExecId::new("loop"),
+        },
+    )
+    .await;
+    let (looped, _) = result_of(&mut worker.ws, "loop").await.unwrap();
+    assert!(looped.cancelled);
+    assert_eq!(looped.error, None);
+    assert_eq!(looped.exit_code, Some(130));
+
+    // An interrupt that only ends the foreground job would run the rest of the list.
+    submit(
+        &mut worker.ws,
+        "list",
+        SessionCommandMode::Stateful,
+        "echo \"$KEPT $PWD\"; sleep 30; echo ran-after-cancel",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    send(
+        &mut worker.ws,
+        Frame::Cancel {
+            request_id: ExecId::new("list"),
+        },
+    )
+    .await;
+    let (list, stdout) = result_of(&mut worker.ws, "list").await.unwrap();
+    assert!(list.cancelled);
+    assert_eq!(list.error, None);
+    assert_eq!(list.exit_code, Some(130));
+    assert_eq!(String::from_utf8_lossy(&stdout), "yes /\n");
+}
+
+#[tokio::test]
 async fn cancel_works_when_the_worker_inherits_ignored_or_blocked_signals() {
     // `nohup worker &` from a non-interactive shell starts the worker with
     // these signals ignored. Exec preserves ignored dispositions and the

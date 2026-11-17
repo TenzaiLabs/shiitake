@@ -175,7 +175,7 @@ wheels = [
 
 [[package]]
 name = "shiitake-py"
-version = "0.5.1"
+version = "0.5.2"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
