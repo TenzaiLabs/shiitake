@@ -503,47 +503,46 @@ async fn parallel_job_waits_for_an_earlier_stateful_job_and_inherits_its_state()
     assert_eq!(String::from_utf8_lossy(&stdout), "yes /\n");
 }
 
-#[tokio::test]
-async fn cancel_stops_a_whole_compound_command_and_keeps_the_session() {
-    let mut worker = start_session(|_| {}).await;
-    // Bash abandons the rest of the input line when an interrupt breaks a loop.
-    submit(
-        &mut worker.ws,
-        "loop",
-        SessionCommandMode::Stateful,
-        "cd /; export KEPT=yes; for i in 1 2 3; do sleep 30; done",
-    )
-    .await;
+/// Cancels a stateful command once it is running and returns its result and stdout.
+async fn cancelled(ws: &mut WebSocket, request_id: &str, command: &str) -> (ResultFrame, Vec<u8>) {
+    submit(ws, request_id, SessionCommandMode::Stateful, command).await;
     tokio::time::sleep(Duration::from_millis(350)).await;
     send(
-        &mut worker.ws,
+        ws,
         Frame::Cancel {
-            request_id: ExecId::new("loop"),
+            request_id: ExecId::new(request_id),
         },
     )
     .await;
-    let (looped, _) = result_of(&mut worker.ws, "loop").await.unwrap();
-    assert!(looped.cancelled);
-    assert_eq!(looped.error, None);
-    assert_eq!(looped.exit_code, Some(130));
+    result_of(ws, request_id).await.unwrap()
+}
 
-    // An interrupt that only ends the foreground job would run the rest of the list.
-    submit(
+#[tokio::test]
+async fn cancel_stops_a_whole_stateful_command_and_keeps_the_session() {
+    let mut worker = start_session(|_| {}).await;
+    // An interrupt leaves Bash at the prompt without finishing the input line,
+    // whatever the command did to the prompt or the terminal's input.
+    for (request_id, command) in [
+        (
+            "loop",
+            "cd /; export KEPT=yes; for i in 1 2 3; do sleep 30; done",
+        ),
+        ("prompt-hook", "PROMPT_COMMAND=true; sleep 30"),
+        ("terminal-read", "read -r answer"),
+    ] {
+        let (result, _) = cancelled(&mut worker.ws, request_id, command).await;
+        assert!(result.cancelled, "{request_id}");
+        assert_eq!(result.error, None, "{request_id}");
+        assert_eq!(result.exit_code, Some(130), "{request_id}");
+    }
+
+    // An interrupt that only ended the foreground job would run the rest of the list.
+    let (list, stdout) = cancelled(
         &mut worker.ws,
         "list",
-        SessionCommandMode::Stateful,
         "echo \"$KEPT $PWD\"; sleep 30; echo ran-after-cancel",
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(350)).await;
-    send(
-        &mut worker.ws,
-        Frame::Cancel {
-            request_id: ExecId::new("list"),
-        },
-    )
-    .await;
-    let (list, stdout) = result_of(&mut worker.ws, "list").await.unwrap();
     assert!(list.cancelled);
     assert_eq!(list.error, None);
     assert_eq!(list.exit_code, Some(130));
