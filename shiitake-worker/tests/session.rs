@@ -550,6 +550,40 @@ async fn cancel_stops_a_whole_stateful_command_and_keeps_the_session() {
 }
 
 #[tokio::test]
+async fn stateful_command_completes_when_its_job_dies_from_sigint_without_a_cancel() {
+    let mut worker = start_session(|_| {}).await;
+    // Bash abandons the input line here too, and no cancel follows to finish it.
+    submit(
+        &mut worker.ws,
+        "self-interrupt",
+        SessionCommandMode::Stateful,
+        "export KEPT=yes; bash -c 'kill -INT $$'; echo ran-after-interrupt",
+    )
+    .await;
+    let (result, stdout) = timeout(
+        Duration::from_secs(5),
+        result_of(&mut worker.ws, "self-interrupt"),
+    )
+    .await
+    .expect("the command never reported completion")
+    .unwrap();
+    assert!(!result.cancelled);
+    assert_eq!(result.error, None);
+    assert_eq!(result.exit_code, Some(130));
+    assert_eq!(String::from_utf8_lossy(&stdout), "");
+
+    submit(
+        &mut worker.ws,
+        "after",
+        SessionCommandMode::Stateful,
+        "test \"$KEPT\" = yes",
+    )
+    .await;
+    let (after, _) = result_of(&mut worker.ws, "after").await.unwrap();
+    assert_eq!(after.exit_code, Some(0));
+}
+
+#[tokio::test]
 async fn cancel_works_when_the_worker_inherits_ignored_or_blocked_signals() {
     // `nohup worker &` from a non-interactive shell starts the worker with
     // these signals ignored. Exec preserves ignored dispositions and the

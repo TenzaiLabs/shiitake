@@ -64,13 +64,15 @@ the rule documented in README, docs, and client docstrings when changing it.
 Stateful completion requires the shell's per-command PTY marker after `source`
 returns and a valid cwd/environment/status snapshot; the capture status file
 alone is writable by the session user and is never proof of completion.
-An interrupt returns Bash to the prompt without running the rest of the input
-line, so a cancel types the completion call into the shell again shortly after
-the interrupt; the call is a no-op once it has run. It is typed after a pause
-because a command reading the terminal would consume it. The wrapper leaves INT
-untrapped: with a trap, Bash ends only the foreground job and keeps running the
-rest of a list. Do not depend on `PROMPT_COMMAND` or other shell settings a
-command can reassign.
+A foreground job that dies from SIGINT, cancelled or not, returns Bash to the
+prompt without running the rest of the input line. The completion call
+therefore has three callers, and is a no-op once it has run: the end of the
+line; the next prompt's `PROMPT_COMMAND`, which needs no cancel; and a cancel,
+which types the call shortly after the interrupt and so still works when the
+command reassigned `PROMPT_COMMAND`. It is typed after a pause because a command
+reading the terminal would consume it. Keep both fallbacks: each covers a case
+the other cannot. The wrapper leaves INT untrapped: with a trap, Bash ends only
+the foreground job and keeps running the rest of a list.
 A terminal attachment is detachable. It cannot overlap a stateful job, and at
 most one attachment is active at a time. Command strings use shell syntax.
 The worker clears the inherited environment; pass `PATH` for external tools.

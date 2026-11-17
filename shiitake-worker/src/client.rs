@@ -884,7 +884,8 @@ enum SessionEvent {
     Abort { request_id: ExecId },
 }
 
-/// Ends a stateful input line; a cancel types it again after the interrupt.
+/// Ends a stateful input line; a cancel types it again after the interrupt, in
+/// case the command reassigned the `PROMPT_COMMAND` that would have run it.
 const FINISH_CALL: &str = "__shiitake_finish\n";
 /// A command reading the terminal would consume a call typed together with the
 /// interrupt, so the interrupt gets this long to land first.
@@ -1293,11 +1294,14 @@ fn give_to_session_user(path: &Path, execute: &ExecuteFrame) -> Result<()> {
 /// tailed into the dispatch socket, and spooled by the server. The final
 /// status file is written only after the cwd and exported environment snapshot.
 ///
-/// An interrupt returns Bash to the prompt without running the rest of the
-/// input line, so a cancel types `FINISH_CALL` again; the nonce guard makes a
-/// repeated call a no-op. INT stays untrapped so the interrupt ends the whole
-/// script; with a trap, Bash ends only the foreground job and runs the rest of
-/// a list.
+/// A foreground job that dies from SIGINT returns Bash to the prompt without
+/// running the rest of the input line, so `__shiitake_finish` has three
+/// callers: the end of the line, the next prompt's `PROMPT_COMMAND` (fires
+/// with no cancel involved), and a cancel typing `FINISH_CALL` (still works
+/// when the command reassigned `PROMPT_COMMAND`). The nonce guard makes every
+/// call after the first a no-op. INT stays untrapped so the interrupt ends the
+/// whole script; with a trap, Bash ends only the foreground job and runs the
+/// rest of a list.
 async fn prepare_stateful_job(execute: &ExecuteFrame, root: &Path) -> Result<(String, Vec<u8>)> {
     let dir = capture::handle_dir(root, &execute.request_id);
     tokio::fs::create_dir_all(&dir).await?;
@@ -1320,6 +1324,11 @@ async fn prepare_stateful_job(execute: &ExecuteFrame, root: &Path) -> Result<(St
         "__shiitake_finish() {{ \
          local __shiitake_rc=$?; \
          [[ ${{__shiitake_done-}} != {nonce} ]] || return 0; \
+         if [[ -v PROMPT_COMMAND ]]; then \
+         PROMPT_COMMAND=${{PROMPT_COMMAND//__shiitake_finish;/}}; \
+         PROMPT_COMMAND=${{PROMPT_COMMAND//__shiitake_finish/}}; \
+         [[ -n ${{PROMPT_COMMAND[*]}} ]] || unset PROMPT_COMMAND; \
+         fi; \
          printf '%s' \"$PWD\" > {}; \
          while IFS= read -r __shiitake_name; do \
          printf '%s=%s\\0' \"$__shiitake_name\" \"${{!__shiitake_name}}\"; \
@@ -1328,6 +1337,7 @@ async fn prepare_stateful_job(execute: &ExecuteFrame, root: &Path) -> Result<(St
          __shiitake_done={nonce}; \
          printf '\\033]shiitake-complete:{nonce}\\007'; \
          }}; \
+         PROMPT_COMMAND=\"__shiitake_finish${{PROMPT_COMMAND:+;$PROMPT_COMMAND}}\"; \
          trap - INT; \
          source {} > {} 2> {}; {FINISH_CALL}",
         shell_quote(&cwd),
