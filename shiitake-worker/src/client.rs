@@ -880,8 +880,22 @@ enum SessionEvent {
     Output(ExecId, OutputStream, Vec<u8>),
     Result(ResultFrame),
     Interrupt,
+    Finish,
     Abort { request_id: ExecId },
 }
+
+/// Ends a stateful input line. Bash abandons the line when a foreground job
+/// dies from SIGINT, so the worker types the call again once the shell is back
+/// at its prompt with the job unfinished.
+const FINISH_CALL: &str = "__shiitake_finish\n";
+/// Backstop for a cancel when the prompt cannot be observed. A command reading
+/// the terminal would consume a call typed together with the interrupt, so the
+/// interrupt gets this long to land first.
+const FINISH_CALL_DELAY: Duration = Duration::from_millis(250);
+const PROMPT_CHECK_INTERVAL: Duration = Duration::from_millis(50);
+/// The shell is also at its prompt for a moment before it reads a submitted
+/// line; only a prompt held this long means the line was abandoned.
+const PROMPT_SETTLE: Duration = Duration::from_millis(200);
 
 /// The shell writes this private, per-command marker to its PTY only after the
 /// sourced script and state snapshot have finished. A status file alone is not
@@ -993,6 +1007,11 @@ async fn run_session(
     let mut deadline = std::pin::pin!(tokio::time::sleep(lease));
     let mut lost = false;
     let mut close_error = None;
+    let mut prompt_check = tokio::time::interval(PROMPT_CHECK_INTERVAL);
+    prompt_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut at_prompt_since = None;
+    // Whether `FINISH_CALL` is already in the terminal's input queue.
+    let mut finish_typed = false;
     loop {
         while stateful_running.is_none() && running.len() < 32 {
             let Some((mut execute, mode)) = queued.pop_front() else {
@@ -1018,6 +1037,8 @@ async fn run_session(
                             seen: false,
                         });
                         stateful_running = Some(rid.clone());
+                        at_prompt_since = None;
+                        finish_typed = false;
                         running.insert(rid, cancel_tx);
                         let tx = event_tx.clone();
                         let root = capture_root.to_path_buf();
@@ -1109,6 +1130,15 @@ async fn run_session(
                 }
                 SessionEvent::Interrupt => {
                     let _ = pty.write_input(b"\x03").await;
+                    // The terminal discards queued input on an interrupt.
+                    at_prompt_since = None;
+                    finish_typed = false;
+                }
+                SessionEvent::Finish => {
+                    if !finish_typed {
+                        finish_typed = true;
+                        let _ = pty.write_input(FINISH_CALL.as_bytes()).await;
+                    }
                 }
                 SessionEvent::Abort { request_id } => {
                     let _ = send_worker_frame(sink, &Frame::Result(ResultFrame {
@@ -1123,6 +1153,20 @@ async fn run_session(
                     break;
                 }
             },
+            _ = prompt_check.tick(), if stateful_running.is_some() => {
+                let unfinished = shell_completion.as_ref().is_some_and(|c| !c.seen);
+                if !unfinished || !pty.shell_at_prompt() {
+                    at_prompt_since = None;
+                } else if at_prompt_since
+                    .get_or_insert_with(tokio::time::Instant::now)
+                    .elapsed()
+                    >= PROMPT_SETTLE
+                    && !finish_typed
+                {
+                    finish_typed = true;
+                    let _ = pty.write_input(FINISH_CALL.as_bytes()).await;
+                }
+            }
             () = &mut deadline => {
                 warn!(%session_id, "server lease lapsed during session");
                 lost = true;
@@ -1282,6 +1326,14 @@ fn give_to_session_user(path: &Path, execute: &ExecuteFrame) -> Result<()> {
 /// shell, so `cd` and `export` persist. Output is redirected to local files,
 /// tailed into the dispatch socket, and spooled by the server. The final
 /// status file is written only after the cwd and exported environment snapshot.
+///
+/// A foreground job that dies from SIGINT, cancelled or not, returns Bash to
+/// the prompt without running the rest of the input line. The session loop
+/// then types `FINISH_CALL` itself; the nonce guard makes every call after the
+/// first a no-op. Nothing here hooks the prompt from inside the shell, because
+/// the command could undo that. INT stays untrapped so the interrupt ends the
+/// whole script; with a trap, Bash ends only the foreground job and runs the
+/// rest of a list.
 async fn prepare_stateful_job(execute: &ExecuteFrame, root: &Path) -> Result<(String, Vec<u8>)> {
     let dir = capture::handle_dir(root, &execute.request_id);
     tokio::fs::create_dir_all(&dir).await?;
@@ -1302,26 +1354,24 @@ async fn prepare_stateful_job(execute: &ExecuteFrame, root: &Path) -> Result<(St
     let marker = format!("\x1b]shiitake-complete:{nonce}\x07").into_bytes();
     let line = format!(
         "__shiitake_finish() {{ \
+         local __shiitake_rc=$?; \
+         [[ ${{__shiitake_done-}} != {nonce} ]] || return 0; \
          printf '%s' \"$PWD\" > {}; \
          while IFS= read -r __shiitake_name; do \
          printf '%s=%s\\0' \"$__shiitake_name\" \"${{!__shiitake_name}}\"; \
          done < <(compgen -e) > {}; \
-         printf '%s' \"$1\" > {}; \
+         printf '%s' \"$__shiitake_rc\" > {}; \
+         __shiitake_done={nonce}; \
+         printf '\\033]shiitake-complete:{nonce}\\007'; \
          }}; \
-         __shiitake_interrupted=0; \
-         trap '__shiitake_interrupted=1; return 130' INT; \
-         source {} > {} 2> {}; __shiitake_rc=$?; \
          trap - INT; \
-         if [[ \"$__shiitake_interrupted\" == 1 ]]; then __shiitake_rc=130; fi; \
-         __shiitake_finish \"$__shiitake_rc\"; \
-         printf '\\033]shiitake-complete:{}\\007'\n",
+         source {} > {} 2> {}; {FINISH_CALL}",
         shell_quote(&cwd),
         shell_quote(&env),
         shell_quote(&status),
         shell_quote(&script),
         shell_quote(&stdout),
         shell_quote(&stderr),
-        nonce,
     );
     Ok((line, marker))
 }
@@ -1367,6 +1417,7 @@ async fn watch_stateful_job(
     ));
     let status_path = capture::handle_dir(&root, &rid).join("status");
     let mut interrupted_at = None;
+    let mut finish_requested = false;
     let mut cancelled = false;
     let exit_code = loop {
         if *completed.borrow()
@@ -1379,6 +1430,13 @@ async fn watch_stateful_job(
             cancelled = true;
             interrupted_at = Some(tokio::time::Instant::now());
             if tx.send(SessionEvent::Interrupt).await.is_err() {
+                abandon_stateful_job(done_tx, out, err, &root, &rid).await;
+                return;
+            }
+        }
+        if !finish_requested && interrupted_at.is_some_and(|at| at.elapsed() > FINISH_CALL_DELAY) {
+            finish_requested = true;
+            if tx.send(SessionEvent::Finish).await.is_err() {
                 abandon_stateful_job(done_tx, out, err, &root, &rid).await;
                 return;
             }

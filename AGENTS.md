@@ -64,6 +64,19 @@ the rule documented in README, docs, and client docstrings when changing it.
 Stateful completion requires the shell's per-command PTY marker after `source`
 returns and a valid cwd/environment/status snapshot; the capture status file
 alone is writable by the session user and is never proof of completion.
+A foreground job that dies from SIGINT, cancelled or not, returns Bash to the
+prompt without running the rest of the input line. The worker then types the
+completion call itself, which is a no-op once it has run. It knows the shell is
+back at its prompt from the kernel: the shell holds the terminal's foreground
+process group and its line editor has taken the terminal out of canonical mode.
+Do not move this into the shell (`PROMPT_COMMAND`, `PS1`, a trap): the command
+runs in that shell and can undo it. A command that itself reads raw input in the
+shell (`read -e`, `read -n`) looks the same and receives the call as input. A
+cancel also types the call after a pause, as a backstop for a shell whose prompt
+cannot be observed (line editing off); the pause is there because a command
+reading the terminal would consume a call typed with the interrupt. The wrapper
+leaves INT untrapped: with a trap, Bash ends only the foreground job and keeps
+running the rest of a list.
 A terminal attachment is detachable. It cannot overlap a stateful job, and at
 most one attachment is active at a time. Command strings use shell syntax.
 The worker clears the inherited environment; pass `PATH` for external tools.

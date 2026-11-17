@@ -141,7 +141,10 @@ curl -fsS -X DELETE -H "Authorization: Bearer $SHIITAKE_AUTH_TOKEN" \
 
 Cancellation sends SIGTERM to a parallel command's process group, then
 SIGKILL after a two-second grace period. A stateful command receives an
-interrupt; if it does not stop, the worker closes that session. Status and
+interrupt that ends the whole command, including the rest of a loop or list,
+and leaves the session usable; if the command does not stop within two seconds,
+the worker closes that session. A stateful command also ends, with exit code
+130, when one of its foreground processes dies from SIGINT on its own. Status and
 output remain available through the handle until the server's retention period.
 
 Output is streamed from worker to server over the authenticated dispatch
