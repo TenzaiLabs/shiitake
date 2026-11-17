@@ -552,35 +552,54 @@ async fn cancel_stops_a_whole_stateful_command_and_keeps_the_session() {
 #[tokio::test]
 async fn stateful_command_completes_when_its_job_dies_from_sigint_without_a_cancel() {
     let mut worker = start_session(|_| {}).await;
-    // Bash abandons the input line here too, and no cancel follows to finish it.
-    submit(
-        &mut worker.ws,
-        "self-interrupt",
-        SessionCommandMode::Stateful,
-        "export KEPT=yes; bash -c 'kill -INT $$'; echo ran-after-interrupt",
-    )
-    .await;
-    let (result, stdout) = timeout(
-        Duration::from_secs(5),
-        result_of(&mut worker.ws, "self-interrupt"),
-    )
-    .await
-    .expect("the command never reported completion")
-    .unwrap();
-    assert!(!result.cancelled);
-    assert_eq!(result.error, None);
-    assert_eq!(result.exit_code, Some(130));
-    assert_eq!(String::from_utf8_lossy(&stdout), "");
+    // Bash abandons the input line here too, and no cancel follows to finish
+    // it. The command must not be able to switch that completion off.
+    for (request_id, command) in [
+        (
+            "self-interrupt",
+            "export KEPT=yes; bash -c 'kill -INT $$'; echo ran-after-interrupt",
+        ),
+        (
+            "prompt-hook-reassigned",
+            "PROMPT_COMMAND='history -a'; bash -c 'kill -INT $$'; echo ran-after-interrupt",
+        ),
+        (
+            "prompt-hook-unset",
+            "unset PROMPT_COMMAND; bash -c 'kill -INT $$'; echo ran-after-interrupt",
+        ),
+    ] {
+        submit(
+            &mut worker.ws,
+            request_id,
+            SessionCommandMode::Stateful,
+            command,
+        )
+        .await;
+        let (result, stdout) = timeout(
+            Duration::from_secs(5),
+            result_of(&mut worker.ws, request_id),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{request_id} never reported completion"))
+        .unwrap();
+        assert!(!result.cancelled, "{request_id}");
+        assert_eq!(result.error, None, "{request_id}");
+        assert_eq!(result.exit_code, Some(130), "{request_id}");
+        assert_eq!(String::from_utf8_lossy(&stdout), "", "{request_id}");
+    }
 
+    // A command that keeps the shell in the foreground without a job, here a
+    // terminal read that times out, is not at the prompt and gets no input.
     submit(
         &mut worker.ws,
         "after",
         SessionCommandMode::Stateful,
-        "test \"$KEPT\" = yes",
+        "read -t 0.7 answer; echo \"$KEPT [$answer]\"",
     )
     .await;
-    let (after, _) = result_of(&mut worker.ws, "after").await.unwrap();
+    let (after, stdout) = result_of(&mut worker.ws, "after").await.unwrap();
     assert_eq!(after.exit_code, Some(0));
+    assert_eq!(String::from_utf8_lossy(&stdout), "yes []\n");
 }
 
 #[tokio::test]

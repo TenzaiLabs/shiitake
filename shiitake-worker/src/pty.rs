@@ -162,6 +162,24 @@ impl PtySession {
         Ok(())
     }
 
+    /// Whether the shell is idle at its own prompt: it holds the terminal's
+    /// foreground process group and its line editor has taken the terminal out
+    /// of canonical mode. A shell running a job, a builtin, or a plain `read`
+    /// does not match. Read from the kernel, so a command cannot disable it the
+    /// way it can a hook inside the shell.
+    pub fn shell_at_prompt(&self) -> bool {
+        let Some(shell) = self.child.id() else {
+            return false;
+        };
+        let master = self.master.get_ref();
+        nix::unistd::tcgetpgrp(master).is_ok_and(|foreground| foreground.as_raw() as u32 == shell)
+            && nix::sys::termios::tcgetattr(master).is_ok_and(|termios| {
+                !termios
+                    .local_flags
+                    .contains(nix::sys::termios::LocalFlags::ICANON)
+            })
+    }
+
     /// Wait for the shell to exit.
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
         self.child.wait().await

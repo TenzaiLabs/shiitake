@@ -884,12 +884,18 @@ enum SessionEvent {
     Abort { request_id: ExecId },
 }
 
-/// Ends a stateful input line; a cancel types it again after the interrupt, in
-/// case the command reassigned the `PROMPT_COMMAND` that would have run it.
+/// Ends a stateful input line. Bash abandons the line when a foreground job
+/// dies from SIGINT, so the worker types the call again once the shell is back
+/// at its prompt with the job unfinished.
 const FINISH_CALL: &str = "__shiitake_finish\n";
-/// A command reading the terminal would consume a call typed together with the
-/// interrupt, so the interrupt gets this long to land first.
+/// Backstop for a cancel when the prompt cannot be observed. A command reading
+/// the terminal would consume a call typed together with the interrupt, so the
+/// interrupt gets this long to land first.
 const FINISH_CALL_DELAY: Duration = Duration::from_millis(250);
+const PROMPT_CHECK_INTERVAL: Duration = Duration::from_millis(50);
+/// The shell is also at its prompt for a moment before it reads a submitted
+/// line; only a prompt held this long means the line was abandoned.
+const PROMPT_SETTLE: Duration = Duration::from_millis(200);
 
 /// The shell writes this private, per-command marker to its PTY only after the
 /// sourced script and state snapshot have finished. A status file alone is not
@@ -1001,6 +1007,11 @@ async fn run_session(
     let mut deadline = std::pin::pin!(tokio::time::sleep(lease));
     let mut lost = false;
     let mut close_error = None;
+    let mut prompt_check = tokio::time::interval(PROMPT_CHECK_INTERVAL);
+    prompt_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut at_prompt_since = None;
+    // Whether `FINISH_CALL` is already in the terminal's input queue.
+    let mut finish_typed = false;
     loop {
         while stateful_running.is_none() && running.len() < 32 {
             let Some((mut execute, mode)) = queued.pop_front() else {
@@ -1026,6 +1037,8 @@ async fn run_session(
                             seen: false,
                         });
                         stateful_running = Some(rid.clone());
+                        at_prompt_since = None;
+                        finish_typed = false;
                         running.insert(rid, cancel_tx);
                         let tx = event_tx.clone();
                         let root = capture_root.to_path_buf();
@@ -1117,9 +1130,15 @@ async fn run_session(
                 }
                 SessionEvent::Interrupt => {
                     let _ = pty.write_input(b"\x03").await;
+                    // The terminal discards queued input on an interrupt.
+                    at_prompt_since = None;
+                    finish_typed = false;
                 }
                 SessionEvent::Finish => {
-                    let _ = pty.write_input(FINISH_CALL.as_bytes()).await;
+                    if !finish_typed {
+                        finish_typed = true;
+                        let _ = pty.write_input(FINISH_CALL.as_bytes()).await;
+                    }
                 }
                 SessionEvent::Abort { request_id } => {
                     let _ = send_worker_frame(sink, &Frame::Result(ResultFrame {
@@ -1134,6 +1153,20 @@ async fn run_session(
                     break;
                 }
             },
+            _ = prompt_check.tick(), if stateful_running.is_some() => {
+                let unfinished = shell_completion.as_ref().is_some_and(|c| !c.seen);
+                if !unfinished || !pty.shell_at_prompt() {
+                    at_prompt_since = None;
+                } else if at_prompt_since
+                    .get_or_insert_with(tokio::time::Instant::now)
+                    .elapsed()
+                    >= PROMPT_SETTLE
+                    && !finish_typed
+                {
+                    finish_typed = true;
+                    let _ = pty.write_input(FINISH_CALL.as_bytes()).await;
+                }
+            }
             () = &mut deadline => {
                 warn!(%session_id, "server lease lapsed during session");
                 lost = true;
@@ -1294,12 +1327,11 @@ fn give_to_session_user(path: &Path, execute: &ExecuteFrame) -> Result<()> {
 /// tailed into the dispatch socket, and spooled by the server. The final
 /// status file is written only after the cwd and exported environment snapshot.
 ///
-/// A foreground job that dies from SIGINT returns Bash to the prompt without
-/// running the rest of the input line, so `__shiitake_finish` has three
-/// callers: the end of the line, the next prompt's `PROMPT_COMMAND` (fires
-/// with no cancel involved), and a cancel typing `FINISH_CALL` (still works
-/// when the command reassigned `PROMPT_COMMAND`). The nonce guard makes every
-/// call after the first a no-op. INT stays untrapped so the interrupt ends the
+/// A foreground job that dies from SIGINT, cancelled or not, returns Bash to
+/// the prompt without running the rest of the input line. The session loop
+/// then types `FINISH_CALL` itself; the nonce guard makes every call after the
+/// first a no-op. Nothing here hooks the prompt from inside the shell, because
+/// the command could undo that. INT stays untrapped so the interrupt ends the
 /// whole script; with a trap, Bash ends only the foreground job and runs the
 /// rest of a list.
 async fn prepare_stateful_job(execute: &ExecuteFrame, root: &Path) -> Result<(String, Vec<u8>)> {
@@ -1324,11 +1356,6 @@ async fn prepare_stateful_job(execute: &ExecuteFrame, root: &Path) -> Result<(St
         "__shiitake_finish() {{ \
          local __shiitake_rc=$?; \
          [[ ${{__shiitake_done-}} != {nonce} ]] || return 0; \
-         if [[ -v PROMPT_COMMAND ]]; then \
-         PROMPT_COMMAND=${{PROMPT_COMMAND//__shiitake_finish;/}}; \
-         PROMPT_COMMAND=${{PROMPT_COMMAND//__shiitake_finish/}}; \
-         [[ -n ${{PROMPT_COMMAND[*]}} ]] || unset PROMPT_COMMAND; \
-         fi; \
          printf '%s' \"$PWD\" > {}; \
          while IFS= read -r __shiitake_name; do \
          printf '%s=%s\\0' \"$__shiitake_name\" \"${{!__shiitake_name}}\"; \
@@ -1337,7 +1364,6 @@ async fn prepare_stateful_job(execute: &ExecuteFrame, root: &Path) -> Result<(St
          __shiitake_done={nonce}; \
          printf '\\033]shiitake-complete:{nonce}\\007'; \
          }}; \
-         PROMPT_COMMAND=\"__shiitake_finish${{PROMPT_COMMAND:+;$PROMPT_COMMAND}}\"; \
          trap - INT; \
          source {} > {} 2> {}; {FINISH_CALL}",
         shell_quote(&cwd),
@@ -1391,7 +1417,7 @@ async fn watch_stateful_job(
     ));
     let status_path = capture::handle_dir(&root, &rid).join("status");
     let mut interrupted_at = None;
-    let mut finish_typed = false;
+    let mut finish_requested = false;
     let mut cancelled = false;
     let exit_code = loop {
         if *completed.borrow()
@@ -1408,8 +1434,8 @@ async fn watch_stateful_job(
                 return;
             }
         }
-        if !finish_typed && interrupted_at.is_some_and(|at| at.elapsed() > FINISH_CALL_DELAY) {
-            finish_typed = true;
+        if !finish_requested && interrupted_at.is_some_and(|at| at.elapsed() > FINISH_CALL_DELAY) {
+            finish_requested = true;
             if tx.send(SessionEvent::Finish).await.is_err() {
                 abandon_stateful_job(done_tx, out, err, &root, &rid).await;
                 return;
