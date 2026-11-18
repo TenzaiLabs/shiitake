@@ -25,7 +25,7 @@ RUN set -eux; \
 
 # The server makes outbound TLS calls to the Kubernetes API (container-OOM
 # detection) so it needs a CA bundle; it never executes user commands itself.
-FROM alpine:3.24@sha256:a2d49ea686c2adfe3c992e47dc3b5e7fa6e6b5055609400dc2acaeb241c829f4
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /out/shiitake-server /usr/local/bin/shiitake-server
 USER 65532:65532
