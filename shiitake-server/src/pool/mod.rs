@@ -170,6 +170,15 @@ enum OpenFailure {
 /// idle queue until the keepalive timeout evicts it.
 const PING_ANSWER_GRACE: Duration = Duration::from_secs(2);
 
+/// One step of the pool's session protocol, as a trace-level event. The step
+/// names are stable so a recorded run can be checked against a model of the
+/// protocol; nothing is emitted unless the target is enabled.
+macro_rules! protocol_step {
+    ($($field:tt)*) => {
+        tracing::trace!(target: "shiitake::protocol", $($field)*)
+    };
+}
+
 /// Workers one create may lose after sending them the session. Losing one
 /// costs up to the open timeout, so this also bounds how long a create runs.
 const SESSION_OPEN_ATTEMPTS: usize = 3;
@@ -200,6 +209,9 @@ struct WorkerLiveness {
     heard: Arc<Notify>,
     /// Distinguishes this connection from a later one under the same worker id.
     connection: u64,
+    /// Told to go, but its read loop has not dropped it yet. It can serve
+    /// nothing in that window, so it must not count as live or as busy.
+    evicting: bool,
 }
 
 impl WorkerLiveness {
@@ -208,9 +220,10 @@ impl WorkerLiveness {
             .is_none_or(|sent| now.duration_since(sent) < PING_ANSWER_GRACE)
     }
 
-    /// Heard from since registering, and not silent on a ping now.
+    /// Heard from since registering, not silent on a ping now, and not on
+    /// its way out.
     fn is_live(&self, now: Instant) -> bool {
-        self.answered && self.answers_pings(now)
+        self.answered && !self.evicting && self.answers_pings(now)
     }
 }
 
@@ -463,6 +476,8 @@ pub struct WorkerPool {
     session_open_timeout: Duration,
     probe_timeout: Duration,
     live_worker_wait: Duration,
+    /// Numbers session-create requests in protocol-step events.
+    requests: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl WorkerPool {
@@ -504,6 +519,7 @@ impl WorkerPool {
             session_open_timeout: Duration::from_secs(10),
             probe_timeout: Duration::from_secs(1),
             live_worker_wait: Duration::from_secs(10),
+            requests: Arc::default(),
         }
     }
 
@@ -710,11 +726,13 @@ impl WorkerPool {
         let give_up = started
             + self.live_worker_wait
             + self.session_open_timeout * SESSION_OPEN_ATTEMPTS as u32;
+        let request = self.next_request();
+        protocol_step!(step = "Begin", request, profile);
         let mut unresponsive = HashSet::new();
         let mut lost = 0;
         loop {
             let result = self
-                .try_create_session(profile.to_string(), open(), &unresponsive)
+                .try_create_session(profile.to_string(), open(), &unresponsive, request)
                 .await;
             match result {
                 // Nothing was sent to it, so trying the next worker is free.
@@ -734,9 +752,26 @@ impl WorkerPool {
                 Err(SessionError::NoLiveWorker) if started.elapsed() < self.live_worker_wait => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                result => return result,
+                result => {
+                    match &result {
+                        Err(SessionError::Busy) => {
+                            protocol_step!(step = "Answer", request, status = 429)
+                        }
+                        Err(SessionError::NoLiveWorker) => {
+                            protocol_step!(step = "Answer", request, status = 503)
+                        }
+                        _ => {}
+                    }
+                    return result;
+                }
             }
         }
+    }
+
+    fn next_request(&self) -> u64 {
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
     }
 
     /// One attempt on one worker.
@@ -745,7 +780,8 @@ impl WorkerPool {
         profile: String,
         open: SessionOpenFrame,
     ) -> Result<SessionSnapshot, SessionError> {
-        self.try_create_session(profile, open, &HashSet::new())
+        let request = self.next_request();
+        self.try_create_session(profile, open, &HashSet::new(), request)
             .await
     }
 
@@ -754,6 +790,7 @@ impl WorkerPool {
         profile: String,
         open: SessionOpenFrame,
         unresponsive: &HashSet<u64>,
+        request: u64,
     ) -> Result<SessionSnapshot, SessionError> {
         let id = open.session_id.clone();
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -767,7 +804,18 @@ impl WorkerPool {
                 });
             }
             if !s.idle.iter().any(|w| w.profile == profile) {
-                return Err(SessionError::Busy);
+                // Busy only if a worker that could serve is held by someone
+                // else; otherwise the profile simply has no live worker.
+                let now = Instant::now();
+                let held = s
+                    .liveness
+                    .values()
+                    .any(|w| w.profile == profile && w.is_live(now));
+                return Err(if held {
+                    SessionError::Busy
+                } else {
+                    SessionError::NoLiveWorker
+                });
             }
             // Oldest idle worker first, passing over one whose connection has
             // stopped answering pings unless nothing else is left, and never
@@ -817,6 +865,7 @@ impl WorkerPool {
             );
             (worker, connection, heard)
         };
+        protocol_step!(step = "Reserve", request, worker = %worker.worker_id);
         // Prove the connection carries traffic before committing a session to
         // it: a dead one would otherwise hold the caller for the open timeout.
         let answer = heard.notified();
@@ -841,8 +890,11 @@ impl WorkerPool {
             .await
             .is_err()
         {
-            return Err(self.release_unanswered(worker, &id, connection).await);
+            return Err(self
+                .release_unanswered(worker, &id, connection, request)
+                .await);
         }
+        protocol_step!(step = "ProbeAnswered", request, worker = %worker.worker_id);
         if let Err(e) = tokio::time::timeout(
             Duration::from_secs(10),
             send_frame(&worker.sink, &Frame::SessionOpen(open)),
@@ -856,7 +908,13 @@ impl WorkerPool {
             return Err(SessionError::WorkerLost("session open could not be sent"));
         }
         match tokio::time::timeout(self.session_open_timeout, ready_rx).await {
-            Ok(Ok(Ok(()))) => self.created_session_snapshot(&id).await,
+            Ok(Ok(Ok(()))) => {
+                let created = self.created_session_snapshot(&id).await;
+                if created.is_ok() {
+                    protocol_step!(step = "OpenAck", request, worker = %worker.worker_id);
+                }
+                created
+            }
             Ok(Ok(Err(OpenFailure::Refused(e)))) => Err(SessionError::Worker(e)),
             Ok(Ok(Err(OpenFailure::WorkerLost))) | Ok(Err(_)) => {
                 Err(SessionError::WorkerLost("worker disconnected during open"))
@@ -867,6 +925,7 @@ impl WorkerPool {
                     send_frame(&worker.sink, &Frame::SessionClose { session_id: id }),
                 )
                 .await;
+                protocol_step!(step = "OpenTimeout", request, worker = %worker.worker_id);
                 self.evict_worker(&worker.worker_id).await;
                 Err(SessionError::WorkerLost("session open timed out"))
             }
@@ -880,6 +939,7 @@ impl WorkerPool {
         worker: WorkerEntry,
         id: &SessionId,
         connection: u64,
+        request: u64,
     ) -> SessionError {
         let mut s = self.state.lock().await;
         let still_reserved = s.worker_sessions.get(&worker.worker_id) == Some(id)
@@ -891,14 +951,18 @@ impl WorkerPool {
         }
         s.worker_sessions.remove(&worker.worker_id);
         s.sessions.remove(id);
+        protocol_step!(step = "ProbeTimeout", request, worker = %worker.worker_id);
         s.idle.push_front(worker);
         SessionError::WorkerUnresponsive(connection)
     }
 
     async fn evict_worker(&self, id: &WorkerId) {
         let shutdown = {
-            let s = self.state.lock().await;
-            s.liveness.get(id).map(|l| l.shutdown.clone())
+            let mut s = self.state.lock().await;
+            s.liveness.get_mut(id).map(|l| {
+                l.evicting = true;
+                l.shutdown.clone()
+            })
         };
         if let Some(shutdown) = shutdown {
             shutdown.notify_one();
@@ -1521,9 +1585,15 @@ impl WorkerPool {
                     answered: false,
                     heard: Arc::new(Notify::new()),
                     connection,
+                    evicting: false,
                 },
             );
             info!(%worker_id, idle = s.idle.len(), "worker registered");
+            protocol_step!(
+                step = "RegisterAndRun",
+                worker = %worker_id,
+                profile = s.liveness[&worker_id].profile.as_str()
+            );
         }
         self.report_occupancy().await;
         // The worker counts as live once it answers this; see `is_live`.
@@ -1782,6 +1852,9 @@ impl WorkerPool {
         if let Some(l) = s.liveness.get_mut(worker_id) {
             l.last_seen = Instant::now();
             l.unanswered_ping = None;
+            if !l.answered {
+                protocol_step!(step = "TouchWorker", worker = %worker_id);
+            }
             l.answered = true;
             l.heard.notify_waiters();
         }
@@ -1943,11 +2016,11 @@ impl WorkerPool {
                     error: Some("worker disconnected".to_string()),
                 });
             }
-            (
-                s.liveness.remove(worker_id).and_then(|l| l.location),
-                closed,
-                terminal,
-            )
+            let registered = s.liveness.remove(worker_id);
+            if registered.is_some() {
+                protocol_step!(step = "Drop", worker = %worker_id);
+            }
+            (registered.and_then(|l| l.location), closed, terminal)
         };
         if let Some(tx) = terminal {
             tokio::spawn(async move {
