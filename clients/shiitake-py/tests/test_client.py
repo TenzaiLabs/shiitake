@@ -131,6 +131,16 @@ async def test_create_session_stops_waiting_for_a_live_worker_at_its_deadline() 
     await client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_create_session_asks_again_when_the_wait_is_shorter_than_the_poll() -> None:
+    handler, attempts = no_live_worker_then_session()
+    client = await with_mock(handler, live_worker_wait=0.05, live_worker_poll=30.0)
+    session = await client.create_session()
+    assert session.session_id == "s"
+    assert len(attempts) == 2
+    await client.aclose()
+
+
 def test_sync_create_session_waits_for_a_live_worker_when_asked_to() -> None:
     handler, attempts = no_live_worker_then_session()
     client = ShiitakeClient("http://srv", live_worker_wait=5.0, live_worker_poll=0.0)

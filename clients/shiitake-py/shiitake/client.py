@@ -205,9 +205,13 @@ class _Base:
     def _url(self, path: str) -> str:
         return f"{self._base_url}{self._api_prefix}{path}"
 
-    def _keeps_waiting_for_a_live_worker(self, status: int, deadline: float) -> bool:
-        """Whether a create answered `status` is asked again before `deadline`."""
-        return status == 503 and time.monotonic() + self._live_worker_poll < deadline
+    def _live_worker_pause(self, status: int, deadline: float) -> float | None:
+        """How long to pause before repeating a create answered `status`, or
+        None once it is not a 503 or `deadline` has passed."""
+        remaining = deadline - time.monotonic()
+        if status != 503 or remaining <= 0:
+            return None
+        return min(self._live_worker_poll, remaining)
 
     def _backoff(self, attempt: int) -> float:
         base = min(self._retry_initial * (2**attempt), self._retry_max)
@@ -479,9 +483,10 @@ class AsyncShiitakeClient(_Base):
                 "POST", self._url("/sessions"), json=body,
                 retry_on_429=wait_for_worker, retry_transport=False,
             )
-            if not self._keeps_waiting_for_a_live_worker(resp.status_code, deadline):
+            pause = self._live_worker_pause(resp.status_code, deadline)
+            if pause is None:
                 break
-            await asyncio.sleep(self._live_worker_poll)
+            await asyncio.sleep(pause)
         _raise_for_create(resp)
         return AsyncSession(self, SessionResponse(**resp.json()))
 
@@ -626,9 +631,10 @@ class ShiitakeClient(_Base):
         deadline = time.monotonic() + self._live_worker_wait
         while True:
             resp = self._http.post(self._url("/sessions"), headers=self._headers(), json=body)
-            if not self._keeps_waiting_for_a_live_worker(resp.status_code, deadline):
+            pause = self._live_worker_pause(resp.status_code, deadline)
+            if pause is None:
                 break
-            time.sleep(self._live_worker_poll)
+            time.sleep(pause)
         _raise_for_create(resp)
         return Session(self, SessionResponse(**resp.json()))
 
