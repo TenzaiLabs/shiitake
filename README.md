@@ -31,7 +31,7 @@ protected by `SHIITAKE_DISPATCH_TOKEN`.
 | Method | Path | What it does |
 | --- | --- | --- |
 | `GET` | `/profiles` | Connected profiles and their idle/allocated worker counts. |
-| `POST` | `/sessions` | Allocate a worker and start its shell. Returns `201`, or `400` for invalid input, `404` for a profile with no dispatch credential, `429` when that profile has no idle worker (including before its workers register), and `502` if the worker fails during creation. A worker that is lost before it opens the session (it never acknowledges, or it drops) is removed and the request moves to another worker, three in all, before `502`. |
+| `POST` | `/sessions` | Allocate a worker and start its shell. Returns `201`, or `400` for invalid input, `404` for a profile with no dispatch credential, `429` when every worker of the profile is busy, `503` when the profile has no live worker (none registered yet, or none that answers a ping), and `502` if the worker fails during creation. The server pings a worker before giving it the session and moves past one that does not answer. It waits up to ten seconds for a live worker before `503`, and replaces a worker lost after it was given the session, three in all, before `502`. |
 | `GET` | `/sessions/{id}` | Session state and assigned worker. |
 | `DELETE` | `/sessions/{id}` | Close the shell, cancel its jobs, reset the worker, and release it. |
 | `POST` | `/sessions/{id}/commands` | Submit a stateful or parallel command; returns a handle (`202`). |
@@ -190,8 +190,9 @@ The Kubernetes container restart policy can bound state that reset cannot
 clean. Set scratch paths to exclude data that must persist between sessions.
 
 `/health` stays healthy while the server serves requests. `/ready` becomes
-ready once the configured number of default-profile workers have registered,
-whether idle or allocated; workers of additional profiles do not count. The server probes Kubernetes for `OOMKilled` when a worker drops;
+ready once the configured number of default-profile workers are live, whether
+idle or allocated: each has answered a ping since it registered and is not
+silent on one now. Workers of additional profiles do not count. The server probes Kubernetes for `OOMKilled` when a worker drops;
 the worker cannot reliably report a container OOM itself. The server exports
 OpenTelemetry traces and metrics when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 Per-command CPU and memory attribution is omitted for parallel jobs because

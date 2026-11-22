@@ -66,8 +66,8 @@ struct Config {
     max_body_bytes: usize,
     #[arg(long, env = "SHIITAKE_CAPTURE_ROOT", default_value = "/capture")]
     capture_root: PathBuf,
-    /// Registered default-profile workers the pool needs before `/ready`
-    /// reports ready.
+    /// Live default-profile workers the pool needs before `/ready` reports
+    /// ready.
     #[arg(long, env = "SHIITAKE_MIN_READY_WORKERS", default_value_t = 1)]
     min_ready_workers: usize,
     /// Terminal client ping interval (and legacy `/pty` worker keepalive).

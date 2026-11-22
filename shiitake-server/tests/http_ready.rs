@@ -4,7 +4,7 @@
 //! so the endpoint is exercised across the whole registration lifecycle —
 //! empty pool, worker registered, worker gone.
 
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use shiitake_server::{
     http::{AppState, build_api_router, build_dispatch_router_with_profiles},
     pool::WorkerPool,
@@ -31,9 +31,11 @@ const TOKEN: &str = "test-token";
 const DISPATCH_TOKEN: &str = "test-dispatch-token";
 const ROOT_DISPATCH_TOKEN: &str = "test-root-dispatch-token";
 
-/// A fake worker's end of the dispatch socket. Held by the test so the
-/// worker stays registered; dropping it deregisters the worker.
-type WorkerConn = WebSocketStream<MaybeTlsStream<TcpStream>>;
+/// A fake worker that keeps reading its dispatch socket, which is what answers
+/// the server's pings. Aborting the task hangs up and deregisters the worker.
+type WorkerConn = tokio::task::JoinHandle<()>;
+
+type WorkerSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// The probe pair as the orchestrator sees it: (status code, body).
 async fn probe(base: &str, path: &str) -> (reqwest::StatusCode, serde_json::Value) {
@@ -114,6 +116,12 @@ async fn connect_profile_worker(
     profile: &str,
     token: &str,
 ) -> WorkerConn {
+    let mut ws = connect_socket(dispatch_port, id, profile, token).await;
+    tokio::spawn(async move { while let Some(Ok(_)) = ws.next().await {} })
+}
+
+/// Registers and returns the socket unread, so nothing answers a ping.
+async fn connect_socket(dispatch_port: u16, id: &str, profile: &str, token: &str) -> WorkerSocket {
     let mut req = format!("ws://127.0.0.1:{dispatch_port}/dispatch")
         .into_client_request()
         .unwrap();
@@ -148,14 +156,14 @@ async fn ready_follows_the_pool_while_health_stays_up() {
     assert_eq!(status, reqwest::StatusCode::OK);
     assert_eq!(body["status"], "ok");
 
-    let mut ws = connect_worker(dispatch_port, "fake-0").await;
+    let ws = connect_worker(dispatch_port, "fake-0").await;
     let body = await_ready(&base, true).await;
     assert_eq!(body["workers_idle"], 1);
     let (status, _) = probe(&base, "/ready").await;
     assert_eq!(status, reqwest::StatusCode::OK);
 
     // Every worker dies: unready again, and still not a liveness failure.
-    ws.close(None).await.unwrap();
+    ws.abort();
     let body = await_ready(&base, false).await;
     assert_eq!(body["workers_idle"], 0);
     let (status, _) = probe(&base, "/health").await;
@@ -201,6 +209,29 @@ async fn workers_of_another_profile_do_not_make_the_server_ready() {
     assert_eq!(body["workers_idle"], 0);
 
     let _default = connect_worker(dispatch_port, "fake-0").await;
+    let body = await_ready(&base, true).await;
+    assert_eq!(body["workers_idle"], 1);
+}
+
+#[tokio::test]
+async fn a_worker_that_never_answers_does_not_make_the_server_ready() {
+    let (base, dispatch_port, _capture) = serve(1).await;
+
+    // Registered, but its connection carries nothing back: the shape of a
+    // dispatch connection that died right after the handshake.
+    let _silent = connect_socket(dispatch_port, "silent-0", "default", DISPATCH_TOKEN).await;
+    for _ in 0..100 {
+        if probe(&base, "/health").await.1["workers_idle"] == 1 {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    sleep(Duration::from_millis(200)).await;
+    let (status, body) = probe(&base, "/ready").await;
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["workers_idle"], 0);
+
+    let _live = connect_worker(dispatch_port, "fake-0").await;
     let body = await_ready(&base, true).await;
     assert_eq!(body["workers_idle"], 1);
 }

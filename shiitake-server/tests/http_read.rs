@@ -74,7 +74,9 @@ async fn reads_full_and_range_and_suffix() {
         ))
         .await
         .unwrap();
-        while let Some(Ok(Message::Text(t))) = ws.next().await {
+        while let Some(Ok(msg)) = ws.next().await {
+            // Keep reading past pings: the read is what sends the pong.
+            let Message::Text(t) = msg else { continue };
             match serde_json::from_str::<Frame>(&t).unwrap() {
                 Frame::SessionOpen(open) => {
                     ws.send(Message::Text(

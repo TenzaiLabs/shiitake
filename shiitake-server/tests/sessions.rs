@@ -705,20 +705,29 @@ async fn quitting_worker(port: u16, id: &'static str) {
     }
 }
 
+/// A default-profile worker that answers pings and nothing else: it never
+/// acknowledges a session, like a worker that hangs while starting the shell.
+async fn mute_worker(port: u16, id: &'static str) {
+    let mut ws = silent_worker_socket(port, id).await;
+    while let Some(Ok(_)) = ws.next().await {}
+}
+
+fn fast_pool(capture: &TempDir) -> WorkerPool {
+    WorkerPool::new(None, "server".into(), "test".into(), capture.path().into())
+        .with_probe_timeout(Duration::from_millis(100))
+        .with_session_open_timeout(Duration::from_millis(200))
+        .with_live_worker_wait(Duration::from_millis(300))
+}
+
 #[tokio::test]
-async fn configured_profile_without_workers_is_busy_not_unknown() {
+async fn configured_profile_without_workers_is_unavailable_not_unknown() {
     let capture = TempDir::new().unwrap();
-    let pool = Arc::new(WorkerPool::new(
-        None,
-        "server".into(),
-        "test".into(),
-        capture.path().into(),
-    ));
+    let pool = Arc::new(fast_pool(&capture));
     let (app, _port) = serve(pool, BTreeMap::from([("root".into(), "root-token".into())])).await;
 
     for configured in ["default", "root"] {
         let (status, _) = create_in(&app, configured).await;
-        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{configured}");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{configured}");
     }
     let (status, _) = create_in(&app, "unconfigured").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -756,28 +765,57 @@ async fn session_creation_passes_over_a_worker_that_stopped_answering_pings() {
 }
 
 #[tokio::test]
-async fn session_open_timeout_moves_the_request_to_another_worker() {
+async fn session_create_passes_over_a_worker_that_does_not_answer_its_ping() {
     let capture = TempDir::new().unwrap();
-    let pool = Arc::new(
-        WorkerPool::new(None, "server".into(), "test".into(), capture.path().into())
-            .with_session_open_timeout(Duration::from_millis(200)),
-    );
+    let pool = Arc::new(fast_pool(&capture));
     let (app, port) = serve(pool.clone(), BTreeMap::new()).await;
     let _silent = silent_worker(port, "silent-0").await;
     wait_for_idle(&pool, 1).await;
     tokio::spawn(fake_worker(port, "live-0", "default"));
     wait_for_idle(&pool, 2).await;
 
-    // No ping has gone out, so the silent worker is still picked first.
+    // The silent worker is the oldest and still within its grace, so it is
+    // picked first; its ping goes unanswered and the create moves on.
     let (status, body) = create_in(&app, "default").await;
     assert_eq!(status, StatusCode::CREATED);
     let session: SessionResponse = serde_json::from_slice(&body).unwrap();
     assert_eq!(session.worker_id.as_str(), "live-0");
+    // Nothing was sent to the silent worker, so it stays registered.
+    assert_eq!(pool.snapshot().await, (1, 1));
+}
+
+#[tokio::test]
+async fn a_pool_with_only_unresponsive_workers_is_unavailable() {
+    let capture = TempDir::new().unwrap();
+    let pool = Arc::new(fast_pool(&capture));
+    let (app, port) = serve(pool.clone(), BTreeMap::new()).await;
+    let _silent = silent_worker(port, "silent-0").await;
+    wait_for_idle(&pool, 1).await;
+
+    let (status, _) = create_in(&app, "default").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn a_create_waits_for_a_live_worker_to_arrive() {
+    let capture = TempDir::new().unwrap();
+    let pool = Arc::new(fast_pool(&capture).with_live_worker_wait(Duration::from_secs(5)));
+    let (app, port) = serve(pool.clone(), BTreeMap::new()).await;
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        fake_worker(port, "late-0", "default").await;
+    });
+
+    let (status, body) = create_in(&app, "default").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let session: SessionResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(session.worker_id.as_str(), "late-0");
 }
 
 /// The first seconds of a pool: workers register one by one, and a caller
-/// starts the moment `/ready` answers 200. Whatever the order, that caller's
-/// first default-profile session must open on a worker that can serve it.
+/// starts the moment `/ready` answers 200. Whatever the order, `/ready` must
+/// wait for a default-profile worker that answers, and that caller's first
+/// default-profile session must open on a worker that can serve it.
 #[tokio::test]
 async fn a_caller_that_starts_on_ready_gets_a_session_in_every_registration_order() {
     const ORDERS: [[&str; 3]; 6] = [
@@ -790,24 +828,21 @@ async fn a_caller_that_starts_on_ready_gets_a_session_in_every_registration_orde
     ];
     for order in ORDERS {
         let capture = TempDir::new().unwrap();
-        let pool = Arc::new(
-            WorkerPool::new(None, "server".into(), "test".into(), capture.path().into())
-                .with_session_open_timeout(Duration::from_millis(200)),
-        );
+        let pool = Arc::new(fast_pool(&capture));
         let (app, port) = serve(
             pool.clone(),
             BTreeMap::from([("root".into(), "root-token".into())]),
         )
         .await;
         let mut held = Vec::new();
-        let mut default_registered = false;
+        let mut live_registered = false;
         for (registered, worker) in order.into_iter().enumerate() {
             match worker {
                 "root" => drop(tokio::spawn(fake_worker(port, "root-0", "root"))),
                 "silent" => held.push(silent_worker(port, "silent-0").await),
                 _ => drop(tokio::spawn(fake_worker(port, "live-0", "default"))),
             }
-            default_registered |= worker != "root";
+            live_registered |= worker == "live";
             timeout(Duration::from_secs(3), async {
                 while pool.snapshot().await.0 != registered + 1 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -815,10 +850,12 @@ async fn a_caller_that_starts_on_ready_gets_a_session_in_every_registration_orde
             })
             .await
             .unwrap();
+            // Long enough for a live worker's answer to its registration ping.
+            tokio::time::sleep(Duration::from_millis(100)).await;
             let (status, _) = api_call(&app, Method::GET, "/api/v1/ready".into(), None).await;
             assert_eq!(
                 status == StatusCode::OK,
-                default_registered,
+                live_registered,
                 "{order:?} after {worker}"
             );
         }
@@ -832,13 +869,11 @@ async fn a_caller_that_starts_on_ready_gets_a_session_in_every_registration_orde
 #[tokio::test]
 async fn session_create_moves_past_two_lost_workers_to_a_healthy_one() {
     let capture = TempDir::new().unwrap();
-    let pool = Arc::new(
-        WorkerPool::new(None, "server".into(), "test".into(), capture.path().into())
-            .with_session_open_timeout(Duration::from_millis(200)),
-    );
+    let pool = Arc::new(fast_pool(&capture));
     let (app, port) = serve(pool.clone(), BTreeMap::new()).await;
-    // Oldest first: one never answers, the next hangs up when handed the session.
-    let _silent = silent_worker(port, "silent-0").await;
+    // Oldest first: both answer their ping, then one never acknowledges the
+    // session and the next hangs up when handed it.
+    tokio::spawn(mute_worker(port, "mute-0"));
     wait_for_idle(&pool, 1).await;
     tokio::spawn(quitting_worker(port, "quitter-0"));
     wait_for_idle(&pool, 2).await;

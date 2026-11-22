@@ -35,8 +35,8 @@ pub struct AppState {
     pub default_workdir: PathBuf,
     /// Maximum accepted request body size, in bytes.
     pub max_body_bytes: usize,
-    /// Registered default-profile workers (idle + in-flight) the pool needs
-    /// before `/ready` reports ready. `1` is the useful minimum; raise it to
+    /// Live default-profile workers (idle + in-flight) the pool needs before
+    /// `/ready` reports ready. `1` is the useful minimum; raise it to
     /// keep a large deployment out of rotation until some fraction of its pool
     /// is back.
     pub min_ready_workers: usize,

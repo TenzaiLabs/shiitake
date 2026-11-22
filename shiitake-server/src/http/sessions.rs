@@ -27,8 +27,6 @@ type HttpError = (StatusCode, String);
 const MAX_SESSION_ENV_ENTRIES: usize = 128;
 const MAX_SESSION_ENV_BYTES: usize = 64 * 1024;
 const MAX_SESSION_WORKDIR_BYTES: usize = 4096;
-/// Workers tried for one session before the caller is told the worker failed.
-const SESSION_OPEN_ATTEMPTS: usize = 3;
 
 fn validate_session_request(req: &CreateSessionRequest) -> Result<(), HttpError> {
     if req.profile.is_empty()
@@ -103,6 +101,9 @@ fn map_error(error: SessionError, action: &'static str) -> HttpError {
     let status = match error {
         SessionError::UnknownProfile | SessionError::NotFound => StatusCode::NOT_FOUND,
         SessionError::Busy => StatusCode::TOO_MANY_REQUESTS,
+        SessionError::NoLiveWorker | SessionError::WorkerUnresponsive(_) => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         SessionError::NotActive | SessionError::TerminalBusy => StatusCode::CONFLICT,
         SessionError::Worker(_) | SessionError::WorkerLost(_) => unreachable!(),
     };
@@ -139,31 +140,11 @@ pub async fn create(
         cols: req.cols,
         rows: req.rows,
     };
-    let mut attempt = 1;
-    let snap = loop {
-        let result = state
-            .pool
-            .create_session(
-                req.profile.clone(),
-                open(SessionId::new(new_public_id('s'))),
-            )
-            .await;
-        match result {
-            // A worker with a silently dead connection never acknowledges, and
-            // one can drop mid-open. The pool has dropped it and no shell is
-            // left running, so another worker gets the request, under a new id
-            // because the lost session's record remains.
-            Err(SessionError::WorkerLost(details)) if attempt < SESSION_OPEN_ATTEMPTS => {
-                tracing::warn!(
-                    details,
-                    attempt,
-                    "worker lost while opening a session; trying another"
-                );
-                attempt += 1;
-            }
-            result => break result.map_err(|e| map_error(e, "start session"))?,
-        }
-    };
+    let snap = state
+        .pool
+        .open_session(&req.profile, || open(SessionId::new(new_public_id('s'))))
+        .await
+        .map_err(|e| map_error(e, "start session"))?;
     Ok((StatusCode::CREATED, Json(response(snap))))
 }
 

@@ -163,21 +163,28 @@ server and the new server permanently unready.
   Sends to a client use the same deadline, so a client that stops reading
   cannot block terminal output forwarding and pin the worker either.
 - `/health` is liveness and stays healthy for an empty pool. `/ready` needs
-  `SHIITAKE_MIN_READY_WORKERS` registered default-profile workers, including
-  allocated ones. Other profiles do not count: a caller that starts on a root
-  worker alone has no default worker to use. A profile with a dispatch
-  credential and no registered worker answers session-create with 429, not
-  404, so callers that wait for a worker ride out a slow worker start.
+  `SHIITAKE_MIN_READY_WORKERS` live default-profile workers, including
+  allocated ones. Live means the worker has answered a ping since it
+  registered and is not silent on one now: the server pings each worker as it
+  registers, because a connection can die right after its handshake. Other
+  profiles do not count: a caller that starts on a root worker alone has no
+  default worker to use.
   The two-pod dispatch Service uses `publishNotReadyAddresses` so workers can
   register before the server becomes ready.
 - Worker ids must be unique. In a worker Deployment use pod name from the
   downward API; `Hello` location points the server OOM probe at the right pod.
 - The server pings idle and allocated workers and evicts silent connections.
-  A dispatch connection can die silently right after its handshake, so
-  session-create passes over an idle worker with a ping unanswered for two
-  seconds. A worker lost before it opens the session, by silence or by
-  dropping, is removed and the create moves to another worker under a new
-  session id, three workers in all.
+  A dispatch connection can die silently, so session-create never commits
+  to a worker blind. It reserves the oldest idle worker (passing over one
+  with a ping unanswered for two seconds), pings it, and sends the session
+  only after an answer. A worker that stays silent for a second goes back to
+  the queue, is skipped for the rest of that create, and is left to the
+  keepalive. A worker lost after the session was sent, by silence or by
+  dropping, is removed and the create moves on under a new session id, three
+  such losses in all. Status codes: 429 when every worker of the profile is
+  busy; 503 when none is live, after waiting up to ten seconds for one; 502
+  when the third worker is lost. A caller still has to retry 503 and 502:
+  the server cannot see a connection die between the ping and the session.
   A worker that loses its server mid-session kills work and exits for a fresh
   container; idle workers reconnect. The lease timeout catches partitions.
 - In two-pod mode, each profile gets its own worker Deployment. A profile can

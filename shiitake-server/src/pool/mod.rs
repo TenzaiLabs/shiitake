@@ -85,6 +85,8 @@ struct PoolState {
     pty_sessions: HashMap<WorkerId, mpsc::Sender<PtyEvent>>,
     sessions: HashMap<SessionId, SessionRecord>,
     worker_sessions: HashMap<WorkerId, SessionId>,
+    /// Connections accepted so far; the next one's id.
+    connections: u64,
 }
 
 struct SessionRecord {
@@ -144,6 +146,14 @@ pub enum SessionError {
     /// can open a new session on another worker.
     #[error("worker failed: {0}")]
     WorkerLost(&'static str),
+    /// The profile is configured, but none of its workers can take a session:
+    /// none has registered, or none that is idle answers a ping.
+    #[error("no live worker in profile")]
+    NoLiveWorker,
+    /// The reserved worker did not answer a ping, so nothing was sent to it.
+    /// It stays registered; the value names its connection.
+    #[error("no live worker in profile")]
+    WorkerUnresponsive(u64),
 }
 
 /// Why a reserved worker did not open its session.
@@ -159,6 +169,10 @@ enum OpenFailure {
 /// connection that has silently died would otherwise stay at the head of the
 /// idle queue until the keepalive timeout evicts it.
 const PING_ANSWER_GRACE: Duration = Duration::from_secs(2);
+
+/// Workers one create may lose after sending them the session. Losing one
+/// costs up to the open timeout, so this also bounds how long a create runs.
+const SESSION_OPEN_ATTEMPTS: usize = 3;
 
 /// Bounded backlog of pty output events per session. A slow client fills this,
 /// which blocks the worker's read loop, which stops draining the dispatch WS,
@@ -176,15 +190,27 @@ struct WorkerLiveness {
     /// disconnect to aim the OOM probe; see [`WorkerPool::worker_location`].
     location: Option<WorkerLocation>,
     profile: String,
-    /// When the oldest keepalive ping this worker has not answered was sent.
-    /// Any inbound frame clears it.
+    /// When the oldest ping this worker has not answered was sent. Any
+    /// inbound frame clears it.
     unanswered_ping: Option<Instant>,
+    /// Whether any frame has arrived since registration. A connection can die
+    /// right after its handshake, so registering alone proves nothing.
+    answered: bool,
+    /// Wakes a create waiting for this worker to answer its ping.
+    heard: Arc<Notify>,
+    /// Distinguishes this connection from a later one under the same worker id.
+    connection: u64,
 }
 
 impl WorkerLiveness {
     fn answers_pings(&self, now: Instant) -> bool {
         self.unanswered_ping
             .is_none_or(|sent| now.duration_since(sent) < PING_ANSWER_GRACE)
+    }
+
+    /// Heard from since registering, and not silent on a ping now.
+    fn is_live(&self, now: Instant) -> bool {
+        self.answered && self.answers_pings(now)
     }
 }
 
@@ -435,6 +461,8 @@ pub struct WorkerPool {
     /// registered yet. See [`WorkerPool::declare_profiles`].
     declared_profiles: Arc<std::sync::RwLock<BTreeSet<String>>>,
     session_open_timeout: Duration,
+    probe_timeout: Duration,
+    live_worker_wait: Duration,
 }
 
 impl WorkerPool {
@@ -465,6 +493,7 @@ impl WorkerPool {
                 pty_sessions: HashMap::new(),
                 sessions: HashMap::new(),
                 worker_sessions: HashMap::new(),
+                connections: 0,
             })),
             probe,
             pod_name,
@@ -473,12 +502,27 @@ impl WorkerPool {
             capture_dir,
             declared_profiles: Arc::default(),
             session_open_timeout: Duration::from_secs(10),
+            probe_timeout: Duration::from_secs(1),
+            live_worker_wait: Duration::from_secs(10),
         }
     }
 
     /// How long a reserved worker has to acknowledge a session open.
     pub fn with_session_open_timeout(mut self, timeout: Duration) -> Self {
         self.session_open_timeout = timeout;
+        self
+    }
+
+    /// How long a reserved worker has to answer the ping sent before its
+    /// session is.
+    pub fn with_probe_timeout(mut self, timeout: Duration) -> Self {
+        self.probe_timeout = timeout;
+        self
+    }
+
+    /// How long a create waits for a live worker when the profile has none.
+    pub fn with_live_worker_wait(mut self, wait: Duration) -> Self {
+        self.live_worker_wait = wait;
         self
     }
 
@@ -553,11 +597,19 @@ impl WorkerPool {
         (s.idle.len(), busy.len())
     }
 
-    /// Registered workers of one profile, for `/ready`: (idle, allocated).
-    pub async fn profile_snapshot(&self, profile: &str) -> (usize, usize) {
+    /// Live workers of one profile, for `/ready`: (idle, allocated). A worker
+    /// is live once it has answered since registering and is not silent on a
+    /// ping; one that only registered may have a dead connection.
+    pub async fn live_snapshot(&self, profile: &str) -> (usize, usize) {
         let s = self.state.lock().await;
-        let registered = s.liveness.values().filter(|w| w.profile == profile).count();
-        let idle = s.idle.iter().filter(|w| w.profile == profile).count();
+        let now = Instant::now();
+        let live = |id: &WorkerId| {
+            s.liveness
+                .get(id)
+                .is_some_and(|w| w.profile == profile && w.is_live(now))
+        };
+        let registered = s.liveness.keys().filter(|id| live(id)).count();
+        let idle = s.idle.iter().filter(|w| live(&w.worker_id)).count();
         (idle, registered.saturating_sub(idle))
     }
 
@@ -646,37 +698,101 @@ impl WorkerPool {
         })
     }
 
+    /// Open a session on a worker of `profile`, moving past workers that
+    /// cannot take it. `open` is called once per worker tried, because each
+    /// attempt needs its own session id.
+    pub async fn open_session(
+        &self,
+        profile: &str,
+        mut open: impl FnMut() -> SessionOpenFrame,
+    ) -> Result<SessionSnapshot, SessionError> {
+        let started = Instant::now();
+        let give_up = started
+            + self.live_worker_wait
+            + self.session_open_timeout * SESSION_OPEN_ATTEMPTS as u32;
+        let mut unresponsive = HashSet::new();
+        let mut lost = 0;
+        loop {
+            let result = self
+                .try_create_session(profile.to_string(), open(), &unresponsive)
+                .await;
+            match result {
+                // Nothing was sent to it, so trying the next worker is free.
+                Err(SessionError::WorkerUnresponsive(connection)) if Instant::now() < give_up => {
+                    unresponsive.insert(connection);
+                }
+                // The pool has dropped that worker and no shell is left
+                // running; the lost session's record keeps its id.
+                Err(SessionError::WorkerLost(details)) if lost + 1 < SESSION_OPEN_ATTEMPTS => {
+                    lost += 1;
+                    warn!(
+                        details,
+                        lost, "worker lost while opening a session; trying another"
+                    );
+                }
+                // A pool that is still starting: give its workers a moment.
+                Err(SessionError::NoLiveWorker) if started.elapsed() < self.live_worker_wait => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// One attempt on one worker.
     pub async fn create_session(
         &self,
         profile: String,
         open: SessionOpenFrame,
     ) -> Result<SessionSnapshot, SessionError> {
+        self.try_create_session(profile, open, &HashSet::new())
+            .await
+    }
+
+    async fn try_create_session(
+        &self,
+        profile: String,
+        open: SessionOpenFrame,
+        unresponsive: &HashSet<u64>,
+    ) -> Result<SessionSnapshot, SessionError> {
         let id = open.session_id.clone();
         let (ready_tx, ready_rx) = oneshot::channel();
-        let worker = {
+        let (worker, connection, heard) = {
             let mut s = self.state.lock().await;
             if !s.liveness.values().any(|w| w.profile == profile) {
                 return Err(if self.is_declared(&profile) {
-                    SessionError::Busy
+                    SessionError::NoLiveWorker
                 } else {
                     SessionError::UnknownProfile
                 });
             }
+            if !s.idle.iter().any(|w| w.profile == profile) {
+                return Err(SessionError::Busy);
+            }
             // Oldest idle worker first, passing over one whose connection has
-            // stopped answering pings unless nothing else is idle.
+            // stopped answering pings unless nothing else is left, and never
+            // one that already failed this create's ping.
             let now = Instant::now();
+            let usable = |w: &WorkerEntry, responsive: bool| {
+                w.profile == profile
+                    && s.liveness.get(&w.worker_id).is_some_and(|l| {
+                        !unresponsive.contains(&l.connection)
+                            && (!responsive || l.answers_pings(now))
+                    })
+            };
             let pos = s
                 .idle
                 .iter()
-                .position(|w| {
-                    w.profile == profile
-                        && s.liveness
-                            .get(&w.worker_id)
-                            .is_some_and(|l| l.answers_pings(now))
-                })
-                .or_else(|| s.idle.iter().position(|w| w.profile == profile))
-                .ok_or(SessionError::Busy)?;
+                .position(|w| usable(w, true))
+                .or_else(|| s.idle.iter().position(|w| usable(w, false)))
+                .ok_or(SessionError::NoLiveWorker)?;
             let worker = s.idle.remove(pos).expect("position came from idle");
+            let liveness = s
+                .liveness
+                .get_mut(&worker.worker_id)
+                .expect("an idle worker is registered");
+            liveness.unanswered_ping.get_or_insert(now);
+            let (connection, heard) = (liveness.connection, liveness.heard.clone());
             s.worker_sessions
                 .insert(worker.worker_id.clone(), id.clone());
             s.sessions.insert(
@@ -699,8 +815,34 @@ impl WorkerPool {
                     stateful_count: 0,
                 },
             );
-            worker
+            (worker, connection, heard)
         };
+        // Prove the connection carries traffic before committing a session to
+        // it: a dead one would otherwise hold the caller for the open timeout.
+        let answer = heard.notified();
+        tokio::pin!(answer);
+        answer.as_mut().enable();
+        let ping = async {
+            worker
+                .sink
+                .lock()
+                .await
+                .send(Message::Ping(Vec::new().into()))
+                .await
+        };
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(2), ping).await,
+            Ok(Ok(()))
+        ) {
+            self.handle_worker_drop(&worker.worker_id).await;
+            return Err(SessionError::WorkerLost("ping could not be sent"));
+        }
+        if tokio::time::timeout(self.probe_timeout, answer)
+            .await
+            .is_err()
+        {
+            return Err(self.release_unanswered(worker, &id, connection).await);
+        }
         if let Err(e) = tokio::time::timeout(
             Duration::from_secs(10),
             send_frame(&worker.sink, &Frame::SessionOpen(open)),
@@ -729,6 +871,28 @@ impl WorkerPool {
                 Err(SessionError::WorkerLost("session open timed out"))
             }
         }
+    }
+
+    /// Return a reserved worker that did not answer its ping to the head of
+    /// the idle queue. The keepalive decides whether to evict it.
+    async fn release_unanswered(
+        &self,
+        worker: WorkerEntry,
+        id: &SessionId,
+        connection: u64,
+    ) -> SessionError {
+        let mut s = self.state.lock().await;
+        let still_reserved = s.worker_sessions.get(&worker.worker_id) == Some(id)
+            && s.liveness
+                .get(&worker.worker_id)
+                .is_some_and(|l| l.connection == connection);
+        if !still_reserved {
+            return SessionError::WorkerLost("worker disconnected during open");
+        }
+        s.worker_sessions.remove(&worker.worker_id);
+        s.sessions.remove(id);
+        s.idle.push_front(worker);
+        SessionError::WorkerUnresponsive(connection)
     }
 
     async fn evict_worker(&self, id: &WorkerId) {
@@ -1333,6 +1497,7 @@ impl WorkerPool {
         mut stream: WorkerStream,
     ) -> Result<()> {
         let shutdown = Arc::new(Notify::new());
+        let sink: SharedSink = Arc::new(Mutex::new(sink));
         {
             let mut s = self.state.lock().await;
             if s.liveness.contains_key(&worker_id) {
@@ -1341,8 +1506,10 @@ impl WorkerPool {
             s.idle.push_back(WorkerEntry {
                 worker_id: worker_id.clone(),
                 profile: profile.clone(),
-                sink: Arc::new(Mutex::new(sink)),
+                sink: sink.clone(),
             });
+            s.connections += 1;
+            let connection = s.connections;
             s.liveness.insert(
                 worker_id.clone(),
                 WorkerLiveness {
@@ -1350,12 +1517,23 @@ impl WorkerPool {
                     shutdown: shutdown.clone(),
                     location,
                     profile,
-                    unanswered_ping: None,
+                    unanswered_ping: Some(Instant::now()),
+                    answered: false,
+                    heard: Arc::new(Notify::new()),
+                    connection,
                 },
             );
             info!(%worker_id, idle = s.idle.len(), "worker registered");
         }
         self.report_occupancy().await;
+        // The worker counts as live once it answers this; see `is_live`.
+        let ping = async {
+            sink.lock()
+                .await
+                .send(Message::Ping(Vec::new().into()))
+                .await
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(2), ping).await;
 
         loop {
             tokio::select! {
@@ -1604,6 +1782,8 @@ impl WorkerPool {
         if let Some(l) = s.liveness.get_mut(worker_id) {
             l.last_seen = Instant::now();
             l.unanswered_ping = None;
+            l.answered = true;
+            l.heard.notify_waiters();
         }
     }
 
