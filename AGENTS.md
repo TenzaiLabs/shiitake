@@ -109,9 +109,20 @@ SHIITAKE_E2E_TOPOLOGY=two-pod bash tests/setup.sh
 SHIITAKE_E2E_TOPOLOGY=two-pod bash tests/run.sh
 ```
 
-`mise install` provides k3d, kubectl, Helm, Python, and uv. Python test
-dependencies are pinned in `clients/shiitake-py/uv.lock`; use `uv lock --upgrade`
-from that directory when updating them. Rust is pinned in
+`mise install` provides k3d, kubectl, Helm, Python, and uv. The worker runs
+whichever `bash` is first on PATH and needs Bash 5.0 or newer. Cancel relies
+on the shell itself: when the foreground job of a sourced stateful script dies
+from SIGINT, Bash 5.0 stops the rest of the script, and Bash 4.1 reports the
+interrupt as a status above 128. An older Bash runs the remaining commands of
+a cancelled line and reports 0 or 1. The worker cannot do either from outside
+the shell, and a trap inside it can be undone by the command, so there is no
+compatibility path. macOS ships Bash 3.2: install a current one there (`brew
+install bash`). At startup the worker logs the Bash version it found
+(`session shell`), as a warning when it is older than 5.0. The worker session
+tests run it at warn level, so on an older Bash that warning prints above the
+two interrupt tests that fail.
+Python test dependencies are pinned in `clients/shiitake-py/uv.lock`; use
+`uv lock --upgrade` from that directory when updating them. Rust is pinned in
 `rust-toolchain.toml`; nightly rustfmt is used by CI for unstable import
 formatting options. `ci.yml` runs format, clippy, test, and version checks;
 `test.yml` runs both topology variants. The Cargo workspace and Python

@@ -222,6 +222,11 @@ SHIITAKE_E2E_TOPOLOGY=two-pod bash tests/setup.sh
 SHIITAKE_E2E_TOPOLOGY=two-pod bash tests/run.sh
 ```
 
+The worker runs whichever `bash` is first on `PATH` and needs Bash 5.0 or
+newer: an older Bash keeps running the rest of a cancelled command line and
+reports the wrong exit status. macOS ships Bash 3.2; install a current one with
+`brew install bash` before running the worker or its tests there.
+
 The cluster suite needs Docker, k3d, kubectl, Helm, Python, and uv. `mise
 install` provides the local tools; `rust-toolchain.toml` pins Rust. Releases
 keep the Cargo workspace and Python package versions in lockstep.

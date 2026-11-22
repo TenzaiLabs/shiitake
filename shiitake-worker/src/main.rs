@@ -33,6 +33,32 @@ struct Config {
     client: ClientConfig,
 }
 
+/// Record the Bash that sessions run in, the first on this process's PATH.
+/// Cancel needs Bash 5.0 or newer: an older one keeps running the rest of a
+/// cancelled command line and reports status 0 or 1 for it.
+async fn log_session_shell() {
+    let version = tokio::process::Command::new("bash")
+        .args(["-c", "printf %s \"$BASH_VERSION\""])
+        .output()
+        .await;
+    match version {
+        Ok(out) if out.status.success() => {
+            let bash = String::from_utf8_lossy(&out.stdout);
+            let major = bash.split('.').next().and_then(|m| m.parse::<u32>().ok());
+            if major.is_some_and(|major| major >= 5) {
+                tracing::info!(%bash, "session shell");
+            } else {
+                tracing::warn!(
+                    %bash,
+                    "session shell is older than Bash 5.0; a cancelled command line keeps running"
+                );
+            }
+        }
+        Ok(out) => tracing::warn!(status = %out.status, "could not read the session shell version"),
+        Err(e) => tracing::warn!("could not run bash to read the session shell version: {e}"),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -43,6 +69,7 @@ async fn main() {
     #[cfg(target_os = "linux")]
     nix::sys::prctl::set_dumpable(false).expect("clear the dumpable flag");
     let cfg = Config::parse();
+    log_session_shell().await;
     // Always exit 0: whether the worker reaches its restart-after quota, a
     // session errors out, or it catches a termination signal (SIGTERM on pod
     // teardown), a non-zero exit would make routine recycles look like crashes
