@@ -28,7 +28,7 @@ use shiitake_worker_api::{
     SessionCommandMode, SessionId, SessionOpenFrame, WorkerId, WorkerLocation, capture,
 };
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     ffi::CString,
     os::{
         fd::{AsRawFd, FromRawFd},
@@ -139,7 +139,17 @@ pub enum SessionError {
     TerminalBusy,
     #[error("worker failed: {0}")]
     Worker(String),
+    /// The reserved worker never acknowledged the open and was evicted. No
+    /// shell started, so the caller can open a new session on another worker.
+    #[error("worker failed: session open timed out")]
+    OpenTimedOut,
 }
+
+/// How long a keepalive ping may go unanswered before session creation stops
+/// preferring that worker. A healthy worker answers within milliseconds; a
+/// connection that has silently died would otherwise stay at the head of the
+/// idle queue until the keepalive timeout evicts it.
+const PING_ANSWER_GRACE: Duration = Duration::from_secs(2);
 
 /// Bounded backlog of pty output events per session. A slow client fills this,
 /// which blocks the worker's read loop, which stops draining the dispatch WS,
@@ -157,6 +167,16 @@ struct WorkerLiveness {
     /// disconnect to aim the OOM probe; see [`WorkerPool::worker_location`].
     location: Option<WorkerLocation>,
     profile: String,
+    /// When the oldest keepalive ping this worker has not answered was sent.
+    /// Any inbound frame clears it.
+    unanswered_ping: Option<Instant>,
+}
+
+impl WorkerLiveness {
+    fn answers_pings(&self, now: Instant) -> bool {
+        self.unanswered_ping
+            .is_none_or(|sent| now.duration_since(sent) < PING_ANSWER_GRACE)
+    }
 }
 
 struct WorkerEntry {
@@ -402,6 +422,10 @@ pub struct WorkerPool {
     namespace: String,
     capture_root: PathBuf,
     capture_dir: Arc<OnceLock<Arc<std::fs::File>>>,
+    /// Profiles that have a dispatch credential, whether or not a worker has
+    /// registered yet. See [`WorkerPool::declare_profiles`].
+    declared_profiles: Arc<std::sync::RwLock<BTreeSet<String>>>,
+    session_open_timeout: Duration,
 }
 
 impl WorkerPool {
@@ -438,7 +462,32 @@ impl WorkerPool {
             namespace,
             capture_root,
             capture_dir,
+            declared_profiles: Arc::default(),
+            session_open_timeout: Duration::from_secs(10),
         }
+    }
+
+    /// How long a reserved worker has to acknowledge a session open.
+    pub fn with_session_open_timeout(mut self, timeout: Duration) -> Self {
+        self.session_open_timeout = timeout;
+        self
+    }
+
+    /// Record the profiles this deployment is configured to serve. A declared
+    /// profile whose workers have not registered yet is busy, not unknown, so
+    /// a caller that waits for a worker rides out a slow worker start.
+    pub fn declare_profiles(&self, profiles: impl IntoIterator<Item = String>) {
+        self.declared_profiles
+            .write()
+            .expect("declared profiles lock")
+            .extend(profiles);
+    }
+
+    fn is_declared(&self, profile: &str) -> bool {
+        self.declared_profiles
+            .read()
+            .expect("declared profiles lock")
+            .contains(profile)
     }
 
     pub fn capture_root(&self) -> &std::path::Path {
@@ -493,6 +542,14 @@ impl WorkerPool {
         busy.extend(s.worker_sessions.keys().cloned());
         busy.extend(s.pty_sessions.keys().cloned());
         (s.idle.len(), busy.len())
+    }
+
+    /// Registered workers of one profile, for `/ready`: (idle, allocated).
+    pub async fn profile_snapshot(&self, profile: &str) -> (usize, usize) {
+        let s = self.state.lock().await;
+        let registered = s.liveness.values().filter(|w| w.profile == profile).count();
+        let idle = s.idle.iter().filter(|w| w.profile == profile).count();
+        (idle, registered.saturating_sub(idle))
     }
 
     /// Workers currently held by an interactive PTY session.
@@ -592,12 +649,25 @@ impl WorkerPool {
         let worker = {
             let mut s = self.state.lock().await;
             if !s.liveness.values().any(|w| w.profile == profile) {
-                return Err(SessionError::UnknownProfile);
+                return Err(if self.is_declared(&profile) {
+                    SessionError::Busy
+                } else {
+                    SessionError::UnknownProfile
+                });
             }
+            // Oldest idle worker first, passing over one whose connection has
+            // stopped answering pings unless nothing else is idle.
+            let now = Instant::now();
             let pos = s
                 .idle
                 .iter()
-                .position(|w| w.profile == profile)
+                .position(|w| {
+                    w.profile == profile
+                        && s.liveness
+                            .get(&w.worker_id)
+                            .is_some_and(|l| l.answers_pings(now))
+                })
+                .or_else(|| s.idle.iter().position(|w| w.profile == profile))
                 .ok_or(SessionError::Busy)?;
             let worker = s.idle.remove(pos).expect("position came from idle");
             s.worker_sessions
@@ -635,7 +705,7 @@ impl WorkerPool {
             self.handle_worker_drop(&worker.worker_id).await;
             return Err(SessionError::Worker(e));
         }
-        match tokio::time::timeout(Duration::from_secs(10), ready_rx).await {
+        match tokio::time::timeout(self.session_open_timeout, ready_rx).await {
             Ok(Ok(Ok(()))) => self.created_session_snapshot(&id).await,
             Ok(Ok(Err(e))) => Err(SessionError::Worker(e)),
             Ok(Err(_)) => Err(SessionError::Worker(
@@ -648,7 +718,7 @@ impl WorkerPool {
                 )
                 .await;
                 self.evict_worker(&worker.worker_id).await;
-                Err(SessionError::Worker("session open timed out".into()))
+                Err(SessionError::OpenTimedOut)
             }
         }
     }
@@ -1272,6 +1342,7 @@ impl WorkerPool {
                     shutdown: shutdown.clone(),
                     location,
                     profile,
+                    unanswered_ping: None,
                 },
             );
             info!(%worker_id, idle = s.idle.len(), "worker registered");
@@ -1522,6 +1593,7 @@ impl WorkerPool {
         let mut s = self.state.lock().await;
         if let Some(l) = s.liveness.get_mut(worker_id) {
             l.last_seen = Instant::now();
+            l.unanswered_ping = None;
         }
     }
 
@@ -1902,7 +1974,11 @@ impl WorkerPool {
                         .await
                 };
                 match tokio::time::timeout(Duration::from_secs(2), send).await {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => {
+                        if let Some(l) = self.state.lock().await.liveness.get_mut(&worker_id) {
+                            l.unanswered_ping.get_or_insert(now);
+                        }
+                    }
                     Ok(Err(e)) => {
                         warn!(%worker_id, error = %e, "ping send failed; evicting");
                         shutdown.notify_one();

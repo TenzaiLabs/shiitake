@@ -86,7 +86,12 @@ fn encode_public_id(kind: char, bytes: [u8; 10]) -> String {
 }
 
 fn map_error(error: SessionError, action: &'static str) -> HttpError {
-    if let SessionError::Worker(details) = error {
+    let details = match &error {
+        SessionError::Worker(details) => Some(details.as_str()),
+        SessionError::OpenTimedOut => Some("session open timed out"),
+        _ => None,
+    };
+    if let Some(details) = details {
         tracing::warn!(%details, action, "worker request failed");
         return (
             StatusCode::BAD_GATEWAY,
@@ -97,7 +102,7 @@ fn map_error(error: SessionError, action: &'static str) -> HttpError {
         SessionError::UnknownProfile | SessionError::NotFound => StatusCode::NOT_FOUND,
         SessionError::Busy => StatusCode::TOO_MANY_REQUESTS,
         SessionError::NotActive | SessionError::TerminalBusy => StatusCode::CONFLICT,
-        SessionError::Worker(_) => unreachable!(),
+        SessionError::Worker(_) | SessionError::OpenTimedOut => unreachable!(),
     };
     (status, error.to_string())
 }
@@ -121,22 +126,38 @@ pub async fn create(
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<SessionResponse>), HttpError> {
     validate_session_request(&req)?;
-    let id = SessionId::new(new_public_id('s'));
-    let open = SessionOpenFrame {
-        session_id: id,
-        working_dir: req
-            .workdir
-            .unwrap_or_else(|| state.default_workdir.to_string_lossy().into_owned()),
-        env: req.env,
-        drop_to: req.drop_to,
+    let working_dir = req
+        .workdir
+        .unwrap_or_else(|| state.default_workdir.to_string_lossy().into_owned());
+    let open = |session_id| SessionOpenFrame {
+        session_id,
+        working_dir: working_dir.clone(),
+        env: req.env.clone(),
+        drop_to: req.drop_to.clone(),
         cols: req.cols,
         rows: req.rows,
     };
-    let snap = state
+    let mut result = state
         .pool
-        .create_session(req.profile, open)
-        .await
-        .map_err(|e| map_error(e, "start session"))?;
+        .create_session(
+            req.profile.clone(),
+            open(SessionId::new(new_public_id('s'))),
+        )
+        .await;
+    // A worker whose connection died silently never acknowledges the open.
+    // The pool has evicted it and no shell started, so one more worker gets
+    // the request, under a new id because the first session's record remains.
+    if matches!(result, Err(SessionError::OpenTimedOut)) {
+        tracing::warn!("session open timed out; retrying on another worker");
+        result = state
+            .pool
+            .create_session(
+                req.profile.clone(),
+                open(SessionId::new(new_public_id('s'))),
+            )
+            .await;
+    }
+    let snap = result.map_err(|e| map_error(e, "start session"))?;
     Ok((StatusCode::CREATED, Json(response(snap))))
 }
 

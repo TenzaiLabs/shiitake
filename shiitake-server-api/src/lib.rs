@@ -179,7 +179,8 @@ pub struct HealthResponse {
 ///
 /// A worker is *registered* whether it is idle or serving a command
 /// (`workers_idle + workers_inflight`); readiness is that count against
-/// `workers_required`, so a fully-busy pool stays ready.
+/// `workers_required`, so a fully-busy pool stays ready. Both counts cover the
+/// default profile only; `workers_sessions` covers every profile.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadyResponse {
     pub ready: bool,
@@ -190,7 +191,7 @@ pub struct ReadyResponse {
     pub workers_inflight: usize,
     #[serde(default)]
     pub workers_sessions: usize,
-    /// Registered workers the pool must have to report ready
+    /// Registered default-profile workers the pool must have to report ready
     /// (`SHIITAKE_MIN_READY_WORKERS`).
     #[serde(default)]
     pub workers_required: usize,

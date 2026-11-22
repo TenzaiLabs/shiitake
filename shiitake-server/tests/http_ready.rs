@@ -6,11 +6,11 @@
 
 use futures_util::SinkExt;
 use shiitake_server::{
-    http::{AppState, build_api_router, build_dispatch_router},
+    http::{AppState, build_api_router, build_dispatch_router_with_profiles},
     pool::WorkerPool,
 };
 use shiitake_worker_api::{Frame, WorkerId};
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -29,6 +29,7 @@ const TOKEN: &str = "test-token";
 /// The dispatch listener's own bearer token — separate from the API's, and
 /// required, since the dispatch path may cross pods.
 const DISPATCH_TOKEN: &str = "test-dispatch-token";
+const ROOT_DISPATCH_TOKEN: &str = "test-root-dispatch-token";
 
 /// A fake worker's end of the dispatch socket. Held by the test so the
 /// worker stays registered; dropping it deregisters the worker.
@@ -68,7 +69,12 @@ async fn serve(min_ready_workers: usize) -> (String, u16, TempDir) {
 
     let dispatch_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dispatch_port = dispatch_listener.local_addr().unwrap().port();
-    let dispatch_router = build_dispatch_router(pool.clone(), DISPATCH_TOKEN);
+    let dispatch_router = build_dispatch_router_with_profiles(
+        pool.clone(),
+        DISPATCH_TOKEN,
+        BTreeMap::from([("root".into(), ROOT_DISPATCH_TOKEN.into())]),
+    )
+    .unwrap();
     tokio::spawn(async move {
         axum::serve(dispatch_listener, dispatch_router.into_make_service())
             .await
@@ -99,18 +105,27 @@ async fn serve(min_ready_workers: usize) -> (String, u16, TempDir) {
 }
 
 async fn connect_worker(dispatch_port: u16, id: &str) -> WorkerConn {
+    connect_profile_worker(dispatch_port, id, "default", DISPATCH_TOKEN).await
+}
+
+async fn connect_profile_worker(
+    dispatch_port: u16,
+    id: &str,
+    profile: &str,
+    token: &str,
+) -> WorkerConn {
     let mut req = format!("ws://127.0.0.1:{dispatch_port}/dispatch")
         .into_client_request()
         .unwrap();
     req.headers_mut().insert(
         AUTHORIZATION,
-        HeaderValue::try_from(format!("Bearer {DISPATCH_TOKEN}")).unwrap(),
+        HeaderValue::try_from(format!("Bearer {token}")).unwrap(),
     );
     let (mut ws, _) = connect_async(req).await.unwrap();
     let hello = serde_json::to_string(&Frame::Hello {
         protocol_version: 3,
         worker_id: WorkerId::new(id),
-        profile: "default".into(),
+        profile: profile.into(),
         location: None,
     })
     .unwrap();
@@ -166,4 +181,26 @@ async fn threshold_holds_the_pod_back_until_enough_workers_register() {
     let _second = connect_worker(dispatch_port, "fake-1").await;
     let body = await_ready(&base, true).await;
     assert_eq!(body["workers_idle"], 2);
+}
+
+#[tokio::test]
+async fn workers_of_another_profile_do_not_make_the_server_ready() {
+    let (base, dispatch_port, _capture) = serve(1).await;
+
+    let _root = connect_profile_worker(dispatch_port, "root-0", "root", ROOT_DISPATCH_TOKEN).await;
+    // Wait on /health, which counts every profile, so the registration is known
+    // to have landed before /ready is asked.
+    for _ in 0..100 {
+        if probe(&base, "/health").await.1["workers_idle"] == 1 {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    let (status, body) = probe(&base, "/ready").await;
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["workers_idle"], 0);
+
+    let _default = connect_worker(dispatch_port, "fake-0").await;
+    let body = await_ready(&base, true).await;
+    assert_eq!(body["workers_idle"], 1);
 }

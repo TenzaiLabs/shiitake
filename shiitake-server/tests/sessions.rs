@@ -620,3 +620,138 @@ async fn idle_session_expires_and_releases_its_worker() {
         shiitake_server_api::SessionState::Closed
     );
 }
+
+/// API router plus a dispatch listener for the default profile and `extra`.
+async fn serve(pool: Arc<WorkerPool>, extra: BTreeMap<String, String>) -> (Router, u16) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let dispatch =
+        build_dispatch_router_with_profiles(pool.clone(), "default-token", extra).unwrap();
+    tokio::spawn(async move { axum::serve(listener, dispatch).await.unwrap() });
+    let app = build_api_router(AppState {
+        pool,
+        auth_token: Arc::new("api-token".into()),
+        default_workdir: "/tmp".into(),
+        max_body_bytes: 1024 * 1024,
+        min_ready_workers: 1,
+        pty_keepalive: Duration::from_secs(1),
+    });
+    (app, port)
+}
+
+async fn create_in(app: &Router, profile: &str) -> (StatusCode, Bytes) {
+    api_call(
+        app,
+        Method::POST,
+        "/api/v1/sessions".into(),
+        Some(serde_json::json!({ "profile": profile })),
+    )
+    .await
+}
+
+async fn wait_for_idle(pool: &WorkerPool, idle: usize) {
+    timeout(Duration::from_secs(3), async {
+        while pool.profiles().await.first().is_none_or(|p| p.idle != idle) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// A default-profile worker that registers and then never reads its socket,
+/// so it answers neither pings nor a session open: a dispatch connection that
+/// died without closing. The caller holds the socket to keep it registered.
+async fn silent_worker(port: u16, id: &'static str) -> impl Sized {
+    let mut req = format!("ws://127.0.0.1:{port}/dispatch")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut().insert(
+        AUTHORIZATION,
+        HeaderValue::from_static("Bearer default-token"),
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    ws.send(Message::Text(
+        serde_json::to_string(&Frame::Hello {
+            protocol_version: 3,
+            worker_id: WorkerId::new(id),
+            profile: "default".into(),
+            location: None,
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    ws
+}
+
+#[tokio::test]
+async fn configured_profile_without_workers_is_busy_not_unknown() {
+    let capture = TempDir::new().unwrap();
+    let pool = Arc::new(WorkerPool::new(
+        None,
+        "server".into(),
+        "test".into(),
+        capture.path().into(),
+    ));
+    let (app, _port) = serve(pool, BTreeMap::from([("root".into(), "root-token".into())])).await;
+
+    for configured in ["default", "root"] {
+        let (status, _) = create_in(&app, configured).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{configured}");
+    }
+    let (status, _) = create_in(&app, "unconfigured").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn session_creation_passes_over_a_worker_that_stopped_answering_pings() {
+    let capture = TempDir::new().unwrap();
+    let pool = Arc::new(WorkerPool::new(
+        None,
+        "server".into(),
+        "test".into(),
+        capture.path().into(),
+    ));
+    let (app, port) = serve(pool.clone(), BTreeMap::new()).await;
+    // Registered first, so it is the oldest idle worker.
+    let _silent = silent_worker(port, "silent-0").await;
+    wait_for_idle(&pool, 1).await;
+    tokio::spawn(fake_worker(port, "live-0", "default"));
+    wait_for_idle(&pool, 2).await;
+
+    // A long timeout keeps the silent worker registered: this is the window
+    // before the keepalive would evict it.
+    let keepalive = tokio::spawn(
+        pool.clone()
+            .run_keepalive(Duration::from_millis(100), Duration::from_secs(60)),
+    );
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    let (status, body) = create_in(&app, "default").await;
+    keepalive.abort();
+    assert_eq!(status, StatusCode::CREATED);
+    let session: SessionResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(session.worker_id.as_str(), "live-0");
+}
+
+#[tokio::test]
+async fn session_open_timeout_moves_the_request_to_another_worker() {
+    let capture = TempDir::new().unwrap();
+    let pool = Arc::new(
+        WorkerPool::new(None, "server".into(), "test".into(), capture.path().into())
+            .with_session_open_timeout(Duration::from_millis(200)),
+    );
+    let (app, port) = serve(pool.clone(), BTreeMap::new()).await;
+    let _silent = silent_worker(port, "silent-0").await;
+    wait_for_idle(&pool, 1).await;
+    tokio::spawn(fake_worker(port, "live-0", "default"));
+    wait_for_idle(&pool, 2).await;
+
+    // No ping has gone out, so the silent worker is still picked first.
+    let (status, body) = create_in(&app, "default").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let session: SessionResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(session.worker_id.as_str(), "live-0");
+}
