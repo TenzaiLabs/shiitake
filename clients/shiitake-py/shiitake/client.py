@@ -43,6 +43,14 @@ class NoIdleWorkerError(ShiitakeError):
         super().__init__(429, "all workers busy")
 
 
+class NoLiveWorkerError(ShiitakeError):
+    """`POST /sessions` returned 503: the profile has no live worker, so no
+    shell was started and the create is safe to repeat."""
+
+    def __init__(self, message: str = "no live worker") -> None:
+        super().__init__(503, message)
+
+
 @dataclass
 class DropTo:
     """Privilege-drop directive: the worker does setgid → setgroups → setuid →
@@ -175,6 +183,8 @@ class _Base:
         max_retries: int = 5,
         retry_initial_delay: float = 0.5,
         retry_max_delay: float = 10.0,
+        live_worker_wait: float = 0.0,
+        live_worker_poll: float = 5.0,
         api_prefix: str = _API_PREFIX,
     ) -> None:
         self._base_url = base_url.rstrip("/")
@@ -184,12 +194,24 @@ class _Base:
         self._max_retries = max_retries
         self._retry_initial = retry_initial_delay
         self._retry_max = retry_max_delay
+        # How long `create_session` keeps asking while the profile has no live
+        # worker (a pool that is starting or recovering), and how often.
+        self._live_worker_wait = live_worker_wait
+        self._live_worker_poll = live_worker_poll
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._auth_token}"} if self._auth_token else {}
 
     def _url(self, path: str) -> str:
         return f"{self._base_url}{self._api_prefix}{path}"
+
+    def _live_worker_pause(self, status: int, deadline: float) -> float | None:
+        """How long to pause before repeating a create answered `status`, or
+        None once it is not a 503 or `deadline` has passed."""
+        remaining = deadline - time.monotonic()
+        if status != 503 or remaining <= 0:
+            return None
+        return min(self._live_worker_poll, remaining)
 
     def _backoff(self, attempt: int) -> float:
         base = min(self._retry_initial * (2**attempt), self._retry_max)
@@ -455,13 +477,17 @@ class AsyncShiitakeClient(_Base):
             body["workdir"] = workdir
         if drop_to is not None:
             body["drop_to"] = drop_to.to_json() if isinstance(drop_to, DropTo) else dict(drop_to)
-        resp = await self._request(
-            "POST", self._url("/sessions"), json=body,
-            retry_on_429=wait_for_worker, retry_transport=False,
-        )
-        if resp.status_code == 429:
-            raise NoIdleWorkerError
-        _raise_for_status(resp)
+        deadline = time.monotonic() + self._live_worker_wait
+        while True:
+            resp = await self._request(
+                "POST", self._url("/sessions"), json=body,
+                retry_on_429=wait_for_worker, retry_transport=False,
+            )
+            pause = self._live_worker_pause(resp.status_code, deadline)
+            if pause is None:
+                break
+            await asyncio.sleep(pause)
+        _raise_for_create(resp)
         return AsyncSession(self, SessionResponse(**resp.json()))
 
     async def session_status(self, session_id: str) -> SessionResponse:
@@ -602,10 +628,14 @@ class ShiitakeClient(_Base):
             body["workdir"] = workdir
         if drop_to is not None:
             body["drop_to"] = drop_to.to_json() if isinstance(drop_to, DropTo) else dict(drop_to)
-        resp = self._http.post(self._url("/sessions"), headers=self._headers(), json=body)
-        if resp.status_code == 429:
-            raise NoIdleWorkerError
-        _raise_for_status(resp)
+        deadline = time.monotonic() + self._live_worker_wait
+        while True:
+            resp = self._http.post(self._url("/sessions"), headers=self._headers(), json=body)
+            pause = self._live_worker_pause(resp.status_code, deadline)
+            if pause is None:
+                break
+            time.sleep(pause)
+        _raise_for_create(resp)
         return Session(self, SessionResponse(**resp.json()))
 
 
@@ -688,6 +718,14 @@ class Session:
 
     def __exit__(self, *exc: Any) -> None:
         self.release()
+
+
+def _raise_for_create(resp: httpx.Response) -> None:
+    if resp.status_code == 429:
+        raise NoIdleWorkerError
+    if resp.status_code == 503:
+        raise NoLiveWorkerError(resp.text)
+    _raise_for_status(resp)
 
 
 def _raise_for_status(resp: httpx.Response) -> None:

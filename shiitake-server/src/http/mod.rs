@@ -35,9 +35,10 @@ pub struct AppState {
     pub default_workdir: PathBuf,
     /// Maximum accepted request body size, in bytes.
     pub max_body_bytes: usize,
-    /// Registered workers (idle + in-flight) the pool needs before `/ready`
-    /// reports ready. `1` is the useful minimum; raise it to keep a large
-    /// deployment out of rotation until some fraction of its pool is back.
+    /// Live default-profile workers (idle + in-flight) the pool needs before
+    /// `/ready` reports ready. `1` is the useful minimum; raise it to
+    /// keep a large deployment out of rotation until some fraction of its pool
+    /// is back.
     pub min_ready_workers: usize,
     /// How often a terminal attachment pings its client; the legacy `/pty`
     /// handler also uses this for its pinned worker lease.
@@ -127,6 +128,7 @@ pub fn build_dispatch_router_with_profiles(
     }
     let mut tokens = BTreeMap::from([("default".to_string(), default_token.to_string())]);
     tokens.extend(extra_tokens);
+    pool.declare_profiles(tokens.keys().cloned());
     Ok(Router::new()
         .route("/dispatch", get(dispatch::connect_scoped))
         .with_state(dispatch::ProfileCredentials {

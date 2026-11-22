@@ -84,10 +84,13 @@ async fn dispatch_with_one_fake_worker_marks_handle_completed() {
             }
         ));
 
-        let exec_msg = ws.next().await.unwrap().unwrap();
-        let exec_text = match exec_msg {
-            Message::Text(t) => t,
-            other => panic!("expected text, got {other:?}"),
+        // The server pings a worker as it registers; the next text frame is the work.
+        let exec_text = loop {
+            match ws.next().await.unwrap().unwrap() {
+                Message::Text(t) => break t,
+                Message::Ping(_) => {}
+                other => panic!("expected text, got {other:?}"),
+            }
         };
         let frame: Frame = serde_json::from_str(&exec_text).unwrap();
         let exec = match frame {
@@ -292,9 +295,14 @@ async fn worker_drop_marks_handle_worker_died() {
         })
         .unwrap();
         ws.send(Message::Text(hello.into())).await.unwrap();
-        // Receive Execute, then ABRUPTLY close.
-        let _ = ws.next().await;
-        let _ = ws.next().await;
+        // Receive HelloAck and Execute (past the registration ping), then
+        // ABRUPTLY close.
+        let mut texts = 0;
+        while texts < 2 {
+            if let Some(Ok(Message::Text(_))) = ws.next().await {
+                texts += 1;
+            }
+        }
         ws.close(None).await.ok();
     });
 

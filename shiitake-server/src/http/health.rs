@@ -24,12 +24,19 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-/// Ready once at least `min_ready_workers` workers are registered. A worker
-/// counts whether it is idle or in-flight — a busy pool is still able to
-/// serve, and gating on idle alone would pull a pod out of rotation exactly
-/// when it is doing the most work.
+/// Ready once at least `min_ready_workers` default-profile workers are live:
+/// each has answered since it registered and is not silent on a ping. A
+/// worker counts whether it is idle or in-flight — a busy pool is still able
+/// to serve, and gating on idle alone would pull a pod out of rotation exactly
+/// when it is doing the most work. Workers of additional profiles do not
+/// count: they cannot serve a default-profile session, and a caller that
+/// starts on their registration alone finds no worker to use. Neither does a
+/// worker that has only registered, because its connection may be dead.
 pub async fn ready(State(state): State<AppState>) -> (StatusCode, Json<ReadyResponse>) {
-    let (idle, inflight) = state.pool.snapshot().await;
+    let (idle, inflight) = state
+        .pool
+        .live_snapshot(&shiitake_worker_api::default_profile())
+        .await;
     let ready = idle + inflight >= state.min_ready_workers;
     let status = if ready {
         StatusCode::OK

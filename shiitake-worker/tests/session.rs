@@ -397,6 +397,11 @@ async fn start_session(configure: impl FnOnce(&mut Command)) -> Worker {
         .env("SHIITAKE_DISPATCH_TOKEN", DISPATCH_TOKEN)
         .env("SHIITAKE_CAPTURE_ROOT", capture.path())
         .kill_on_drop(true);
+    // Shows the worker's own warning about a Bash older than 5.0 (macOS ships
+    // 3.2), which is why the interrupt tests fail there.
+    if std::env::var_os("RUST_LOG").is_none() {
+        command.env("RUST_LOG", "warn");
+    }
     configure(&mut command);
     let process = command.spawn().unwrap();
     let mut ws = timeout(Duration::from_secs(10), rx.recv())

@@ -86,7 +86,12 @@ fn encode_public_id(kind: char, bytes: [u8; 10]) -> String {
 }
 
 fn map_error(error: SessionError, action: &'static str) -> HttpError {
-    if let SessionError::Worker(details) = error {
+    let details = match &error {
+        SessionError::Worker(details) => Some(details.as_str()),
+        SessionError::WorkerLost(details) => Some(*details),
+        _ => None,
+    };
+    if let Some(details) = details {
         tracing::warn!(%details, action, "worker request failed");
         return (
             StatusCode::BAD_GATEWAY,
@@ -96,8 +101,11 @@ fn map_error(error: SessionError, action: &'static str) -> HttpError {
     let status = match error {
         SessionError::UnknownProfile | SessionError::NotFound => StatusCode::NOT_FOUND,
         SessionError::Busy => StatusCode::TOO_MANY_REQUESTS,
+        SessionError::NoLiveWorker | SessionError::WorkerUnresponsive(_) => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         SessionError::NotActive | SessionError::TerminalBusy => StatusCode::CONFLICT,
-        SessionError::Worker(_) => unreachable!(),
+        SessionError::Worker(_) | SessionError::WorkerLost(_) => unreachable!(),
     };
     (status, error.to_string())
 }
@@ -121,20 +129,20 @@ pub async fn create(
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<SessionResponse>), HttpError> {
     validate_session_request(&req)?;
-    let id = SessionId::new(new_public_id('s'));
-    let open = SessionOpenFrame {
-        session_id: id,
-        working_dir: req
-            .workdir
-            .unwrap_or_else(|| state.default_workdir.to_string_lossy().into_owned()),
-        env: req.env,
-        drop_to: req.drop_to,
+    let working_dir = req
+        .workdir
+        .unwrap_or_else(|| state.default_workdir.to_string_lossy().into_owned());
+    let open = |session_id| SessionOpenFrame {
+        session_id,
+        working_dir: working_dir.clone(),
+        env: req.env.clone(),
+        drop_to: req.drop_to.clone(),
         cols: req.cols,
         rows: req.rows,
     };
     let snap = state
         .pool
-        .create_session(req.profile, open)
+        .open_session(&req.profile, || open(SessionId::new(new_public_id('s'))))
         .await
         .map_err(|e| map_error(e, "start session"))?;
     Ok((StatusCode::CREATED, Json(response(snap))))
