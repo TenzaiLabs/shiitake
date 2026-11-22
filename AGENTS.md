@@ -175,8 +175,9 @@ server and the new server permanently unready.
 - The server pings idle and allocated workers and evicts silent connections.
   A dispatch connection can die silently right after its handshake, so
   session-create passes over an idle worker with a ping unanswered for two
-  seconds, and an open that is never acknowledged moves once to another
-  worker under a new session id.
+  seconds. A worker lost before it opens the session, by silence or by
+  dropping, is removed and the create moves to another worker under a new
+  session id, three workers in all.
   A worker that loses its server mid-session kills work and exits for a fresh
   container; idle workers reconnect. The lease timeout catches partitions.
 - In two-pod mode, each profile gets its own worker Deployment. A profile can

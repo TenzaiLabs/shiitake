@@ -663,6 +663,13 @@ async fn wait_for_idle(pool: &WorkerPool, idle: usize) {
 /// so it answers neither pings nor a session open: a dispatch connection that
 /// died without closing. The caller holds the socket to keep it registered.
 async fn silent_worker(port: u16, id: &'static str) -> impl Sized {
+    silent_worker_socket(port, id).await
+}
+
+async fn silent_worker_socket(
+    port: u16,
+    id: &'static str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     let mut req = format!("ws://127.0.0.1:{port}/dispatch")
         .into_client_request()
         .unwrap();
@@ -684,6 +691,18 @@ async fn silent_worker(port: u16, id: &'static str) -> impl Sized {
     .await
     .unwrap();
     ws
+}
+
+/// A default-profile worker that registers and hangs up the moment it is
+/// handed a session, the way a crashing or recycled worker does.
+async fn quitting_worker(port: u16, id: &'static str) {
+    let mut ws = silent_worker_socket(port, id).await;
+    while let Some(Ok(msg)) = ws.next().await {
+        let Message::Text(text) = msg else { continue };
+        if matches!(serde_json::from_str(&text), Ok(Frame::SessionOpen(_))) {
+            return;
+        }
+    }
 }
 
 #[tokio::test]
@@ -808,4 +827,26 @@ async fn a_caller_that_starts_on_ready_gets_a_session_in_every_registration_orde
         let session: SessionResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(session.worker_id.as_str(), "live-0", "{order:?}");
     }
+}
+
+#[tokio::test]
+async fn session_create_moves_past_two_lost_workers_to_a_healthy_one() {
+    let capture = TempDir::new().unwrap();
+    let pool = Arc::new(
+        WorkerPool::new(None, "server".into(), "test".into(), capture.path().into())
+            .with_session_open_timeout(Duration::from_millis(200)),
+    );
+    let (app, port) = serve(pool.clone(), BTreeMap::new()).await;
+    // Oldest first: one never answers, the next hangs up when handed the session.
+    let _silent = silent_worker(port, "silent-0").await;
+    wait_for_idle(&pool, 1).await;
+    tokio::spawn(quitting_worker(port, "quitter-0"));
+    wait_for_idle(&pool, 2).await;
+    tokio::spawn(fake_worker(port, "live-0", "default"));
+    wait_for_idle(&pool, 3).await;
+
+    let (status, body) = create_in(&app, "default").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let session: SessionResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(session.worker_id.as_str(), "live-0");
 }

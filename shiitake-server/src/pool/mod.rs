@@ -97,7 +97,7 @@ struct SessionRecord {
     created_at: SystemTime,
     last_activity_at: SystemTime,
     finished_at: Option<SystemTime>,
-    opened: Option<oneshot::Sender<Result<(), String>>>,
+    opened: Option<oneshot::Sender<Result<(), OpenFailure>>>,
     closed: Vec<oneshot::Sender<()>>,
     terminal: Option<mpsc::Sender<TerminalEvent>>,
     working_dir: String,
@@ -139,10 +139,19 @@ pub enum SessionError {
     TerminalBusy,
     #[error("worker failed: {0}")]
     Worker(String),
-    /// The reserved worker never acknowledged the open and was evicted. No
-    /// shell started, so the caller can open a new session on another worker.
-    #[error("worker failed: session open timed out")]
-    OpenTimedOut,
+    /// The reserved worker was lost before it opened the session: it never
+    /// acknowledged, or it dropped. No shell is left running, so the caller
+    /// can open a new session on another worker.
+    #[error("worker failed: {0}")]
+    WorkerLost(&'static str),
+}
+
+/// Why a reserved worker did not open its session.
+enum OpenFailure {
+    /// The worker answered that it could not start the shell.
+    Refused(String),
+    /// The worker dropped before answering.
+    WorkerLost,
 }
 
 /// How long a keepalive ping may go unanswered before session creation stops
@@ -624,9 +633,7 @@ impl WorkerPool {
             || !s.liveness.contains_key(&worker_id)
             || s.worker_sessions.get(&worker_id) != Some(id)
         {
-            return Err(SessionError::Worker(
-                "worker disconnected during open".into(),
-            ));
+            return Err(SessionError::WorkerLost("worker disconnected during open"));
         }
         let rec = s.sessions.get_mut(id).expect("checked above");
         rec.last_activity_at = SystemTime::now();
@@ -702,15 +709,16 @@ impl WorkerPool {
         .map_err(|_| "session open send timed out".to_string())
         .and_then(|result| result)
         {
+            warn!(worker_id = %worker.worker_id, error = %e, "session open could not be sent");
             self.handle_worker_drop(&worker.worker_id).await;
-            return Err(SessionError::Worker(e));
+            return Err(SessionError::WorkerLost("session open could not be sent"));
         }
         match tokio::time::timeout(self.session_open_timeout, ready_rx).await {
             Ok(Ok(Ok(()))) => self.created_session_snapshot(&id).await,
-            Ok(Ok(Err(e))) => Err(SessionError::Worker(e)),
-            Ok(Err(_)) => Err(SessionError::Worker(
-                "worker disconnected during open".into(),
-            )),
+            Ok(Ok(Err(OpenFailure::Refused(e)))) => Err(SessionError::Worker(e)),
+            Ok(Ok(Err(OpenFailure::WorkerLost))) | Ok(Err(_)) => {
+                Err(SessionError::WorkerLost("worker disconnected during open"))
+            }
             Err(_) => {
                 let _ = tokio::time::timeout(
                     Duration::from_secs(2),
@@ -718,7 +726,7 @@ impl WorkerPool {
                 )
                 .await;
                 self.evict_worker(&worker.worker_id).await;
-                Err(SessionError::OpenTimedOut)
+                Err(SessionError::WorkerLost("session open timed out"))
             }
         }
     }
@@ -1496,7 +1504,7 @@ impl WorkerPool {
             }
         }
         if let Some(tx) = rec.opened.take() {
-            let _ = tx.send(error.map_or(Ok(()), Err));
+            let _ = tx.send(error.map_or(Ok(()), |e| Err(OpenFailure::Refused(e))));
         }
     }
 
@@ -1530,7 +1538,9 @@ impl WorkerPool {
             rec.clear_inputs();
             let terminal = rec.terminal.take();
             if let Some(tx) = rec.opened.take() {
-                let _ = tx.send(Err(error.clone().unwrap_or_else(|| "shell closed".into())));
+                let _ = tx.send(Err(OpenFailure::Refused(
+                    error.clone().unwrap_or_else(|| "shell closed".into()),
+                )));
             }
             let closed = std::mem::take(&mut rec.closed);
             let profile = rec.profile.clone();
@@ -1736,7 +1746,7 @@ impl WorkerPool {
                 rec.clear_inputs();
                 terminal = rec.terminal.take();
                 if let Some(tx) = rec.opened.take() {
-                    let _ = tx.send(Err("worker disconnected".into()));
+                    let _ = tx.send(Err(OpenFailure::WorkerLost));
                 }
                 closed = std::mem::take(&mut rec.closed);
             }

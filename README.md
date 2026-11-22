@@ -31,7 +31,7 @@ protected by `SHIITAKE_DISPATCH_TOKEN`.
 | Method | Path | What it does |
 | --- | --- | --- |
 | `GET` | `/profiles` | Connected profiles and their idle/allocated worker counts. |
-| `POST` | `/sessions` | Allocate a worker and start its shell. Returns `201`, or `400` for invalid input, `404` for a profile with no dispatch credential, `429` when that profile has no idle worker (including before its workers register), and `502` if the worker fails during creation. A worker that never acknowledges the open is evicted and the request moves to one other worker before `502`. |
+| `POST` | `/sessions` | Allocate a worker and start its shell. Returns `201`, or `400` for invalid input, `404` for a profile with no dispatch credential, `429` when that profile has no idle worker (including before its workers register), and `502` if the worker fails during creation. A worker that is lost before it opens the session (it never acknowledges, or it drops) is removed and the request moves to another worker, three in all, before `502`. |
 | `GET` | `/sessions/{id}` | Session state and assigned worker. |
 | `DELETE` | `/sessions/{id}` | Close the shell, cancel its jobs, reset the worker, and release it. |
 | `POST` | `/sessions/{id}/commands` | Submit a stateful or parallel command; returns a handle (`202`). |

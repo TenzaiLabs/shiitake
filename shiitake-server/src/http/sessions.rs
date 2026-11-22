@@ -27,6 +27,8 @@ type HttpError = (StatusCode, String);
 const MAX_SESSION_ENV_ENTRIES: usize = 128;
 const MAX_SESSION_ENV_BYTES: usize = 64 * 1024;
 const MAX_SESSION_WORKDIR_BYTES: usize = 4096;
+/// Workers tried for one session before the caller is told the worker failed.
+const SESSION_OPEN_ATTEMPTS: usize = 3;
 
 fn validate_session_request(req: &CreateSessionRequest) -> Result<(), HttpError> {
     if req.profile.is_empty()
@@ -88,7 +90,7 @@ fn encode_public_id(kind: char, bytes: [u8; 10]) -> String {
 fn map_error(error: SessionError, action: &'static str) -> HttpError {
     let details = match &error {
         SessionError::Worker(details) => Some(details.as_str()),
-        SessionError::OpenTimedOut => Some("session open timed out"),
+        SessionError::WorkerLost(details) => Some(*details),
         _ => None,
     };
     if let Some(details) = details {
@@ -102,7 +104,7 @@ fn map_error(error: SessionError, action: &'static str) -> HttpError {
         SessionError::UnknownProfile | SessionError::NotFound => StatusCode::NOT_FOUND,
         SessionError::Busy => StatusCode::TOO_MANY_REQUESTS,
         SessionError::NotActive | SessionError::TerminalBusy => StatusCode::CONFLICT,
-        SessionError::Worker(_) | SessionError::OpenTimedOut => unreachable!(),
+        SessionError::Worker(_) | SessionError::WorkerLost(_) => unreachable!(),
     };
     (status, error.to_string())
 }
@@ -137,27 +139,31 @@ pub async fn create(
         cols: req.cols,
         rows: req.rows,
     };
-    let mut result = state
-        .pool
-        .create_session(
-            req.profile.clone(),
-            open(SessionId::new(new_public_id('s'))),
-        )
-        .await;
-    // A worker whose connection died silently never acknowledges the open.
-    // The pool has evicted it and no shell started, so one more worker gets
-    // the request, under a new id because the first session's record remains.
-    if matches!(result, Err(SessionError::OpenTimedOut)) {
-        tracing::warn!("session open timed out; retrying on another worker");
-        result = state
+    let mut attempt = 1;
+    let snap = loop {
+        let result = state
             .pool
             .create_session(
                 req.profile.clone(),
                 open(SessionId::new(new_public_id('s'))),
             )
             .await;
-    }
-    let snap = result.map_err(|e| map_error(e, "start session"))?;
+        match result {
+            // A worker with a silently dead connection never acknowledges, and
+            // one can drop mid-open. The pool has dropped it and no shell is
+            // left running, so another worker gets the request, under a new id
+            // because the lost session's record remains.
+            Err(SessionError::WorkerLost(details)) if attempt < SESSION_OPEN_ATTEMPTS => {
+                tracing::warn!(
+                    details,
+                    attempt,
+                    "worker lost while opening a session; trying another"
+                );
+                attempt += 1;
+            }
+            result => break result.map_err(|e| map_error(e, "start session"))?,
+        }
+    };
     Ok((StatusCode::CREATED, Json(response(snap))))
 }
 
