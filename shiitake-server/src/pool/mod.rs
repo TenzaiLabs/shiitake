@@ -209,8 +209,12 @@ struct WorkerLiveness {
     heard: Arc<Notify>,
     /// Distinguishes this connection from a later one under the same worker id.
     connection: u64,
-    /// Told to go, but its read loop has not dropped it yet. It can serve
-    /// nothing in that window, so it must not count as live or as busy.
+    /// Payload of the last pong that carried one. A create's ping carries a
+    /// unique payload, so only the answer to that ping lets it proceed.
+    last_pong: [u8; 8],
+    /// Told to go, or done with its last session and about to exit, but its
+    /// read loop has not dropped it yet. It can serve nothing in that window,
+    /// so it must not count as live or as busy.
     evicting: bool,
 }
 
@@ -868,15 +872,13 @@ impl WorkerPool {
         protocol_step!(step = "Reserve", request, worker = %worker.worker_id);
         // Prove the connection carries traffic before committing a session to
         // it: a dead one would otherwise hold the caller for the open timeout.
-        let answer = heard.notified();
-        tokio::pin!(answer);
-        answer.as_mut().enable();
+        let probe = self.next_request().to_be_bytes();
         let ping = async {
             worker
                 .sink
                 .lock()
                 .await
-                .send(Message::Ping(Vec::new().into()))
+                .send(Message::Ping(probe.to_vec().into()))
                 .await
         };
         if !matches!(
@@ -886,10 +888,27 @@ impl WorkerPool {
             self.handle_worker_drop(&worker.worker_id).await;
             return Err(SessionError::WorkerLost("ping could not be sent"));
         }
-        if tokio::time::timeout(self.probe_timeout, answer)
-            .await
-            .is_err()
-        {
+        // Any frame wakes the wait; only this ping's own pong ends it, so an
+        // earlier pong still in flight cannot vouch for the connection.
+        let deadline = tokio::time::Instant::now() + self.probe_timeout;
+        let answered = loop {
+            let heard_again = heard.notified();
+            tokio::pin!(heard_again);
+            heard_again.as_mut().enable();
+            if self
+                .pong_matches(&worker.worker_id, connection, probe)
+                .await
+            {
+                break true;
+            }
+            if tokio::time::timeout_at(deadline, heard_again)
+                .await
+                .is_err()
+            {
+                break false;
+            }
+        };
+        if !answered {
             return Err(self
                 .release_unanswered(worker, &id, connection, request)
                 .await);
@@ -932,8 +951,16 @@ impl WorkerPool {
         }
     }
 
-    /// Return a reserved worker that did not answer its ping to the head of
-    /// the idle queue. The keepalive decides whether to evict it.
+    async fn pong_matches(&self, id: &WorkerId, connection: u64, probe: [u8; 8]) -> bool {
+        let s = self.state.lock().await;
+        s.liveness
+            .get(id)
+            .is_some_and(|l| l.connection == connection && l.last_pong == probe)
+    }
+
+    /// Return a reserved worker that did not answer its ping to the back of
+    /// the idle queue, like any released worker. The keepalive decides
+    /// whether to evict it.
     async fn release_unanswered(
         &self,
         worker: WorkerEntry,
@@ -952,7 +979,7 @@ impl WorkerPool {
         s.worker_sessions.remove(&worker.worker_id);
         s.sessions.remove(id);
         protocol_step!(step = "ProbeTimeout", request, worker = %worker.worker_id);
-        s.idle.push_front(worker);
+        s.idle.push_back(worker);
         SessionError::WorkerUnresponsive(connection)
     }
 
@@ -1585,6 +1612,7 @@ impl WorkerPool {
                     answered: false,
                     heard: Arc::new(Notify::new()),
                     connection,
+                    last_pong: [0; 8],
                     evicting: false,
                 },
             );
@@ -1651,6 +1679,11 @@ impl WorkerPool {
                             Ok(other) => warn!(?other, "unexpected frame from worker"),
                             Err(e) => warn!("frame parse error: {e}"),
                         },
+                        Ok(Message::Pong(payload)) => {
+                            if let Ok(payload) = <[u8; 8]>::try_from(&payload[..]) {
+                                self.pong_received(&worker_id, payload).await;
+                            }
+                        }
                         Ok(Message::Close(_)) | Err(_) => break,
                         _ => {}
                     }
@@ -1794,12 +1827,17 @@ impl WorkerPool {
             let profile = rec.profile.clone();
             let sink = rec.sink.clone();
             s.worker_sessions.remove(worker_id);
+            protocol_step!(step = "SessionClosed", worker = %worker_id, reusable);
             if reusable && s.liveness.contains_key(worker_id) {
                 s.idle.push_back(WorkerEntry {
                     worker_id: worker_id.clone(),
                     profile,
                     sink,
                 });
+            } else if let Some(l) = s.liveness.get_mut(worker_id) {
+                // It serves nothing more and exits on its own; until its
+                // socket closes it must not count as live or as busy.
+                l.evicting = true;
             }
             let ids: Vec<_> = s
                 .inflight
@@ -1856,6 +1894,14 @@ impl WorkerPool {
                 protocol_step!(step = "TouchWorker", worker = %worker_id);
             }
             l.answered = true;
+            l.heard.notify_waiters();
+        }
+    }
+
+    async fn pong_received(&self, worker_id: &WorkerId, payload: [u8; 8]) {
+        let mut s = self.state.lock().await;
+        if let Some(l) = s.liveness.get_mut(worker_id) {
+            l.last_pong = payload;
             l.heard.notify_waiters();
         }
     }

@@ -113,17 +113,49 @@ async fn scenario() -> Scenario {
 
 impl Scenario {
     async fn create(&self) -> StatusCode {
+        self.call(
+            Method::POST,
+            "/api/v1/sessions".into(),
+            r#"{"profile":"default"}"#,
+        )
+        .await
+        .0
+    }
+
+    /// Open a session and close it again.
+    async fn create_and_close(&self) {
+        let (status, body) = self
+            .call(
+                Method::POST,
+                "/api/v1/sessions".into(),
+                r#"{"profile":"default"}"#,
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = body["session_id"].as_str().unwrap().to_owned();
+        let (status, _) = self
+            .call(Method::DELETE, format!("/api/v1/sessions/{id}"), "")
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    async fn call(
+        &self,
+        method: Method,
+        uri: String,
+        body: &'static str,
+    ) -> (StatusCode, serde_json::Value) {
         let request = Request::builder()
-            .method(Method::POST)
-            .uri("/api/v1/sessions")
+            .method(method)
+            .uri(uri)
             .header(AUTHORIZATION, "Bearer api-token")
             .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(r#"{"profile":"default"}"#))
+            .body(Body::from(body))
             .unwrap();
         let response = self.app.clone().oneshot(request).await.unwrap();
         let status = response.status();
-        to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        status
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
     }
 
     /// Register a worker and wait until the pool holds `registered` of them.
@@ -177,6 +209,9 @@ enum Kind {
     Mute,
     /// Answers pings, hangs up when handed a session.
     Quitter,
+    /// Serves one session, then reports itself not reusable and lingers: a
+    /// root worker between its last session and its exit.
+    OneShot,
 }
 
 async fn worker(port: u16, kind: Kind, id: &'static str, profile: &'static str) {
@@ -201,21 +236,24 @@ async fn worker(port: u16, kind: Kind, id: &'static str, profile: &'static str) 
     }
     while let Some(Ok(msg)) = ws.next().await {
         let Message::Text(text) = msg else { continue };
-        let Ok(Frame::SessionOpen(open)) = serde_json::from_str(&text) else {
-            continue;
-        };
-        match kind {
-            Kind::Quitter => return,
-            Kind::Live => {
-                let ready = serde_json::to_string(&Frame::SessionReady {
-                    session_id: open.session_id,
+        let reply = match (kind, serde_json::from_str(&text)) {
+            (Kind::Quitter, Ok(Frame::SessionOpen(_))) => return,
+            (Kind::Live | Kind::OneShot, Ok(Frame::SessionOpen(open))) => Frame::SessionReady {
+                session_id: open.session_id,
+                error: None,
+            },
+            (Kind::Live | Kind::OneShot, Ok(Frame::SessionClose { session_id })) => {
+                Frame::SessionClosed {
+                    session_id,
                     error: None,
-                })
-                .unwrap();
-                ws.send(Message::Text(ready.into())).await.unwrap();
+                    reusable: matches!(kind, Kind::Live),
+                }
             }
-            Kind::Mute | Kind::Silent => {}
-        }
+            _ => continue,
+        };
+        ws.send(Message::Text(serde_json::to_string(&reply).unwrap().into()))
+            .await
+            .unwrap();
     }
 }
 
@@ -290,4 +328,23 @@ async fn only_a_worker_that_never_opens() {
     // on; that worker is not "busy", so the answer is 503 and not 429.
     assert_eq!(s.create().await, StatusCode::SERVICE_UNAVAILABLE);
     s.finish("only_a_worker_that_never_opens").await;
+}
+
+#[tokio::test]
+async fn a_closed_session_frees_its_worker_for_the_next() {
+    let s = scenario().await;
+    s.join(Kind::Live, "live-0", "default", 1).await;
+    s.create_and_close().await;
+    assert_eq!(s.create().await, StatusCode::CREATED);
+    s.finish("a_closed_session_frees_its_worker_for_the_next")
+        .await;
+}
+
+#[tokio::test]
+async fn a_one_session_worker_is_not_reused() {
+    let s = scenario().await;
+    s.join(Kind::OneShot, "once-0", "default", 1).await;
+    s.create_and_close().await;
+    assert_eq!(s.create().await, StatusCode::SERVICE_UNAVAILABLE);
+    s.finish("a_one_session_worker_is_not_reused").await;
 }

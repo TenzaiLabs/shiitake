@@ -784,6 +784,37 @@ async fn session_create_passes_over_a_worker_that_does_not_answer_its_ping() {
     assert_eq!(pool.snapshot().await, (1, 1));
 }
 
+/// A default-profile worker that never reads, so it answers no ping, but
+/// keeps sending frames of its own.
+async fn chatty_deaf_worker(port: u16, id: &'static str) {
+    let mut ws = silent_worker_socket(port, id).await;
+    loop {
+        if ws.send(Message::Pong(Vec::new().into())).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_frame_that_is_not_the_ping_answer_does_not_pass_the_probe() {
+    let capture = TempDir::new().unwrap();
+    let pool = Arc::new(fast_pool(&capture));
+    let (app, port) = serve(pool.clone(), BTreeMap::new()).await;
+    tokio::spawn(chatty_deaf_worker(port, "chatty-0"));
+    wait_for_idle(&pool, 1).await;
+    tokio::spawn(fake_worker(port, "live-0", "default"));
+    wait_for_idle(&pool, 2).await;
+
+    let (status, body) = create_in(&app, "default").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let session: SessionResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(session.worker_id.as_str(), "live-0");
+    // Its frames never answered the ping, so no session was sent to it and it
+    // was not evicted for failing to open one.
+    assert_eq!(pool.snapshot().await, (1, 1));
+}
+
 #[tokio::test]
 async fn a_pool_with_only_unresponsive_workers_is_unavailable() {
     let capture = TempDir::new().unwrap();
@@ -884,4 +915,55 @@ async fn session_create_moves_past_two_lost_workers_to_a_healthy_one() {
     assert_eq!(status, StatusCode::CREATED);
     let session: SessionResponse = serde_json::from_slice(&body).unwrap();
     assert_eq!(session.worker_id.as_str(), "live-0");
+}
+
+/// A default-profile worker that serves one session and then reports itself
+/// not reusable, as a root worker does before it exits. It stays connected,
+/// which is the window between its last session and its exit.
+async fn one_session_worker(port: u16, id: &'static str) {
+    let mut ws = silent_worker_socket(port, id).await;
+    while let Some(Ok(msg)) = ws.next().await {
+        let Message::Text(text) = msg else { continue };
+        let reply = match serde_json::from_str(&text) {
+            Ok(Frame::SessionOpen(open)) => Frame::SessionReady {
+                session_id: open.session_id,
+                error: None,
+            },
+            Ok(Frame::SessionClose { session_id }) => Frame::SessionClosed {
+                session_id,
+                error: None,
+                reusable: false,
+            },
+            _ => continue,
+        };
+        ws.send(Message::Text(serde_json::to_string(&reply).unwrap().into()))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_worker_that_finished_its_last_session_is_not_busy() {
+    let capture = TempDir::new().unwrap();
+    let pool = Arc::new(fast_pool(&capture));
+    let (app, port) = serve(pool.clone(), BTreeMap::new()).await;
+    tokio::spawn(one_session_worker(port, "once-0"));
+    wait_for_idle(&pool, 1).await;
+
+    let (status, body) = create_in(&app, "default").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let session: SessionResponse = serde_json::from_slice(&body).unwrap();
+    let (status, _) = api_call(
+        &app,
+        Method::DELETE,
+        format!("/api/v1/sessions/{}", session.session_id),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Nobody holds the worker and it will serve nothing more: the profile has
+    // no live worker, which is 503 and worth waiting out, not 429.
+    let (status, _) = create_in(&app, "default").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
