@@ -211,7 +211,9 @@ profile's trust domain.
 
 `clients/shiitake-py` provides async and sync session clients, plus optional
 terminal support via its `[pty]` extra. `clients/shiitake-rs` provides an async
-HTTP session client. Both clients expose explicit session release.
+HTTP session client. Both clients expose explicit session release, and report
+a busy pool (429) and a pool with no live worker (503) as their own errors.
+The Python client can also wait for a live worker (`live_worker_wait`).
 
 ```bash
 cargo +nightly fmt --all --check

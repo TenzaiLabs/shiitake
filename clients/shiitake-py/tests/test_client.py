@@ -9,8 +9,8 @@ from collections.abc import Callable
 import httpx
 import pytest
 from shiitake.client import (
-    AsyncShiitakeClient, DropTo, NoIdleWorkerError, SessionResponse, ShiitakeClient,
-    ShiitakeError,
+    AsyncShiitakeClient, DropTo, NoIdleWorkerError, NoLiveWorkerError, SessionResponse,
+    ShiitakeClient, ShiitakeError,
 )
 
 
@@ -79,6 +79,66 @@ async def test_create_session_retries_only_when_capacity_is_unavailable() -> Non
     assert session.session_id == "s"
     assert attempts == 2
     await client.aclose()
+
+
+def no_live_worker_then_session() -> tuple[Callable[[httpx.Request], httpx.Response], list[int]]:
+    """A pool that answers the first create 503 and the second with a session."""
+    attempts: list[int] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        if len(attempts) == 1:
+            return httpx.Response(503, text="no live worker for this profile")
+        return httpx.Response(201, json=session_payload())
+
+    return handler, attempts
+
+
+@pytest.mark.asyncio
+async def test_no_live_worker_raises_its_own_error_without_asking_again() -> None:
+    handler, attempts = no_live_worker_then_session()
+    client = await with_mock(handler)
+    with pytest.raises(NoLiveWorkerError) as error:
+        await client.create_session()
+    assert error.value.status == 503
+    assert len(attempts) == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_create_session_waits_for_a_live_worker_when_asked_to() -> None:
+    handler, attempts = no_live_worker_then_session()
+    client = await with_mock(handler, live_worker_wait=5.0, live_worker_poll=0.0)
+    session = await client.create_session()
+    assert session.session_id == "s"
+    assert len(attempts) == 2
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_create_session_stops_waiting_for_a_live_worker_at_its_deadline() -> None:
+    attempts = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(503, text="no live worker for this profile")
+
+    client = await with_mock(handler, live_worker_wait=0.05, live_worker_poll=0.01)
+    with pytest.raises(NoLiveWorkerError):
+        await client.create_session()
+    assert attempts > 1
+    await client.aclose()
+
+
+def test_sync_create_session_waits_for_a_live_worker_when_asked_to() -> None:
+    handler, attempts = no_live_worker_then_session()
+    client = ShiitakeClient("http://srv", live_worker_wait=5.0, live_worker_poll=0.0)
+    client.close()
+    client._http = httpx.Client(transport=httpx.MockTransport(handler))
+    assert client.create_session().session_id == "s"
+    assert len(attempts) == 2
+    client.close()
 
 
 @pytest.mark.asyncio

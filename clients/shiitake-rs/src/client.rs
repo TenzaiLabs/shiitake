@@ -28,8 +28,13 @@ impl Stream {
 pub enum ClientError {
     #[error("transport: {0}")]
     Transport(#[from] reqwest::Error),
+    /// Every worker of the profile is held by a session.
     #[error("all workers busy (429)")]
     NoIdleWorker,
+    /// The profile has no live worker: the pool is starting or recovering.
+    /// No shell was started, so the create is safe to repeat.
+    #[error("no live worker for the profile (503)")]
+    NoLiveWorker,
     #[error("server returned {status}: {body}")]
     Status { status: u16, body: String },
 }
@@ -150,8 +155,10 @@ impl Client {
             .auth(self.http.post(self.url("/sessions")).json(&body))
             .send()
             .await?;
-        if resp.status().as_u16() == 429 {
-            return Err(ClientError::NoIdleWorker);
+        match resp.status().as_u16() {
+            429 => return Err(ClientError::NoIdleWorker),
+            503 => return Err(ClientError::NoLiveWorker),
+            _ => {}
         }
         let details = error_for_status(resp).await?.json().await?;
         Ok(Session {

@@ -39,6 +39,15 @@ included, until it exits or is killed, so start long-lived processes with
 The worker clears its environment at session creation, so supply `PATH` for
 external programs.
 
+`create_session` raises `NoIdleWorkerError` (429) when every worker of the
+profile is busy, and `NoLiveWorkerError` (503) when the profile has no live
+worker: the pool is starting or recovering, and no shell was started. Pass
+`wait_for_worker=True` to retry a busy pool. To wait for a pool to come up,
+construct the client with `live_worker_wait` (seconds, off by default) and
+`live_worker_poll` (seconds between asks, 5 by default); the create then
+raises `NoLiveWorkerError` only once that time has passed. Other failures are
+not repeated, because the session may have been created.
+
 `session.attach_terminal()` opens a detachable binary WebSocket terminal;
 closing it leaves the session and shell running. Install `shiitake-py[pty]`
 for terminal support. `session.run()` collects a bounded amount of output;
