@@ -1967,6 +1967,11 @@ impl WorkerPool {
                     shutdown.notify_one();
                     continue;
                 }
+                // Marked before the send: the reply can be handled before this
+                // task runs again, and marking afterwards would undo its clearing.
+                if let Some(l) = self.state.lock().await.liveness.get_mut(&worker_id) {
+                    l.unanswered_ping.get_or_insert_with(Instant::now);
+                }
                 let send = async {
                     sink.lock()
                         .await
@@ -1974,11 +1979,7 @@ impl WorkerPool {
                         .await
                 };
                 match tokio::time::timeout(Duration::from_secs(2), send).await {
-                    Ok(Ok(())) => {
-                        if let Some(l) = self.state.lock().await.liveness.get_mut(&worker_id) {
-                            l.unanswered_ping.get_or_insert(now);
-                        }
-                    }
+                    Ok(Ok(())) => {}
                     Ok(Err(e)) => {
                         warn!(%worker_id, error = %e, "ping send failed; evicting");
                         shutdown.notify_one();

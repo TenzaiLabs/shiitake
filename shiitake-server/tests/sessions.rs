@@ -755,3 +755,57 @@ async fn session_open_timeout_moves_the_request_to_another_worker() {
     let session: SessionResponse = serde_json::from_slice(&body).unwrap();
     assert_eq!(session.worker_id.as_str(), "live-0");
 }
+
+/// The first seconds of a pool: workers register one by one, and a caller
+/// starts the moment `/ready` answers 200. Whatever the order, that caller's
+/// first default-profile session must open on a worker that can serve it.
+#[tokio::test]
+async fn a_caller_that_starts_on_ready_gets_a_session_in_every_registration_order() {
+    const ORDERS: [[&str; 3]; 6] = [
+        ["root", "silent", "live"],
+        ["root", "live", "silent"],
+        ["silent", "root", "live"],
+        ["silent", "live", "root"],
+        ["live", "root", "silent"],
+        ["live", "silent", "root"],
+    ];
+    for order in ORDERS {
+        let capture = TempDir::new().unwrap();
+        let pool = Arc::new(
+            WorkerPool::new(None, "server".into(), "test".into(), capture.path().into())
+                .with_session_open_timeout(Duration::from_millis(200)),
+        );
+        let (app, port) = serve(
+            pool.clone(),
+            BTreeMap::from([("root".into(), "root-token".into())]),
+        )
+        .await;
+        let mut held = Vec::new();
+        let mut default_registered = false;
+        for (registered, worker) in order.into_iter().enumerate() {
+            match worker {
+                "root" => drop(tokio::spawn(fake_worker(port, "root-0", "root"))),
+                "silent" => held.push(silent_worker(port, "silent-0").await),
+                _ => drop(tokio::spawn(fake_worker(port, "live-0", "default"))),
+            }
+            default_registered |= worker != "root";
+            timeout(Duration::from_secs(3), async {
+                while pool.snapshot().await.0 != registered + 1 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let (status, _) = api_call(&app, Method::GET, "/api/v1/ready".into(), None).await;
+            assert_eq!(
+                status == StatusCode::OK,
+                default_registered,
+                "{order:?} after {worker}"
+            );
+        }
+        let (status, body) = create_in(&app, "default").await;
+        assert_eq!(status, StatusCode::CREATED, "{order:?}");
+        let session: SessionResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(session.worker_id.as_str(), "live-0", "{order:?}");
+    }
+}
