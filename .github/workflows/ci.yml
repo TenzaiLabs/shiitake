@@ -34,7 +34,7 @@ jobs:
       - name: 🧰 Toolchain
         run: rustup show
       - name: 💾 Cache
-        uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # untagged master commit, v2.9.3 + 1
+        uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # untagged master commit, v2.9.3 + 1
         with:
           # Keyed on rust-toolchain.toml so a toolchain bump starts from a clean
           # cache; shared with the test job to compile dependencies once.
@@ -51,7 +51,7 @@ jobs:
       - name: 🧰 Toolchain
         run: rustup show
       - name: 💾 Cache
-        uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # untagged master commit, v2.9.3 + 1
+        uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # untagged master commit, v2.9.3 + 1
         with:
           shared-key: rust-${{ hashFiles('rust-toolchain.toml') }}
       - name: 🧪 Test

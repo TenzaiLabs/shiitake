@@ -33,7 +33,7 @@ jobs:
         # code was already at v0.2.0).
         run: echo "version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "(.*)"/\1/')" >> "$GITHUB_OUTPUT"
       - name: 📝 Release Drafter
-        uses: release-drafter/release-drafter@978bb0b30c5ee8cdd332ced253758157150d43f0 # v7.10.0
+        uses: release-drafter/release-drafter@d1a19e60e81a7e650d00a7de9277f87e439117ea # v7.11.0
         with:
           config-name: release-drafter.yml
           version: ${{ steps.version.outputs.version }}
@@ -47,6 +47,6 @@ jobs:
       pull-requests: write
     steps:
       - name: 🏷️ Autolabeler
-        uses: release-drafter/release-drafter/autolabeler@978bb0b30c5ee8cdd332ced253758157150d43f0 # v7.10.0
+        uses: release-drafter/release-drafter/autolabeler@d1a19e60e81a7e650d00a7de9277f87e439117ea # v7.11.0
         with:
           config-name: release-drafter.yml
